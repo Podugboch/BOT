@@ -183,7 +183,10 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[Di
 
 # --- ZIP Packaging Helper ---
 def create_bot_zip() -> str:
-    zip_path = Path(__file__).resolve().parent / "BOT.zip"
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        zip_path = Path("/tmp/BOT.zip")
+    else:
+        zip_path = Path(__file__).resolve().parent / "BOT.zip"
     exclude_dirs = {".git", ".pytest_cache", "__pycache__", ".venv", "data_cache", "logs", ".vercel"}
     exclude_files = {"users.db", "bot.log", "web.log", "KILL", "BOT.zip"}
 
