@@ -1,0 +1,95 @@
+"""
+Central configuration for the bot. All tunable knobs live here so nothing
+is buried inside strategy/risk/execution logic.
+
+Secrets (API keys) are read from environment variables — never hardcode them.
+Copy .env.example to .env and fill it in, or export the vars directly.
+"""
+import os
+import socket
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+# Automatically load environment variables from .env
+load_dotenv()
+
+# Fallback DNS resolution in case host/ISP DNS blocks crypto exchange domains
+try:
+    import dns.resolver
+    _orig_getaddrinfo = socket.getaddrinfo
+    _resolver = dns.resolver.Resolver()
+    _resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+    _resolver.timeout = 2.0
+    _resolver.lifetime = 4.0
+
+    def _fallback_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        try:
+            return _orig_getaddrinfo(host, port, family, type, proto, flags)
+        except socket.gaierror:
+            try:
+                ip = _resolver.resolve(host, "A")[0].to_text()
+                return _orig_getaddrinfo(ip, port, family, type, proto, flags)
+            except Exception:
+                raise
+
+    socket.getaddrinfo = _fallback_getaddrinfo
+except ImportError:
+    pass
+
+
+@dataclass
+class StrategyConfig:
+    """EMA-crossover trend strategy, filtered by RSI, ADX, and Fibonacci retracement."""
+    fast_ema: int = 12
+    slow_ema: int = 26
+    rsi_period: int = 14
+    rsi_overbought: float = 65     # don't buy into overbought / exit if too hot
+    adx_period: int = 14
+    adx_trend_threshold: float = 20  # only trade when a real trend exists
+
+    # Fibonacci retracement confluence filter — computed automatically from
+    # rolling swing highs/lows, no manual line-drawing required.
+    use_fib_filter: bool = True
+    fib_lookback: int = 50          # bars used to find the swing high/low
+    fib_tolerance_pct: float = 0.005  # price counts as "at" a level within 0.5%
+
+
+@dataclass
+class RiskConfig:
+    """Risk management: sized before profit, always."""
+    risk_per_trade_pct: float = 0.01     # risk 1% of equity per trade
+    stop_loss_atr_mult: float = 2.0      # stop = entry -/+ 2x ATR
+    take_profit_atr_mult: float = 4.0    # 2:1 reward:risk
+    max_daily_loss_pct: float = 0.03     # circuit breaker: halt for the day
+    max_drawdown_pct: float = 0.15       # kill switch: halt the bot entirely
+    max_consecutive_losses: int = 4      # circuit breaker: cool off
+
+
+@dataclass
+class ExchangeConfig:
+    # Any ccxt-supported exchange id works here — see the "Supported exchanges"
+    # list in README.md for the popular ones. Override via env var so you can
+    # switch exchanges without editing code, e.g.:
+    #   EXCHANGE_ID=coinbase SYMBOL=ETH/USD python bot.py
+    exchange_id: str = field(default_factory=lambda: os.getenv("EXCHANGE_ID", "binance"))
+    symbol: str = field(default_factory=lambda: os.getenv("SYMBOL", "BTC/USDT"))
+    timeframe: str = field(default_factory=lambda: os.getenv("TIMEFRAME", "15m"))
+    testnet: bool = field(default_factory=lambda: os.getenv("TESTNET", "true").lower() == "true")
+    api_key: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_KEY", ""))
+    api_secret: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_SECRET", ""))
+    # Some exchanges (Coinbase, KuCoin, OKX, Bitget...) also require a passphrase
+    api_passphrase: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_PASSPHRASE", ""))
+
+
+@dataclass
+class BotConfig:
+    mode: str = "paper"                # "paper" | "live" | "backtest"
+    starting_equity: float = 1000.0
+    taker_fee_pct: float = 0.001       # 0.10% per fill — set to your exchange's real fee
+    slippage_pct: float = 0.0005       # 0.05% assumed slippage per fill
+    poll_interval_sec: int = 60
+    kill_switch_file: str = "KILL"     # touch this file to halt the bot immediately
+
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    exchange: ExchangeConfig = field(default_factory=ExchangeConfig)

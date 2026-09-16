@@ -1,0 +1,20 @@
+[project]
+name = "bot"
+version = "2.0.0"
+description = "Autonomous Crypto Trading Bot with Strategy, Risk Manager, Web Dashboard, and Exchange Authentication"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "ccxt>=4.3.0",
+    "dnspython>=2.0.0"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["."]
+addopts = "-v"

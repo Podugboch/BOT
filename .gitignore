@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.venv/
+.pytest_cache/
+.vercel/
+users.db
+KILL
+.env
+.DS_Store
+BOT.zip
