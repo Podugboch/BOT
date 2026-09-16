@@ -38,7 +38,10 @@ class ExchangeClient:
             exchange_opts["password"] = cfg.api_passphrase  # ccxt's field name for passphrase
         self.exchange = exchange_class(exchange_opts)
         if cfg.testnet and hasattr(self.exchange, "set_sandbox_mode"):
-            self.exchange.set_sandbox_mode(True)
+            try:
+                self.exchange.set_sandbox_mode(True)
+            except Exception:
+                pass
 
         # paper trading book-keeping
         self.paper_cash = starting_equity

@@ -480,30 +480,61 @@ def reset_daily_metrics():
     return {"success": False, "message": "Bot is not initialized"}
 
 
+LAST_ANALYSIS_CACHE: Dict[str, Any] = {}
+
+
 @app.get("/api/analysis")
 def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, exchange: Optional[str] = None):
-    req_symbol = symbol or runner.cfg.exchange.symbol
-    req_timeframe = timeframe or runner.cfg.exchange.timeframe
-    req_exchange = exchange or runner.cfg.exchange.exchange_id
+    global LAST_ANALYSIS_CACHE
+    req_symbol = symbol or runner.cfg.exchange.symbol or "BTC/USDT"
+    req_timeframe = timeframe or runner.cfg.exchange.timeframe or "15m"
+    req_exchange = exchange or runner.cfg.exchange.exchange_id or "binance"
 
+    df = None
+    used_exchange = req_exchange
+
+    # 1. Try to fetch candles from requested exchange (live public OHLCV data)
     try:
-        ex_cfg = ExchangeConfig(exchange_id=req_exchange, symbol=req_symbol, timeframe=req_timeframe)
+        ex_cfg = ExchangeConfig(exchange_id=req_exchange, symbol=req_symbol, timeframe=req_timeframe, testnet=False)
         client = ExchangeClient(ex_cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
         df = client.fetch_ohlcv(limit=100)
+    except Exception as e:
+        logger.warning(f"Could not fetch OHLCV from primary exchange {req_exchange}: {e}")
 
-        if df is None or len(df) < 2:
-            raise HTTPException(status_code=500, detail="Insufficient market data returned from exchange")
+    # 2. Fallback to reliable major exchange if requested exchange fails or returns too few candles
+    if df is None or len(df) < 30:
+        for fb_id in ["binance", "coinbase", "kraken"]:
+            if fb_id == req_exchange:
+                continue
+            try:
+                ex_cfg = ExchangeConfig(exchange_id=fb_id, symbol=req_symbol, timeframe=req_timeframe, testnet=False)
+                client = ExchangeClient(ex_cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+                fb_df = client.fetch_ohlcv(limit=100)
+                if fb_df is not None and len(fb_df) >= 30:
+                    df = fb_df
+                    used_exchange = fb_id
+                    break
+            except Exception:
+                continue
 
+    # 3. If exchange calls fail, return last known cached analysis if available
+    if (df is None or len(df) < 2) and LAST_ANALYSIS_CACHE:
+        return LAST_ANALYSIS_CACHE
+
+    if df is None or len(df) < 2:
+        raise HTTPException(status_code=500, detail="Insufficient market data returned from exchange network")
+
+    try:
         strat_cfg = runner.cfg.strategy
         df = add_indicators(df, strat_cfg)
         curr = df.iloc[-1]
 
         price = float(curr["close"])
-        ema_fast_val = float(curr["ema_fast"])
-        ema_slow_val = float(curr["ema_slow"])
-        rsi_val = float(curr["rsi"])
-        adx_val = float(curr["adx"])
-        atr_val = float(curr["atr"])
+        ema_fast_val = float(curr["ema_fast"]) if pd.notna(curr["ema_fast"]) else price
+        ema_slow_val = float(curr["ema_slow"]) if pd.notna(curr["ema_slow"]) else price
+        rsi_val = float(curr["rsi"]) if pd.notna(curr["rsi"]) else 50.0
+        adx_val = float(curr["adx"]) if pd.notna(curr["adx"]) else 15.0
+        atr_val = float(curr["atr"]) if pd.notna(curr["atr"]) else 0.0
         swing_h = float(curr["swing_high"]) if pd.notna(curr["swing_high"]) else None
         swing_l = float(curr["swing_low"]) if pd.notna(curr["swing_low"]) else None
         fib_382 = float(curr["fib_382"]) if pd.notna(curr["fib_382"]) else None
@@ -522,13 +553,13 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
                 "low": round(float(row["low"]), 2),
                 "close": round(float(row["close"]), 2),
                 "volume": round(float(row["volume"]), 2),
-                "ema_fast": round(float(row["ema_fast"]), 2),
-                "ema_slow": round(float(row["ema_slow"]), 2),
+                "ema_fast": round(float(row["ema_fast"]), 2) if pd.notna(row["ema_fast"]) else round(float(row["close"]), 2),
+                "ema_slow": round(float(row["ema_slow"]), 2) if pd.notna(row["ema_slow"]) else round(float(row["close"]), 2),
             })
 
-        return {
+        result = {
             "symbol": req_symbol,
-            "exchange": req_exchange,
+            "exchange": used_exchange,
             "timeframe": req_timeframe,
             "price": round(price, 2),
             "signal": signal.value,
@@ -550,8 +581,12 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
             },
             "candles": recent_candles,
         }
+        LAST_ANALYSIS_CACHE = result
+        return result
     except Exception as e:
-        logger.exception("Analysis fetch failed")
+        logger.exception("Analysis calculation failed")
+        if LAST_ANALYSIS_CACHE:
+            return LAST_ANALYSIS_CACHE
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1636,64 +1671,98 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function refreshAnalysis() {
       try {
         const res = await fetch('/api/analysis');
+        if (!res.ok) {
+          console.warn('Analysis endpoint returned HTTP status:', res.status);
+          return;
+        }
         const data = await res.json();
+        if (!data || data.price === undefined || data.price === null) {
+          console.warn('Invalid analysis payload:', data);
+          return;
+        }
 
-        document.getElementById('an-price').innerText = '$' + data.price.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('an-exchange').innerText = `Exchange: ${data.exchange} (${data.symbol})`;
+        const priceEl = document.getElementById('an-price');
+        if (priceEl) priceEl.innerText = '$' + Number(data.price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        
+        const exEl = document.getElementById('an-exchange');
+        if (exEl) exEl.innerText = `Exchange: ${data.exchange} (${data.symbol})`;
 
         const trendEl = document.getElementById('an-trend');
-        trendEl.innerText = data.trend;
-        trendEl.className = data.trend === 'BULLISH' ? 'text-base font-bold mt-0.5 text-emerald-400' : 'text-base font-bold mt-0.5 text-rose-400';
-        document.getElementById('an-emas').innerText = `Fast: $${data.ema_fast} | Slow: $${data.ema_slow}`;
+        if (trendEl) {
+          trendEl.innerText = data.trend;
+          trendEl.className = data.trend === 'BULLISH' ? 'text-base font-bold mt-0.5 text-emerald-400' : 'text-base font-bold mt-0.5 text-rose-400';
+        }
+        
+        const emasEl = document.getElementById('an-emas');
+        if (emasEl) emasEl.innerText = `Fast: $${data.ema_fast} | Slow: $${data.ema_slow}`;
 
-        document.getElementById('an-rsi').innerText = data.rsi.toFixed(1);
+        const rsiEl = document.getElementById('an-rsi');
+        if (rsiEl) rsiEl.innerText = Number(data.rsi).toFixed(1);
         const rsiStatusEl = document.getElementById('an-rsi-status');
-        rsiStatusEl.innerText = data.rsi_status;
-        rsiStatusEl.className = data.rsi_status === 'OVERBOUGHT' ? 'text-[10px] mt-1 text-rose-400' : (data.rsi_status === 'OVERSOLD' ? 'text-[10px] mt-1 text-emerald-400' : 'text-[10px] mt-1 text-slate-400');
+        if (rsiStatusEl) {
+          rsiStatusEl.innerText = data.rsi_status;
+          rsiStatusEl.className = data.rsi_status === 'OVERBOUGHT' ? 'text-[10px] mt-1 text-rose-400' : (data.rsi_status === 'OVERSOLD' ? 'text-[10px] mt-1 text-emerald-400' : 'text-[10px] mt-1 text-slate-400');
+        }
 
-        document.getElementById('an-adx').innerText = data.adx.toFixed(1);
+        const adxEl = document.getElementById('an-adx');
+        if (adxEl) adxEl.innerText = Number(data.adx).toFixed(1);
         const adxStatusEl = document.getElementById('an-adx-status');
-        adxStatusEl.innerText = data.adx_status;
-        adxStatusEl.className = data.adx >= 20 ? 'text-[10px] mt-1 text-emerald-400 font-semibold' : 'text-[10px] mt-1 text-slate-400';
+        if (adxStatusEl) {
+          adxStatusEl.innerText = data.adx_status;
+          adxStatusEl.className = Number(data.adx) >= 20 ? 'text-[10px] mt-1 text-emerald-400 font-semibold' : 'text-[10px] mt-1 text-slate-400';
+        }
 
         const sigEl = document.getElementById('val-signal');
-        sigEl.innerText = data.signal;
-        sigEl.className = data.signal === 'BUY' ? 'text-lg font-bold mt-0.5 text-emerald-400 animate-pulse' : (data.signal === 'SELL' ? 'text-lg font-bold mt-0.5 text-rose-400' : 'text-lg font-bold mt-0.5 text-yellow-400');
+        if (sigEl) {
+          sigEl.innerText = data.signal;
+          sigEl.className = data.signal === 'BUY' ? 'text-lg font-bold mt-0.5 text-emerald-400 animate-pulse' : (data.signal === 'SELL' ? 'text-lg font-bold mt-0.5 text-rose-400' : 'text-lg font-bold mt-0.5 text-yellow-400');
+        }
 
-        document.getElementById('fib-high').innerText = data.fib.swing_high ? '$' + data.fib.swing_high.toLocaleString() : '--';
-        document.getElementById('fib-382').innerText = data.fib.fib_382 ? '$' + data.fib.fib_382.toLocaleString() : '--';
-        document.getElementById('fib-500').innerText = data.fib.fib_500 ? '$' + data.fib.fib_500.toLocaleString() : '--';
-        document.getElementById('fib-618').innerText = data.fib.fib_618 ? '$' + data.fib.fib_618.toLocaleString() : '--';
-        document.getElementById('fib-low').innerText = data.fib.swing_low ? '$' + data.fib.swing_low.toLocaleString() : '--';
+        if (data.fib) {
+          const fHigh = document.getElementById('fib-high');
+          if (fHigh) fHigh.innerText = data.fib.swing_high ? '$' + Number(data.fib.swing_high).toLocaleString() : '--';
+          const f382 = document.getElementById('fib-382');
+          if (f382) f382.innerText = data.fib.fib_382 ? '$' + Number(data.fib.fib_382).toLocaleString() : '--';
+          const f500 = document.getElementById('fib-500');
+          if (f500) f500.innerText = data.fib.fib_500 ? '$' + Number(data.fib.fib_500).toLocaleString() : '--';
+          const f618 = document.getElementById('fib-618');
+          if (f618) f618.innerText = data.fib.fib_618 ? '$' + Number(data.fib.fib_618).toLocaleString() : '--';
+          const fLow = document.getElementById('fib-low');
+          if (fLow) fLow.innerText = data.fib.swing_low ? '$' + Number(data.fib.swing_low).toLocaleString() : '--';
 
-        const fibBadge = document.getElementById('an-fib-confluence');
-        if (data.fib.near_fib_support) {
-          fibBadge.innerText = 'AT PULLBACK SUPPORT';
-          fibBadge.className = 'px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
-        } else {
-          fibBadge.innerText = 'OUTSIDE SUPPORT ZONE';
-          fibBadge.className = 'px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400';
+          const fibBadge = document.getElementById('an-fib-confluence');
+          if (fibBadge) {
+            if (data.fib.near_fib_support) {
+              fibBadge.innerText = 'AT PULLBACK SUPPORT';
+              fibBadge.className = 'px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+            } else {
+              fibBadge.innerText = 'OUTSIDE SUPPORT ZONE';
+              fibBadge.className = 'px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400';
+            }
+          }
         }
 
         const candleList = document.getElementById('candle-list');
-        candleList.innerHTML = '';
-        if (data.candles && data.candles.length) {
-          const prices = data.candles.map(c => c.close);
-          const minP = Math.min(...prices);
-          const maxP = Math.max(...prices);
-          const range = maxP - minP || 1;
+        if (candleList) {
+          candleList.innerHTML = '';
+          if (data.candles && data.candles.length) {
+            const prices = data.candles.map(c => Number(c.close));
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            const range = maxP - minP || 1;
 
-          data.candles.forEach(c => {
-            const heightPct = Math.max(15, Math.min(100, ((c.close - minP) / range) * 80 + 15));
-            const isUp = c.close >= c.open;
-            const bar = document.createElement('div');
-            bar.className = 'flex flex-col items-center flex-1 group relative';
-            bar.innerHTML = `
-              <div class="w-full ${isUp ? 'bg-emerald-500/80' : 'bg-rose-500/80'} rounded-t" style="height: ${heightPct}px" title="${c.ts} Close: $${c.close}"></div>
-              <span class="text-[7px] text-slate-500 mt-0.5 opacity-60">${c.ts}</span>
-            `;
-            candleList.appendChild(bar);
-          });
+            data.candles.forEach(c => {
+              const heightPct = Math.max(15, Math.min(100, ((Number(c.close) - minP) / range) * 80 + 15));
+              const isUp = Number(c.close) >= Number(c.open);
+              const bar = document.createElement('div');
+              bar.className = 'flex flex-col items-center flex-1 group relative';
+              bar.innerHTML = `
+                <div class="w-full ${isUp ? 'bg-emerald-500/80' : 'bg-rose-500/80'} rounded-t" style="height: ${heightPct}px" title="${c.ts} Close: $${c.close}"></div>
+                <span class="text-[7px] text-slate-500 mt-0.5 opacity-60">${c.ts}</span>
+              `;
+              candleList.appendChild(bar);
+            });
+          }
         }
       } catch (e) {
         console.error('Error fetching analysis:', e);
