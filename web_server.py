@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
@@ -206,8 +206,9 @@ def create_bot_zip() -> str:
 # API ENDPOINTS: AUTHENTICATION & USER MANAGEMENT
 # ============================================================================
 @app.post("/api/auth/register")
-def register(req: RegisterRequest):
-    res = AuthService.register(req.username, req.email, req.password)
+def register(req: RegisterRequest, request: Request):
+    base_url = str(request.base_url).rstrip("/")
+    res = AuthService.register(req.username, req.email, req.password, base_url=base_url)
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
     return res
@@ -240,8 +241,9 @@ def get_profile(authorization: Optional[str] = Header(None)):
 
 
 @app.post("/api/auth/forgot-password")
-def forgot_password(req: ForgotPasswordRequest):
-    res = AuthService.request_password_reset(req.email)
+def forgot_password(req: ForgotPasswordRequest, request: Request):
+    base_url = str(request.base_url).rstrip("/")
+    res = AuthService.request_password_reset(req.email, base_url=base_url)
     return res
 
 
