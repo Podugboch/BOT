@@ -403,7 +403,7 @@ def save_exchange_credentials(req: SaveExchangeKeyRequest, authorization: Option
 # ============================================================================
 # API ENDPOINTS: CODE DOWNLOAD
 # ============================================================================
-@app.get("/api/download/bot")
+@app.api_route("/api/download/bot", methods=["GET", "HEAD"])
 def download_bot_zip():
     """Packages the bot into BOT.zip and serves it as a file download."""
     zip_path = create_bot_zip()
