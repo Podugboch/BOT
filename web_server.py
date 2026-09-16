@@ -187,21 +187,35 @@ def create_bot_zip() -> str:
         zip_path = Path("/tmp/BOT.zip")
     else:
         zip_path = Path(__file__).resolve().parent / "BOT.zip"
-    exclude_dirs = {".git", ".pytest_cache", "__pycache__", ".venv", "data_cache", "logs", ".vercel"}
-    exclude_files = {"users.db", "bot.log", "web.log", "KILL", "BOT.zip"}
+
+    root = Path(__file__).resolve().parent
+    TARGET_FILES = [
+        "bot.py",
+        "config.py",
+        "exchange_client.py",
+        "indicators.py",
+        "risk_manager.py",
+        "strategy.py",
+        "backtester.py",
+        "web_server.py",
+        "auth.py",
+        "requirements.txt",
+        ".env.example",
+        "README.md",
+        "test_bot.py",
+        "pyproject.toml",
+        "vercel.json",
+    ]
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(Path(__file__).resolve().parent):
-            dirs[:] = [d for d in dirs if d not in exclude_dirs]
-            for file in files:
-                if file in exclude_files or file.endswith(".pyc"):
-                    continue
-                file_path = Path(root) / file
-                arcname = file_path.relative_to(Path(__file__).resolve().parent)
-                # Avoid nesting redundant copies
-                if "crypto_bot" in arcname.parts and len(arcname.parts) > 1:
-                    continue
-                zf.write(file_path, arcname)
+        for fname in TARGET_FILES:
+            fpath = root / fname
+            if fpath.exists() and fpath.is_file():
+                zf.write(fpath, fname)
+        api_index = root / "api" / "index.py"
+        if api_index.exists():
+            zf.write(api_index, "api/index.py")
+
     return str(zip_path)
 
 
