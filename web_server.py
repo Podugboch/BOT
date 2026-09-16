@@ -58,6 +58,13 @@ EXCHANGES_META = [
     {"id": "mexc", "name": "MEXC", "needs_passphrase": False, "sandbox": False},
     {"id": "bitfinex", "name": "Bitfinex", "needs_passphrase": False, "sandbox": False},
     {"id": "cryptocom", "name": "Crypto.com", "needs_passphrase": False, "sandbox": False},
+    {"id": "htx", "name": "HTX (Huobi)", "needs_passphrase": False, "sandbox": False},
+    {"id": "bingx", "name": "BingX", "needs_passphrase": False, "sandbox": False},
+    {"id": "whitebit", "name": "WhiteBIT", "needs_passphrase": False, "sandbox": False},
+    {"id": "gemini", "name": "Gemini", "needs_passphrase": False, "sandbox": True},
+    {"id": "phemex", "name": "Phemex", "needs_passphrase": False, "sandbox": True},
+    {"id": "poloniex", "name": "Poloniex", "needs_passphrase": False, "sandbox": False},
+    {"id": "deribit", "name": "Deribit", "needs_passphrase": False, "sandbox": True},
 ]
 
 # --- Global Bot Runner ---
@@ -290,8 +297,15 @@ def get_exchanges():
 
 
 @app.post("/api/exchange/test")
-def test_exchange(req: TestExchangeRequest):
+def test_exchange(req: TestExchangeRequest, authorization: Optional[str] = Header(None)):
     """Test connection and credential validity using CCXT."""
+    user = get_current_user(authorization)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please create an account and log in to test exchange API keys."
+        )
+
     if not hasattr(ccxt, req.exchange_id):
         raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange_id}'")
 
@@ -325,18 +339,22 @@ def test_exchange(req: TestExchangeRequest):
     except ccxt.AuthenticationError as e:
         return {"success": False, "message": f"Authentication Error: {str(e)}"}
     except Exception as e:
-        # Some exchanges don't allow balance fetch on testnet without special endpoints
         return {"success": False, "message": f"Connection check failed: {str(e)}"}
 
 
 @app.post("/api/exchange/save")
 def save_exchange_credentials(req: SaveExchangeKeyRequest, authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    # If authenticated, store in DB per user
-    if user:
-        AuthService.save_exchange_key(
-            user["id"], req.exchange_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please create an account and log in to manage exchange API keys."
         )
+
+    # Store in DB per user
+    AuthService.save_exchange_key(
+        user["id"], req.exchange_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
+    )
 
     # Also update .env and active BotConfig so the live bot can use it immediately
     env_file = Path(".env")
@@ -747,9 +765,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </button>
 
         <!-- Auth User Menu Button -->
-        <div id="auth-buttons">
+        <div id="auth-buttons" class="flex items-center gap-2">
           <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
             Login
+          </button>
+          <button onclick="openAuthModal('register')" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition">
+            Register
           </button>
         </div>
         <div id="user-badge" class="hidden items-center gap-2 bg-slate-900 border border-bordercol px-2.5 py-1 rounded-lg">
@@ -832,62 +853,84 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </span>
       </div>
 
-      <form id="exchange-key-form" onsubmit="saveExchangeKey(event)" class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
-        <!-- 1. Select Exchange -->
-        <div>
-          <label class="block text-slate-300 font-semibold mb-1">1. Choose Exchange</label>
-          <select id="key-exchange-select" onchange="onExchangeChange()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white font-medium focus:border-emerald-500">
-            <!-- Populated via JS -->
-          </select>
-          <div id="exchange-pass-hint" class="text-[10px] text-slate-400 mt-1"></div>
+      <!-- LOCKED STATE: Shown when user is not logged in -->
+      <div id="api-keys-locked" class="bg-slate-900/90 border border-bordercol/80 rounded-xl p-8 text-center space-y-3">
+        <div class="inline-flex p-3 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 mb-1">
+          <i class="fa-solid fa-lock text-2xl"></i>
         </div>
-
-        <!-- 2. API Key -->
-        <div>
-          <label class="block text-slate-300 font-semibold mb-1">2. API Key</label>
-          <input type="text" id="key-api-key" required placeholder="Paste API Key" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
+        <h3 class="text-base font-bold text-white">Exchange API Keys are Protected</h3>
+        <p class="text-xs text-slate-400 max-w-md mx-auto">
+          You must create an account and log in before you can access, configure, or test exchange API keys.
+        </p>
+        <div class="flex items-center justify-center gap-3 pt-2">
+          <button onclick="openAuthModal('login')" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol text-xs font-semibold rounded-lg transition">
+            <i class="fa-solid fa-right-to-bracket mr-1"></i> Log In
+          </button>
+          <button onclick="openAuthModal('register')" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition">
+            <i class="fa-solid fa-user-plus mr-1"></i> Create Account
+          </button>
         </div>
+      </div>
 
-        <!-- 3. API Secret -->
-        <div>
-          <label class="block text-slate-300 font-semibold mb-1">3. API Secret</label>
-          <input type="password" id="key-api-secret" required placeholder="Paste API Secret" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
-        </div>
-
-        <!-- 4. Passphrase (Dynamic) -->
-        <div id="passphrase-container">
-          <label class="block text-slate-300 font-semibold mb-1" id="passphrase-label">4. Passphrase</label>
-          <input type="password" id="key-api-passphrase" placeholder="Passphrase (if needed)" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
-        </div>
-
-        <!-- Options & Action Buttons -->
-        <div class="md:col-span-4 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-bordercol/50">
-          <div class="flex items-center gap-4">
-            <label class="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" id="key-testnet" checked class="rounded bg-slate-900 border-bordercol text-emerald-500">
-              <span class="text-slate-300 font-medium">Use Testnet / Sandbox Mode (Recommended first)</span>
-            </label>
+      <!-- UNLOCKED STATE: Shown only after account creation and login -->
+      <div id="api-keys-unlocked" class="hidden space-y-4">
+        <form id="exchange-key-form" onsubmit="saveExchangeKey(event)" class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
+          <!-- 1. Select Exchange -->
+          <div>
+            <label class="block text-slate-300 font-semibold mb-1">1. Choose Exchange</label>
+            <select id="key-exchange-select" onchange="onExchangeChange()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white font-medium focus:border-emerald-500">
+              <!-- Populated via JS -->
+            </select>
+            <div id="exchange-pass-hint" class="text-[10px] text-slate-400 mt-1"></div>
           </div>
 
-          <div class="flex items-center gap-2">
-            <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5">
-              <i class="fa-solid fa-plug"></i> Test Connection
-            </button>
-            <button type="submit" id="btn-save-key" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
-              <i class="fa-solid fa-floppy-disk"></i> Save & Apply Credentials
-            </button>
+          <!-- 2. API Key -->
+          <div>
+            <label class="block text-slate-300 font-semibold mb-1">2. API Key</label>
+            <input type="text" id="key-api-key" required placeholder="Paste API Key" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
           </div>
-        </div>
-      </form>
 
-      <!-- Connection Test Result Banner -->
-      <div id="key-test-result" class="hidden text-xs p-3 rounded-lg border"></div>
+          <!-- 3. API Secret -->
+          <div>
+            <label class="block text-slate-300 font-semibold mb-1">3. API Secret</label>
+            <input type="password" id="key-api-secret" required placeholder="Paste API Secret" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
+          </div>
 
-      <!-- Currently Saved Keys for User -->
-      <div id="saved-keys-section" class="pt-2">
-        <div class="text-xs font-semibold text-slate-400 mb-2">Active Exchange Credentials</div>
-        <div id="saved-keys-list" class="space-y-1.5 text-xs">
-          <div class="text-slate-500 italic">No custom keys saved yet. Bot currently defaults to Binance public data / paper mode.</div>
+          <!-- 4. Passphrase (Dynamic) -->
+          <div id="passphrase-container">
+            <label class="block text-slate-300 font-semibold mb-1" id="passphrase-label">4. Passphrase</label>
+            <input type="password" id="key-api-passphrase" placeholder="Passphrase (if needed)" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
+          </div>
+
+          <!-- Options & Action Buttons -->
+          <div class="md:col-span-4 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-bordercol/50">
+            <div class="flex items-center gap-4">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" id="key-testnet" checked class="rounded bg-slate-900 border-bordercol text-emerald-500">
+                <span class="text-slate-300 font-medium">Use Testnet / Sandbox Mode (Recommended first)</span>
+              </label>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5">
+                <i class="fa-solid fa-plug"></i> Test Connection
+              </button>
+              <button type="submit" id="btn-save-key" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+                <i class="fa-solid fa-floppy-disk"></i> Save & Apply Credentials
+              </button>
+            </div>
+          </div>
+        </form>
+
+        <!-- Connection Test Result Banner -->
+        <div id="key-test-result" class="hidden text-xs p-3 rounded-lg border"></div>
+
+        <!-- Currently Saved Keys for User -->
+        <div id="saved-keys-section" class="pt-2">
+          <div class="text-xs font-semibold text-slate-400 mb-2">Active Exchange Credentials</div>
+          <div id="saved-keys-list" class="space-y-1.5 text-xs">
+            <div class="text-slate-500 italic">No custom keys saved yet. Bot currently defaults to Binance public data / paper mode.</div>
+          </div>
         </div>
       </div>
     </div>
@@ -985,12 +1028,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div>
             <label class="block text-slate-400 mb-1">Exchange</label>
             <select id="bt-exchange" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
-              <option value="binance">Binance</option>
-              <option value="coinbase">Coinbase</option>
+              <option value="binance" selected>Binance</option>
+              <option value="coinbase">Coinbase Advanced</option>
               <option value="kraken">Kraken</option>
               <option value="kucoin">KuCoin</option>
               <option value="bybit">Bybit</option>
               <option value="okx">OKX</option>
+              <option value="bitget">Bitget</option>
+              <option value="gateio">Gate.io</option>
+              <option value="mexc">MEXC</option>
+              <option value="bitfinex">Bitfinex</option>
+              <option value="cryptocom">Crypto.com</option>
+              <option value="htx">HTX (Huobi)</option>
+              <option value="bingx">BingX</option>
+              <option value="whitebit">WhiteBIT</option>
+              <option value="gemini">Gemini</option>
+              <option value="phemex">Phemex</option>
+              <option value="poloniex">Poloniex</option>
+              <option value="deribit">Deribit</option>
             </select>
           </div>
 
@@ -1002,6 +1057,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>
               <label class="block text-slate-400 mb-1">Timeframe</label>
               <select id="bt-timeframe" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+                <option value="5m">5m</option>
                 <option value="15m" selected>15m</option>
                 <option value="1h">1h</option>
                 <option value="4h">4h</option>
@@ -1155,12 +1211,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         exchangesList = data.exchanges;
 
         const sel = document.getElementById('key-exchange-select');
-        sel.innerHTML = '';
+        const btSel = document.getElementById('bt-exchange');
+        if (sel) sel.innerHTML = '';
+        if (btSel) btSel.innerHTML = '';
+
         exchangesList.forEach(ex => {
-          const opt = document.createElement('option');
-          opt.value = ex.id;
-          opt.innerText = ex.name + (ex.needs_passphrase ? ' (Passphrase required)' : '');
-          sel.appendChild(opt);
+          if (sel) {
+            const opt = document.createElement('option');
+            opt.value = ex.id;
+            opt.innerText = ex.name + (ex.needs_passphrase ? ' (Passphrase required)' : '');
+            sel.appendChild(opt);
+          }
+          if (btSel) {
+            const btOpt = document.createElement('option');
+            btOpt.value = ex.id;
+            btOpt.innerText = ex.name;
+            btSel.appendChild(btOpt);
+          }
         });
         onExchangeChange();
       } catch (e) {
@@ -1189,6 +1256,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     async function testExchangeConnection() {
+      const token = localStorage.getItem('bot_auth_token');
+      if (!token) {
+        alert('Authentication required: please sign up or log in first to test exchange keys.');
+        openAuthModal('login');
+        return;
+      }
+
       const btn = document.getElementById('btn-test-key');
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing...';
@@ -1207,7 +1281,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/api/exchange/test', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
           body: JSON.stringify(payload)
         });
         const data = await res.json();
@@ -1229,6 +1306,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function saveExchangeKey(e) {
       e.preventDefault();
+      const token = localStorage.getItem('bot_auth_token');
+      if (!token) {
+        alert('Authentication required: please create an account and log in first to configure exchange credentials.');
+        openAuthModal('login');
+        return;
+      }
+
       const btn = document.getElementById('btn-save-key');
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
@@ -1241,9 +1325,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         testnet: document.getElementById('key-testnet').checked
       };
 
-      const token = localStorage.getItem('bot_auth_token');
-      const headers = { 'Content-Type': 'application/json' };
-      if (token) headers['Authorization'] = 'Bearer ' + token;
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      };
 
       try {
         const res = await fetch('/api/exchange/save', {
@@ -1408,10 +1493,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const token = localStorage.getItem('bot_auth_token');
       const authButtons = document.getElementById('auth-buttons');
       const userBadge = document.getElementById('user-badge');
+      const lockedDiv = document.getElementById('api-keys-locked');
+      const unlockedDiv = document.getElementById('api-keys-unlocked');
 
       if (!token) {
-        authButtons.classList.remove('hidden');
-        userBadge.classList.add('hidden');
+        if (authButtons) authButtons.classList.remove('hidden');
+        if (userBadge) userBadge.classList.add('hidden');
+        if (lockedDiv) lockedDiv.classList.remove('hidden');
+        if (unlockedDiv) unlockedDiv.classList.add('hidden');
         return;
       }
 
@@ -1422,9 +1511,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (data.authenticated) {
           currentUser = data.user;
-          authButtons.classList.add('hidden');
-          userBadge.classList.remove('hidden');
-          document.getElementById('user-name-display').innerText = currentUser.username;
+          if (authButtons) authButtons.classList.add('hidden');
+          if (userBadge) userBadge.classList.remove('hidden');
+          if (document.getElementById('user-name-display')) {
+            document.getElementById('user-name-display').innerText = currentUser.username;
+          }
+          if (lockedDiv) lockedDiv.classList.add('hidden');
+          if (unlockedDiv) unlockedDiv.classList.remove('hidden');
 
           // Render saved exchange keys
           const list = document.getElementById('saved-keys-list');
@@ -1446,11 +1539,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         } else {
           localStorage.removeItem('bot_auth_token');
-          authButtons.classList.remove('hidden');
-          userBadge.classList.add('hidden');
+          currentUser = null;
+          if (authButtons) authButtons.classList.remove('hidden');
+          if (userBadge) userBadge.classList.add('hidden');
+          if (lockedDiv) lockedDiv.classList.remove('hidden');
+          if (unlockedDiv) unlockedDiv.classList.add('hidden');
         }
       } catch (e) {
         console.error('Check auth error:', e);
+        if (lockedDiv) lockedDiv.classList.remove('hidden');
+        if (unlockedDiv) unlockedDiv.classList.add('hidden');
       }
     }
 
