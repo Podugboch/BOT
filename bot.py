@@ -14,6 +14,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+import pandas as pd
 
 from config import BotConfig
 from exchange_client import ExchangeClient
@@ -73,6 +74,23 @@ class TradingBot:
         price = float(df["close"].iloc[-1])
         can_trade, reason = self.risk.can_trade()
 
+        # In manual execution mode, monitor market and signals without auto-placing orders
+        if getattr(self.cfg, "execution_mode", "auto") == "manual":
+            sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position))
+            if self.position is not None:
+                hit_stop = price <= self.position["stop"]
+                hit_target = price >= self.position["target"]
+                if hit_stop:
+                    log.warning("MANUAL MODE: Stop loss price reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
+                elif hit_target:
+                    log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
+                elif sig == Signal.SELL:
+                    log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+            else:
+                if sig == Signal.BUY:
+                    log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
+            return True
+
         try:
             if self.position is None:
                 if not can_trade:
@@ -86,6 +104,75 @@ class TradingBot:
             return False
 
         return True
+
+    def manual_buy(self, custom_size: float = 0.0) -> dict:
+        """Place a manual BUY order."""
+        if self.kill_switch_active():
+            raise RuntimeError(f"Kill switch active ({self.cfg.kill_switch_file}). Operation aborted.")
+        if self.position is not None:
+            raise RuntimeError("Position already open. Please close your current position before opening a new one.")
+        can_trade, reason = self.risk.can_trade()
+        if not can_trade:
+            raise RuntimeError(f"Risk check blocked trade: {reason}")
+
+        df = self.exchange.fetch_ohlcv(limit=50)
+        if df is None or len(df) < 2:
+            raise RuntimeError("Could not fetch current market price from exchange.")
+        df = add_indicators(df, self.cfg.strategy)
+        price = float(df["close"].iloc[-1])
+        atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns and pd.notna(df["atr"].iloc[-1]) else (price * 0.02)
+
+        stop, target = self.risk.stop_and_target(price, atr_val, "BUY")
+        size = custom_size if custom_size > 0 else self.risk.position_size(price, stop)
+        if size <= 0:
+            raise RuntimeError("Calculated position size is 0. Check equity or risk settings.")
+
+        fill = self.exchange.place_order("BUY", size, price)
+        self.position = {
+            "entry": fill["price"],
+            "size": size,
+            "stop": stop,
+            "target": target,
+            "fee_paid": fill["fee"],
+            "manual": True,
+        }
+        log.info("MANUAL BUY: entry=%.2f stop=%.2f target=%.2f size=%.6f", fill["price"], stop, target, size)
+        return {
+            "success": True,
+            "action": "BUY",
+            "price": fill["price"],
+            "size": size,
+            "stop": stop,
+            "target": target,
+            "fee": fill["fee"],
+            "mode": fill.get("mode", self.cfg.mode),
+        }
+
+    def manual_sell(self) -> dict:
+        """Place a manual SELL / close position order."""
+        if self.position is None:
+            raise RuntimeError("No active open position to close.")
+
+        df = self.exchange.fetch_ohlcv(limit=10)
+        price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
+
+        fill = self.exchange.place_order("SELL", self.position["size"], price)
+        pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]
+               - self.position["fee_paid"] - fill["fee"])
+        self.risk.record_trade_result(pnl)
+        closed_position = dict(self.position)
+        self.position = None
+        log.info("MANUAL SELL: pnl=%.2f equity=%.2f", pnl, self.risk.state.equity)
+        return {
+            "success": True,
+            "action": "SELL",
+            "price": fill["price"],
+            "size": closed_position["size"],
+            "pnl": round(pnl, 2),
+            "equity": round(self.risk.state.equity, 2),
+            "fee": fill["fee"],
+            "mode": fill.get("mode", self.cfg.mode),
+        }
 
     def _maybe_enter(self, df, price):
         sig = generate_signal(df, self.cfg.strategy, position_open=False)

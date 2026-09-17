@@ -283,3 +283,108 @@ class TestTradingBot:
         finally:
             if os.path.exists(cfg.kill_switch_file):
                 os.remove(cfg.kill_switch_file)
+
+    def test_manual_mode_execution(self, sample_ohlcv):
+        cfg = BotConfig()
+        cfg.execution_mode = "manual"
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        # In manual mode, bot.step() should run without opening auto position
+        res = bot.step()
+        assert res is True
+        assert bot.position is None
+
+        # Manual buy should open position
+        buy_res = bot.manual_buy(custom_size=0.01)
+        assert buy_res["success"] is True
+        assert bot.position is not None
+        assert bot.position["size"] == 0.01
+
+        # Manual sell should close position
+        sell_res = bot.manual_sell()
+        assert sell_res["success"] is True
+        assert bot.position is None
+
+
+# ============================================================================
+# MULTI-STRATEGY & SETTINGS ENDPOINT TESTS
+# ============================================================================
+class TestNewIndicatorsAndMultiStrategy:
+    def test_bollinger_bands(self, sample_ohlcv):
+        from indicators import bollinger_bands
+        bb = bollinger_bands(sample_ohlcv["close"], period=20, num_std=2.0)
+        assert "bb_mid" in bb.columns
+        assert "bb_upper" in bb.columns
+        assert "bb_lower" in bb.columns
+        valid_row = bb.iloc[-1]
+        assert valid_row["bb_upper"] >= valid_row["bb_mid"] >= valid_row["bb_lower"]
+
+    def test_macd(self, sample_ohlcv):
+        from indicators import macd
+        m = macd(sample_ohlcv["close"], fast=12, slow=26, signal_period=9)
+        assert "macd" in m.columns
+        assert "macd_signal" in m.columns
+        assert "macd_hist" in m.columns
+
+    def test_pure_ema_cross_signal(self):
+        cfg = StrategyConfig(strategy_name="pure_ema_cross", adx_trend_threshold=15)
+        df = pd.DataFrame([
+            {"ema_fast": 100.0, "ema_slow": 101.0, "rsi": 45.0, "adx": 20.0, "close": 100.0},
+            {"ema_fast": 102.0, "ema_slow": 101.0, "rsi": 48.0, "adx": 22.0, "close": 102.0},
+        ])
+        sig = generate_signal(df, cfg, position_open=False)
+        assert sig == Signal.BUY
+
+    def test_rsi_reversion_signal(self):
+        cfg = StrategyConfig(strategy_name="rsi_reversion")
+        # Oversold bounce: prev <= 30, curr > prev
+        df_buy = pd.DataFrame([
+            {"rsi": 25.0, "close": 100.0},
+            {"rsi": 29.0, "close": 101.0},
+        ])
+        sig_buy = generate_signal(df_buy, cfg, position_open=False)
+        assert sig_buy == Signal.BUY
+
+        # Overbought exit
+        df_sell = pd.DataFrame([
+            {"rsi": 68.0, "close": 110.0},
+            {"rsi": 72.0, "close": 112.0},
+        ])
+        sig_sell = generate_signal(df_sell, cfg, position_open=True)
+        assert sig_sell == Signal.SELL
+
+    def test_settings_api_and_5m_timeframe(self):
+        from fastapi.testclient import TestClient
+        from web_server import app, AVAILABLE_TIMEFRAMES
+
+        assert "5m" in AVAILABLE_TIMEFRAMES
+
+        client = TestClient(app)
+        # GET settings
+        get_res = client.get("/api/bot/settings")
+        assert get_res.status_code == 200
+        data = get_res.json()
+        assert "5m" in data["available_timeframes"]
+        assert any(s["id"] == "pure_ema_cross" for s in data["available_strategies"])
+
+        # POST settings with 5m and manual mode
+        post_res = client.post("/api/bot/settings", json={
+            "execution_mode": "manual",
+            "strategy": "pure_ema_cross",
+            "timeframe": "5m",
+            "symbol": "BTC/USDT",
+        })
+        assert post_res.status_code == 200
+        post_data = post_res.json()
+        assert post_data["execution_mode"] == "manual"
+        assert post_data["timeframe"] == "5m"
+        assert post_data["strategy"] == "pure_ema_cross"
+
+        # Check status reflects settings
+        st_res = client.get("/api/status")
+        assert st_res.status_code == 200
+        st_data = st_res.json()
+        assert st_data["execution_mode"] == "manual"
+        assert st_data["timeframe"] == "5m"
+        assert st_data["strategy"] == "pure_ema_cross"
+

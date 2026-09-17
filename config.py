@@ -39,7 +39,8 @@ except ImportError:
 
 @dataclass
 class StrategyConfig:
-    """EMA-crossover trend strategy, filtered by RSI, ADX, and Fibonacci retracement."""
+    """Configurable trading strategy parameters."""
+    strategy_name: str = field(default_factory=lambda: os.getenv("STRATEGY", "ema_cross_fib"))
     fast_ema: int = 12
     slow_ema: int = 26
     rsi_period: int = 14
@@ -52,6 +53,11 @@ class StrategyConfig:
     use_fib_filter: bool = True
     fib_lookback: int = 50          # bars used to find the swing high/low
     fib_tolerance_pct: float = 0.005  # price counts as "at" a level within 0.5%
+
+    # Volatility & Momentum indicator parameters
+    bb_period: int = 20
+    bb_std: float = 2.0
+    macd_signal_period: int = 9
 
 
 @dataclass
@@ -83,7 +89,8 @@ class ExchangeConfig:
 
 @dataclass
 class BotConfig:
-    mode: str = "paper"                # "paper" | "live" | "backtest"
+    mode: str = field(default_factory=lambda: os.getenv("MODE", "paper"))  # "paper" | "live" | "backtest"
+    execution_mode: str = field(default_factory=lambda: os.getenv("EXECUTION_MODE", "auto"))  # "auto" | "manual"
     starting_equity: float = 1000.0
     taker_fee_pct: float = 0.001       # 0.10% per fill — set to your exchange's real fee
     slippage_pct: float = 0.0005       # 0.05% assumed slippage per fill
@@ -93,3 +100,4 @@ class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
+

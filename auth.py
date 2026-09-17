@@ -14,6 +14,8 @@ import sqlite3
 import hashlib
 import secrets
 import smtplib
+import ssl
+import socket
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -131,26 +133,88 @@ def set_system_setting(key: str, value: str):
         print(f"[AUTH ERROR] Failed to set system setting {key}: {e}")
 
 
+def get_resend_verified_domains(resend_key: str) -> list:
+    """Queries Resend API for verified sending domains associated with this API key."""
+    if not resend_key:
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://api.resend.com/domains",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "User-Agent": "CryptoTradingBot/2.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            domains = data.get("data", [])
+            return [d["name"] for d in domains if d.get("status") == "verified"]
+    except Exception:
+        return []
+
+
 def get_email_settings() -> Dict[str, Any]:
-    smtp_host = get_system_setting("SMTP_HOST", "") or ""
-    smtp_port = get_system_setting("SMTP_PORT", "587") or "587"
-    smtp_user = get_system_setting("SMTP_USER", "") or ""
-    smtp_pass = get_system_setting("SMTP_PASS", "") or ""
-    from_email = get_system_setting("FROM_EMAIL", "") or ""
-    resend_key = get_system_setting("RESEND_API_KEY", "") or ""
+    provider = (get_system_setting("EMAIL_PROVIDER", "") or "").strip().lower()
+    smtp_host = (get_system_setting("SMTP_HOST", "") or "").strip()
+    smtp_port = (get_system_setting("SMTP_PORT", "587") or "587").strip()
+    smtp_user = (get_system_setting("SMTP_USER", "") or "").strip()
+    smtp_pass = (get_system_setting("SMTP_PASS", "") or "").strip()
+    from_email = (get_system_setting("FROM_EMAIL", "") or "").strip()
+    resend_key = (get_system_setting("RESEND_API_KEY", "") or "").strip()
+    brevo_key = (get_system_setting("BREVO_API_KEY", "") or "").strip()
+    sendgrid_key = (get_system_setting("SENDGRID_API_KEY", "") or "").strip()
 
     has_smtp = bool(smtp_host and smtp_user and smtp_pass)
     has_resend = bool(resend_key)
-    is_configured = has_smtp or has_resend
+    has_brevo = bool(brevo_key)
+    has_sendgrid = bool(sendgrid_key)
+    is_configured = has_smtp or has_resend or has_brevo or has_sendgrid
 
-    active_provider = "none"
+    # Check if Resend has verified domains on account
+    resend_domains = []
     if has_resend:
-        active_provider = "resend"
-    elif has_smtp:
-        if "gmail" in smtp_host.lower():
+        resend_domains = get_resend_verified_domains(resend_key)
+        # If user has a verified custom domain on Resend but from_email is unset or still on sandbox, auto-upgrade
+        if resend_domains and ("onboarding@resend.dev" in from_email.lower() or not from_email):
+            auto_from = f"Crypto Trading Bot <noreply@{resend_domains[0]}>"
+            from_email = auto_from
+            set_system_setting("FROM_EMAIL", auto_from)
+
+    # Check if Resend is operating in sandbox testing mode (onboarding@resend.dev without verified domain)
+    is_resend_sandbox = bool(
+        has_resend and ("onboarding@resend.dev" in from_email.lower() or not from_email) and not resend_domains
+    )
+
+    # Determine active provider
+    active_provider = "none"
+    if provider in ["gmail", "brevo", "resend", "sendgrid", "smtp"]:
+        if provider == "gmail" and has_smtp:
             active_provider = "gmail"
-        else:
+        elif provider == "brevo" and has_brevo:
+            active_provider = "brevo"
+        elif provider == "resend" and has_resend:
+            active_provider = "resend"
+        elif provider == "sendgrid" and has_sendgrid:
+            active_provider = "sendgrid"
+        elif provider == "smtp" and has_smtp:
             active_provider = "smtp"
+
+    if active_provider == "none":
+        if has_resend:
+            active_provider = "resend"
+        elif has_brevo:
+            active_provider = "brevo"
+        elif has_sendgrid:
+            active_provider = "sendgrid"
+        elif has_smtp:
+            active_provider = "gmail" if "gmail" in smtp_host.lower() else "smtp"
+
+    can_send_to_all_users = bool(
+        (active_provider in ["gmail", "smtp"] and has_smtp)
+        or (active_provider == "brevo" and has_brevo)
+        or (active_provider == "sendgrid" and has_sendgrid)
+        or (active_provider == "resend" and has_resend and not is_resend_sandbox)
+    )
 
     return {
         "is_configured": is_configured,
@@ -160,14 +224,34 @@ def get_email_settings() -> Dict[str, Any]:
         "smtp_user": smtp_user,
         "smtp_pass_masked": f"{smtp_pass[:2]}••••{smtp_pass[-2:]}" if len(smtp_pass) > 4 else ("••••" if smtp_pass else ""),
         "from_email": from_email,
-        "resend_key_masked": f"{resend_key[:5]}••••" if len(resend_key) > 5 else ("••••" if resend_key else "")
+        "resend_key_masked": f"{resend_key[:5]}••••" if len(resend_key) > 5 else ("••••" if resend_key else ""),
+        "brevo_key_masked": f"{brevo_key[:5]}••••" if len(brevo_key) > 5 else ("••••" if brevo_key else ""),
+        "sendgrid_key_masked": f"{sendgrid_key[:5]}••••" if len(sendgrid_key) > 5 else ("••••" if sendgrid_key else ""),
+        "is_resend_sandbox": is_resend_sandbox,
+        "can_send_to_all_users": can_send_to_all_users,
+        "resend_domains": resend_domains,
+        "verified_domain": resend_domains[0] if resend_domains else ""
     }
 
 
 def save_email_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    for k in ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "FROM_EMAIL", "RESEND_API_KEY"]:
-        if k in settings:
+    allowed_keys = [
+        "EMAIL_PROVIDER",
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_USER",
+        "SMTP_PASS",
+        "FROM_EMAIL",
+        "RESEND_API_KEY",
+        "BREVO_API_KEY",
+        "SENDGRID_API_KEY",
+    ]
+    for k in allowed_keys:
+        if k in settings and settings[k] is not None:
             val = str(settings[k]).strip()
+            # Do not overwrite sensitive credentials with blank if already configured
+            if k in ["SMTP_PASS", "RESEND_API_KEY", "BREVO_API_KEY", "SENDGRID_API_KEY"] and val == "":
+                continue
             set_system_setting(k, val)
 
     return {"success": True, "message": "Email settings saved successfully", "settings": get_email_settings()}
@@ -185,8 +269,219 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
     return secrets.compare_digest(computed_hash, password_hash)
 
 
+def _send_via_resend(to_email: str, subject: str, body: str, resend_key: str, from_email: str, email_type: str) -> Tuple[bool, str]:
+    if not resend_key:
+        return False, "Resend API key not configured"
+
+    sender = from_email
+    # If sender is using the sandbox address or empty, check if account has a verified domain
+    if not sender or "onboarding@resend.dev" in sender.lower():
+        verified = get_resend_verified_domains(resend_key)
+        if verified:
+            sender = f"Crypto Trading Bot <noreply@{verified[0]}>"
+            set_system_setting("FROM_EMAIL", sender)
+        else:
+            sender = "Crypto Trading Bot <onboarding@resend.dev>"
+
+    try:
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=json.dumps({
+                "from": sender,
+                "to": [to_email],
+                "subject": subject,
+                "html": body,
+            }).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "CryptoTradingBot/2.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            if 200 <= resp.status < 300:
+                msg = f"Delivered {email_type} email to {to_email} via Resend API ({sender})"
+                print(f"[AUTH EMAIL] {msg}")
+                return True, msg
+            return False, f"Resend API returned status code {resp.status}"
+    except urllib.error.HTTPError as e:
+        try:
+            raw_err = e.read().decode("utf-8")
+            err_json = json.loads(raw_err)
+            detail = err_json.get("message", raw_err)
+        except Exception:
+            detail = str(e)
+
+        if e.code == 403 and ("testing emails to your own email address" in detail.lower() or "verify a domain" in detail.lower()):
+            err_msg = (
+                "Resend Sandbox Restriction (403): onboarding@resend.dev can only deliver to the Resend account owner. "
+                "To send verification emails to all registering users, please add & verify your custom domain at https://resend.com/domains "
+                "and set FROM_EMAIL to an address on that domain (e.g. Crypto Bot <noreply@yourdomain.com>), or switch to Brevo API or Gmail SMTP."
+            )
+        else:
+            err_msg = f"Resend API error ({e.code}): {detail}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+    except Exception as e:
+        err_msg = f"Resend delivery failed: {e}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+
+
+def _send_via_brevo(to_email: str, subject: str, body: str, brevo_key: str, from_email: str, email_type: str) -> Tuple[bool, str]:
+    if not brevo_key:
+        return False, "Brevo API key not configured"
+
+    sender_name = "Crypto Trading Bot"
+    sender_email = from_email or "noreply@cryptobot.local"
+    if "<" in sender_email and ">" in sender_email:
+        sender_name = sender_email.split("<")[0].strip() or sender_name
+        sender_email = sender_email.split("<")[1].split(">")[0].strip()
+
+    try:
+        payload = {
+            "sender": {"name": sender_name, "email": sender_email},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": body,
+        }
+        req = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "api-key": brevo_key,
+                "Content-Type": "application/json",
+                "User-Agent": "CryptoTradingBot/2.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            if 200 <= resp.status < 300:
+                msg = f"Delivered {email_type} email to {to_email} via Brevo API"
+                print(f"[AUTH EMAIL] {msg}")
+                return True, msg
+            return False, f"Brevo API returned status code {resp.status}"
+    except urllib.error.HTTPError as e:
+        try:
+            raw_err = e.read().decode("utf-8")
+            err_json = json.loads(raw_err)
+            detail = err_json.get("message", raw_err)
+        except Exception:
+            detail = str(e)
+        err_msg = f"Brevo API error ({e.code}): {detail}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+    except Exception as e:
+        err_msg = f"Brevo delivery failed: {e}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+
+
+def _send_via_sendgrid(to_email: str, subject: str, body: str, sendgrid_key: str, from_email: str, email_type: str) -> Tuple[bool, str]:
+    if not sendgrid_key:
+        return False, "SendGrid API key not configured"
+
+    sender_name = "Crypto Trading Bot"
+    sender_email = from_email or "noreply@cryptobot.local"
+    if "<" in sender_email and ">" in sender_email:
+        sender_name = sender_email.split("<")[0].strip() or sender_name
+        sender_email = sender_email.split("<")[1].split(">")[0].strip()
+
+    try:
+        payload = {
+            "personalizations": [{"to": [{"email": to_email}]}],
+            "from": {"email": sender_email, "name": sender_name},
+            "subject": subject,
+            "content": [{"type": "text/html", "value": body}]
+        }
+        req = urllib.request.Request(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {sendgrid_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "CryptoTradingBot/2.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            if 200 <= resp.status < 300:
+                msg = f"Delivered {email_type} email to {to_email} via SendGrid API"
+                print(f"[AUTH EMAIL] {msg}")
+                return True, msg
+            return False, f"SendGrid API returned status code {resp.status}"
+    except urllib.error.HTTPError as e:
+        try:
+            raw_err = e.read().decode("utf-8")
+            err_json = json.loads(raw_err)
+            errors = err_json.get("errors", [])
+            detail = errors[0].get("message") if errors else raw_err
+        except Exception:
+            detail = str(e)
+        err_msg = f"SendGrid API error ({e.code}): {detail}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+    except Exception as e:
+        err_msg = f"SendGrid delivery failed: {e}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+
+
+def _send_via_smtp(to_email: str, subject: str, body: str, smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str, smtp_from: str, email_type: str) -> Tuple[bool, str]:
+    if not smtp_host:
+        return False, "SMTP host not configured"
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = smtp_from
+        msg["To"] = to_email
+        msg.attach(MIMEText(body, "html"))
+
+        ssl_ctx = ssl.create_default_context()
+
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=12, context=ssl_ctx) as server:
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_from, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+                server.ehlo()
+                server.starttls(context=ssl_ctx)
+                server.ehlo()
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_from, [to_email], msg.as_string())
+
+        msg_str = f"Delivered {email_type} email to {to_email} via SMTP ({smtp_host}:{smtp_port})"
+        print(f"[AUTH EMAIL] {msg_str}")
+        return True, msg_str
+    except smtplib.SMTPAuthenticationError as e:
+        if "gmail" in smtp_host.lower():
+            err_msg = (
+                f"Gmail SMTP authentication failed: Invalid username or App Password. "
+                f"For Gmail, enable 2-Step Verification and use a 16-character App Password "
+                f"generated at https://myaccount.google.com/apppasswords (not your normal Google password)."
+            )
+        else:
+            err_msg = f"SMTP authentication failed ({smtp_host}:{smtp_port}): {e}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+    except (socket.timeout, TimeoutError, smtplib.SMTPConnectError, OSError) as e:
+        err_msg = (
+            f"SMTP connection to {smtp_host}:{smtp_port} failed: {e}. "
+            f"Note: Cloud serverless environments (like Vercel or AWS Lambda) block outbound SMTP ports 587/465. "
+            f"Please configure Brevo API or Resend API in Email Settings for serverless deployments."
+        )
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+    except Exception as e:
+        err_msg = f"SMTP delivery failed to {to_email} ({smtp_host}:{smtp_port}): {e}"
+        print(f"[AUTH EMAIL] {err_msg}")
+        return False, err_msg
+
+
 def send_email_message(to_email: str, subject: str, body: str, token: str, email_type: str) -> Tuple[bool, str]:
-    """Stores in outbox for audit and delivers via Resend API or SMTP.
+    """Stores in outbox for audit and delivers via active provider with automatic fallback.
     Returns (success: bool, status_message: str)."""
     # Always record in database outbox for audit log
     try:
@@ -200,91 +495,74 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
     except Exception as e:
         print(f"[AUTH ERROR] Error recording email in outbox: {e}")
 
-    # Method 1: Check for Resend API Key (Best for serverless / Vercel cloud delivery)
-    resend_key = get_system_setting("RESEND_API_KEY")
-    if resend_key:
-        try:
-            import urllib.request
-            from_email = get_system_setting("FROM_EMAIL") or get_system_setting("SMTP_USER") or "Crypto Trading Bot <onboarding@resend.dev>"
-            req = urllib.request.Request(
-                "https://api.resend.com/emails",
-                data=json.dumps({
-                    "from": from_email,
-                    "to": [to_email],
-                    "subject": subject,
-                    "html": body,
-                }).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {resend_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "CryptoTradingBot/2.0"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                if 200 <= resp.status < 300:
-                    msg = f"Delivered {email_type} email to {to_email} via Resend API"
-                    print(f"[AUTH EMAIL] {msg}")
-                    return True, msg
-                else:
-                    err_msg = f"Resend API returned status code {resp.status}"
-                    print(f"[AUTH EMAIL] {err_msg}")
-                    if not get_system_setting("SMTP_HOST"):
-                        return False, err_msg
-        except urllib.error.HTTPError as e:
-            try:
-                raw_err = e.read().decode("utf-8")
-                err_json = json.loads(raw_err)
-                detail = err_json.get("message", raw_err)
-            except Exception:
-                detail = str(e)
-            err_msg = f"Resend API error ({e.code}): {detail}"
-            print(f"[AUTH EMAIL] {err_msg}")
-            if not get_system_setting("SMTP_HOST"):
-                return False, err_msg
-        except Exception as e:
-            err_msg = f"Resend delivery failed: {e}"
-            print(f"[AUTH EMAIL] {err_msg}")
-            if not get_system_setting("SMTP_HOST"):
-                return False, err_msg
+    settings = get_email_settings()
+    active_prov = settings.get("provider", "none")
 
-    # Method 2: Check for standard SMTP configuration (port 465 SSL or 587 STARTTLS)
-    smtp_host = get_system_setting("SMTP_HOST") or get_system_setting("EMAIL_SERVER")
-    smtp_port = int(get_system_setting("SMTP_PORT") or get_system_setting("EMAIL_PORT") or "587")
-    smtp_user = get_system_setting("SMTP_USER") or get_system_setting("EMAIL_USER")
-    smtp_pass = get_system_setting("SMTP_PASS") or get_system_setting("EMAIL_PASSWORD")
-    smtp_from = get_system_setting("FROM_EMAIL") or smtp_user or "noreply@cryptobot.local"
+    resend_key = get_system_setting("RESEND_API_KEY", "") or ""
+    brevo_key = get_system_setting("BREVO_API_KEY", "") or ""
+    sendgrid_key = get_system_setting("SENDGRID_API_KEY", "") or ""
 
-    if smtp_host:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = smtp_from
-            msg["To"] = to_email
-            msg.attach(MIMEText(body, "html"))
+    smtp_host = get_system_setting("SMTP_HOST", "") or get_system_setting("EMAIL_SERVER", "") or ""
+    smtp_port = int(get_system_setting("SMTP_PORT", "587") or get_system_setting("EMAIL_PORT", "587") or "587")
+    smtp_user = get_system_setting("SMTP_USER", "") or get_system_setting("EMAIL_USER", "") or ""
+    smtp_pass = get_system_setting("SMTP_PASS", "") or get_system_setting("EMAIL_PASSWORD", "") or ""
 
-            if smtp_port == 465:
-                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=12) as server:
-                    if smtp_user and smtp_pass:
-                        server.login(smtp_user, smtp_pass)
-                    server.sendmail(smtp_from, [to_email], msg.as_string())
-            else:
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
-                    server.starttls()
-                    if smtp_user and smtp_pass:
-                        server.login(smtp_user, smtp_pass)
-                    server.sendmail(smtp_from, [to_email], msg.as_string())
+    from_email = get_system_setting("FROM_EMAIL", "") or smtp_user or ""
 
-            msg = f"Delivered {email_type} email to {to_email} via SMTP ({smtp_host}:{smtp_port})"
-            print(f"[AUTH EMAIL] {msg}")
-            return True, msg
-        except Exception as e:
-            err_msg = f"SMTP delivery failed to {to_email} ({smtp_host}:{smtp_port}): {e}"
-            print(f"[AUTH EMAIL] {err_msg}")
-            return False, err_msg
+    # Define dispatch candidates
+    candidates = []
 
-    not_configured_msg = "No SMTP_HOST or RESEND_API_KEY configured on this server."
-    print(f"[AUTH EMAIL] Notice: {not_configured_msg} Recorded email in system outbox for {to_email}.")
-    return False, not_configured_msg
+    def run_brevo():
+        sender = from_email or "Crypto Trading Bot <noreply@cryptobot.local>"
+        return _send_via_brevo(to_email, subject, body, brevo_key, sender, email_type)
+
+    def run_sendgrid():
+        sender = from_email or "Crypto Trading Bot <noreply@cryptobot.local>"
+        return _send_via_sendgrid(to_email, subject, body, sendgrid_key, sender, email_type)
+
+    def run_resend():
+        sender = from_email or "Crypto Trading Bot <onboarding@resend.dev>"
+        return _send_via_resend(to_email, subject, body, resend_key, sender, email_type)
+
+    def run_smtp():
+        s_from = from_email or smtp_user or "noreply@cryptobot.local"
+        return _send_via_smtp(to_email, subject, body, smtp_host, smtp_port, smtp_user, smtp_pass, s_from, email_type)
+
+    # 1. Prioritize active provider
+    if active_prov == "brevo" and brevo_key:
+        candidates.append(("Brevo API", run_brevo))
+    elif active_prov == "sendgrid" and sendgrid_key:
+        candidates.append(("SendGrid API", run_sendgrid))
+    elif active_prov == "resend" and resend_key:
+        candidates.append(("Resend API", run_resend))
+    elif active_prov in ["gmail", "smtp"] and smtp_host and smtp_user and smtp_pass:
+        candidates.append(("SMTP", run_smtp))
+
+    # 2. Add remaining available providers as automatic fallback
+    if brevo_key and not any(c[0] == "Brevo API" for c in candidates):
+        candidates.append(("Brevo API", run_brevo))
+    if resend_key and not any(c[0] == "Resend API" for c in candidates):
+        candidates.append(("Resend API", run_resend))
+    if sendgrid_key and not any(c[0] == "SendGrid API" for c in candidates):
+        candidates.append(("SendGrid API", run_sendgrid))
+    if smtp_host and smtp_user and smtp_pass and not any(c[0] == "SMTP" for c in candidates):
+        candidates.append(("SMTP", run_smtp))
+
+    if not candidates:
+        not_configured_msg = "No email delivery service (Gmail SMTP, Brevo API, Resend API, or SendGrid) is configured on this server."
+        print(f"[AUTH EMAIL] Notice: {not_configured_msg} Recorded email in system outbox for {to_email}.")
+        return False, not_configured_msg
+
+    errors = []
+    for prov_name, dispatch_fn in candidates:
+        success, status = dispatch_fn()
+        if success:
+            return True, status
+        errors.append(status)
+
+    # All attempted providers failed; return diagnostic summary
+    combined_err = " | ".join(errors)
+    return False, combined_err
 
 
 def test_email_connection(to_email: str) -> Dict[str, Any]:
@@ -297,7 +575,7 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
     if not settings["is_configured"]:
         return {
             "success": False,
-            "message": "Neither SMTP credentials nor a Resend API Key is configured yet. Please enter your email credentials first.",
+            "message": "No email delivery service is configured yet. Please enter your Gmail, Brevo, Resend, or SMTP credentials first.",
             "settings": settings
         }
 
@@ -309,7 +587,7 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
       <p>This is a confirmation test email sent from your <strong>Crypto Trading Bot</strong> platform.</p>
       <p>Your email service (<strong>{settings['provider'].upper()}</strong>) is configured and working properly!</p>
       <div style="background: #1e293b; padding: 12px 16px; border-radius: 8px; margin: 20px 0; font-family: monospace; font-size: 12px;">
-        Provider: {settings['provider']}<br>
+        Provider: {settings['provider'].upper()}<br>
         Recipient: {to_email}<br>
         Dispatched at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
       </div>
@@ -322,7 +600,9 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
         "success": success,
         "message": status,
         "recipient": to_email,
-        "provider": settings["provider"]
+        "provider": settings["provider"],
+        "can_send_to_all_users": settings.get("can_send_to_all_users", False),
+        "is_resend_sandbox": settings.get("is_resend_sandbox", False)
     }
 
 
@@ -384,9 +664,9 @@ class AuthService:
             "email_status": email_status
         }
         if email_sent:
-            res["message"] = f"Account created for {username}. A verification email has been sent to {email}. Please check your email to activate your account."
+            res["message"] = f"Account created for {username}. A verification email has been sent to {email}. Please check your inbox to activate your account."
         else:
-            res["message"] = f"Account created for {username}. Notice: {email_status} To receive verification emails, please configure SMTP or Resend credentials in Email Settings."
+            res["message"] = f"Account created for {username}. Email delivery warning: {email_status}"
             res["dev_activation_link"] = activation_link
 
         return res

@@ -33,6 +33,11 @@ class ExchangeClient:
             "apiKey": cfg.api_key,
             "secret": cfg.api_secret,
             "enableRateLimit": True,
+            "timeout": 15000,
+            "options": {
+                "adjustForTimeDifference": True,
+                "recvWindow": 60000,
+            },
         }
         if cfg.api_passphrase:
             exchange_opts["password"] = cfg.api_passphrase  # ccxt's field name for passphrase
@@ -42,6 +47,12 @@ class ExchangeClient:
                 self.exchange.set_sandbox_mode(True)
             except Exception:
                 pass
+
+        if self.exchange.has.get("fetchTime") and hasattr(self.exchange, "load_time_difference"):
+            try:
+                self.exchange.load_time_difference()
+            except Exception as e:
+                log.warning(f"Could not load time difference for {cfg.exchange_id}: {e}")
 
         # paper trading book-keeping
         self.paper_cash = starting_equity

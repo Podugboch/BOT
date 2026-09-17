@@ -34,11 +34,13 @@ if str(CURRENT_DIR) not in sys.path:
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
 from exchange_client import ExchangeClient
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
-from strategy import Signal, add_indicators, generate_signal, _near_fib_support
+from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager
 from backtester import fetch_historical, run_backtest, summarize
 from bot import TradingBot
 from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection
+
+AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 
 logger = logging.getLogger("web")
 init_auth_db()
@@ -129,11 +131,37 @@ class BotRunner:
         self.stop()
         return True
 
+    def get_or_create_bot(self) -> TradingBot:
+        if self.bot is None:
+            self.bot = TradingBot(self.cfg)
+        return self.bot
+
 
 runner = BotRunner()
 
 
 # --- Pydantic Request Models ---
+class BotSettingsRequest(BaseModel):
+    execution_mode: Optional[str] = "auto"  # "auto" | "manual"
+    strategy: Optional[str] = "ema_cross_fib"
+    timeframe: Optional[str] = "15m"
+    symbol: Optional[str] = "BTC/USDT"
+    use_fib_filter: Optional[bool] = True
+    fast_ema: Optional[int] = 12
+    slow_ema: Optional[int] = 26
+    rsi_period: Optional[int] = 14
+    rsi_overbought: Optional[float] = 65.0
+    adx_trend_threshold: Optional[float] = 20.0
+    risk_per_trade_pct: Optional[float] = 0.01
+    stop_loss_atr_mult: Optional[float] = 2.0
+    take_profit_atr_mult: Optional[float] = 4.0
+
+
+class ManualTradeRequest(BaseModel):
+    action: str  # "buy" | "sell"
+    size: Optional[float] = 0.0
+
+
 class RegisterRequest(BaseModel):
     username: str
     email: str
@@ -174,6 +202,11 @@ class TestExchangeRequest(BaseModel):
     testnet: Optional[bool] = True
 
 
+class TradingModeRequest(BaseModel):
+    trading_mode: str  # "testnet" | "real"
+
+
+
 class BacktestRequest(BaseModel):
     exchange: str = "binance"
     symbol: str = "BTC/USDT"
@@ -192,6 +225,8 @@ class EmailSettingsRequest(BaseModel):
     smtp_pass: Optional[str] = ""
     from_email: Optional[str] = ""
     resend_api_key: Optional[str] = ""
+    brevo_api_key: Optional[str] = ""
+    sendgrid_api_key: Optional[str] = ""
 
 
 class TestEmailRequest(BaseModel):
@@ -317,40 +352,51 @@ def get_email_settings_endpoint():
 @app.post("/api/auth/email-settings")
 def save_email_settings_endpoint(req: EmailSettingsRequest):
     settings_dict = {}
-    if req.provider == "gmail":
+    provider = (req.provider or "gmail").strip().lower()
+    settings_dict["EMAIL_PROVIDER"] = provider
+
+    if req.from_email is not None and req.from_email.strip():
+        settings_dict["FROM_EMAIL"] = req.from_email.strip()
+
+    if provider == "gmail":
         settings_dict["SMTP_HOST"] = "smtp.gmail.com"
         settings_dict["SMTP_PORT"] = req.smtp_port or "587"
-        settings_dict["SMTP_USER"] = req.smtp_user or ""
-        if req.smtp_pass is not None:
-            settings_dict["SMTP_PASS"] = req.smtp_pass
-        settings_dict["FROM_EMAIL"] = req.from_email or req.smtp_user or ""
-        settings_dict["RESEND_API_KEY"] = ""
-    elif req.provider == "resend":
-        if req.resend_api_key is not None:
-            settings_dict["RESEND_API_KEY"] = req.resend_api_key
-        settings_dict["FROM_EMAIL"] = req.from_email or "Crypto Trading Bot <onboarding@resend.dev>"
-        settings_dict["SMTP_HOST"] = ""
-        settings_dict["SMTP_USER"] = ""
-        settings_dict["SMTP_PASS"] = ""
-    elif req.provider == "none":
-        settings_dict["SMTP_HOST"] = ""
-        settings_dict["SMTP_PORT"] = "587"
-        settings_dict["SMTP_USER"] = ""
-        settings_dict["SMTP_PASS"] = ""
-        settings_dict["FROM_EMAIL"] = ""
-        settings_dict["RESEND_API_KEY"] = ""
-    else:
-        settings_dict["SMTP_HOST"] = req.smtp_host or ""
-        settings_dict["SMTP_PORT"] = req.smtp_port or "587"
-        settings_dict["SMTP_USER"] = req.smtp_user or ""
-        if req.smtp_pass is not None:
-            settings_dict["SMTP_PASS"] = req.smtp_pass
-        settings_dict["FROM_EMAIL"] = req.from_email or req.smtp_user or ""
-        settings_dict["RESEND_API_KEY"] = ""
+        if req.smtp_user:
+            settings_dict["SMTP_USER"] = req.smtp_user.strip()
+            if not req.from_email:
+                settings_dict["FROM_EMAIL"] = req.smtp_user.strip()
+        if req.smtp_pass and req.smtp_pass.strip():
+            settings_dict["SMTP_PASS"] = req.smtp_pass.strip()
+    elif provider == "brevo":
+        if req.brevo_api_key and req.brevo_api_key.strip():
+            settings_dict["BREVO_API_KEY"] = req.brevo_api_key.strip()
+        if req.from_email:
+            settings_dict["FROM_EMAIL"] = req.from_email.strip()
+    elif provider == "resend":
+        if req.resend_api_key and req.resend_api_key.strip():
+            settings_dict["RESEND_API_KEY"] = req.resend_api_key.strip()
+        if req.from_email:
+            settings_dict["FROM_EMAIL"] = req.from_email.strip()
+    elif provider == "sendgrid":
+        if req.sendgrid_api_key and req.sendgrid_api_key.strip():
+            settings_dict["SENDGRID_API_KEY"] = req.sendgrid_api_key.strip()
+        if req.from_email:
+            settings_dict["FROM_EMAIL"] = req.from_email.strip()
+    elif provider == "smtp":
+        settings_dict["SMTP_HOST"] = (req.smtp_host or "").strip()
+        settings_dict["SMTP_PORT"] = (req.smtp_port or "587").strip()
+        if req.smtp_user:
+            settings_dict["SMTP_USER"] = req.smtp_user.strip()
+        if req.smtp_pass and req.smtp_pass.strip():
+            settings_dict["SMTP_PASS"] = req.smtp_pass.strip()
+        if req.from_email:
+            settings_dict["FROM_EMAIL"] = req.from_email.strip()
+    elif provider == "none":
+        settings_dict["EMAIL_PROVIDER"] = "none"
 
     res = save_email_settings(settings_dict)
 
-    # Persist to .env if writable
+    # Persist to .env if writable and file exists
     try:
         env_file = Path(".env")
         if env_file.exists():
@@ -361,7 +407,7 @@ def save_email_settings_endpoint(req: EmailSettingsRequest):
                 s = l.strip()
                 if s and not s.startswith("#") and "=" in s:
                     k = s.split("=", 1)[0].strip()
-                    if k in settings_dict:
+                    if k in settings_dict and settings_dict[k]:
                         new_lines.append(f"{k}={settings_dict[k]}\n")
                         written.add(k)
                         continue
@@ -371,7 +417,7 @@ def save_email_settings_endpoint(req: EmailSettingsRequest):
                     new_lines.append(f"{k}={v}\n")
             env_file.write_text("".join(new_lines))
     except Exception as e:
-        logger.warning(f"Could not persist email settings to .env: {e}")
+        print(f"[AUTH ERROR] Failed updating .env file: {e}")
 
     return res
 
@@ -402,37 +448,104 @@ def test_exchange(req: TestExchangeRequest, authorization: Optional[str] = Heade
     if not hasattr(ccxt, req.exchange_id):
         raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange_id}'")
 
-    exchange_class = getattr(ccxt, req.exchange_id)
-    opts = {
-        "apiKey": req.api_key.strip(),
-        "secret": req.api_secret.strip(),
-        "enableRateLimit": True,
-        "timeout": 8000,
-    }
-    if req.api_passphrase:
-        opts["password"] = req.api_passphrase.strip()
+    clean_key = req.api_key.strip().strip("'\"")
+    clean_secret = req.api_secret.strip().strip("'\"")
+    clean_passphrase = (req.api_passphrase or "").strip().strip("'\"")
 
-    exchange = exchange_class(opts)
-    if req.testnet and hasattr(exchange, "set_sandbox_mode"):
-        try:
-            exchange.set_sandbox_mode(True)
-        except Exception:
-            pass
+    exchange_class = getattr(ccxt, req.exchange_id)
+
+    def init_exchange_instance(use_sandbox: bool):
+        opts = {
+            "apiKey": clean_key,
+            "secret": clean_secret,
+            "enableRateLimit": True,
+            "timeout": 15000,
+            "options": {
+                "adjustForTimeDifference": True,
+                "recvWindow": 60000,
+            },
+        }
+        if clean_passphrase:
+            opts["password"] = clean_passphrase
+
+        ex = exchange_class(opts)
+        if use_sandbox and hasattr(ex, "set_sandbox_mode"):
+            try:
+                ex.set_sandbox_mode(True)
+            except Exception:
+                pass
+
+        if ex.has.get("fetchTime") and hasattr(ex, "load_time_difference"):
+            try:
+                ex.load_time_difference()
+            except Exception:
+                pass
+        return ex
+
+    # 1. First attempt with user-requested sandbox setting
+    actual_testnet = bool(req.testnet)
+    exchange = init_exchange_instance(actual_testnet)
 
     try:
-        # Check balance to verify trade/read credentials
         balance = exchange.fetch_balance()
-        free_balances = {k: v for k, v in balance.get("free", {}).items() if v and float(v) > 0}
-        return {
-            "success": True,
-            "message": f"Successfully authenticated with {req.exchange_id}! Credentials are valid.",
-            "testnet": req.testnet,
-            "balances": free_balances or {"INFO": "Connected successfully (0 balance found)"}
-        }
-    except ccxt.AuthenticationError as e:
-        return {"success": False, "message": f"Authentication Error: {str(e)}"}
     except Exception as e:
-        return {"success": False, "message": f"Connection check failed: {str(e)}"}
+        err_msg = str(e)
+
+        # A. Clock skew / recvWindow retry
+        if any(w in err_msg.lower() for w in ["recvwindow", "timestamp", "nonce", "outside of the recvwindow"]):
+            try:
+                if hasattr(exchange, "load_time_difference"):
+                    exchange.load_time_difference()
+                balance = exchange.fetch_balance()
+                err_msg = ""
+            except Exception as retry_e:
+                err_msg = str(retry_e)
+
+        # B. Sandbox vs Live Key Mismatch (e.g. Binance code -2014)
+        if err_msg and any(w in err_msg.lower() for w in ["-2014", "api-key format invalid", "invalid api-key"]):
+            if actual_testnet:
+                try:
+                    live_ex = init_exchange_instance(False)
+                    balance = live_ex.fetch_balance()
+                    actual_testnet = False
+                    err_msg = ""
+                except Exception as live_err:
+                    err_msg = f"{err_msg} (Also tested Live mode: {live_err})"
+            else:
+                try:
+                    testnet_ex = init_exchange_instance(True)
+                    balance = testnet_ex.fetch_balance()
+                    actual_testnet = True
+                    err_msg = ""
+                except Exception as testnet_err:
+                    err_msg = f"{err_msg} (Also tested Testnet mode: {testnet_err})"
+
+        if err_msg:
+            if "-2014" in err_msg or "api-key format invalid" in err_msg.lower():
+                return {
+                    "success": False,
+                    "message": (
+                        "Binance Error (-2014: API-key format invalid). "
+                        "Please verify: 1) You copied the complete API Key & Secret without extra spaces or quotes. "
+                        "2) If your key was created on Binance.com (real exchange), uncheck 'Use Testnet / Sandbox Mode'. "
+                        "3) Ensure the key has Spot & Margin trading enabled."
+                    )
+                }
+            if isinstance(e, ccxt.AuthenticationError):
+                return {"success": False, "message": f"Authentication Error: {err_msg}"}
+            return {"success": False, "message": f"Connection check failed: {err_msg}"}
+
+    free_balances = {k: v for k, v in balance.get("free", {}).items() if v and float(v) > 0}
+    env_label = "Testnet / Sandbox" if actual_testnet else "Live / Real Trading"
+    note = ""
+    if actual_testnet != req.testnet:
+        note = f" (Note: Automatically connected to {env_label} because your credentials match {env_label})"
+    return {
+        "success": True,
+        "message": f"Successfully authenticated with {req.exchange_id} ({env_label})! Credentials are valid.{note}",
+        "testnet": actual_testnet,
+        "balances": free_balances or {"INFO": "Connected successfully (0 balance found)"}
+    }
 
 
 @app.post("/api/exchange/save")
@@ -519,10 +632,15 @@ def get_status():
     exchange = bot.exchange if bot else None
 
     kill_file_exists = os.path.exists(cfg.kill_switch_file)
+    strat_meta = next((s for s in STRATEGIES if s["id"] == cfg.strategy.strategy_name), STRATEGIES[0])
 
     return {
         "running": runner.running,
         "mode": cfg.mode,
+        "execution_mode": getattr(cfg, "execution_mode", "auto"),
+        "strategy": cfg.strategy.strategy_name,
+        "strategy_name": strat_meta["name"],
+        "strategy_short_name": strat_meta.get("short_name", strat_meta["name"]),
         "exchange": cfg.exchange.exchange_id,
         "symbol": cfg.exchange.symbol,
         "timeframe": cfg.exchange.timeframe,
@@ -545,12 +663,169 @@ def get_status():
     }
 
 
+@app.get("/api/bot/settings")
+def get_bot_settings():
+    cfg = runner.cfg
+    strat_meta = next((s for s in STRATEGIES if s["id"] == cfg.strategy.strategy_name), STRATEGIES[0])
+    return {
+        "execution_mode": getattr(cfg, "execution_mode", "auto"),
+        "strategy": cfg.strategy.strategy_name,
+        "strategy_name": strat_meta["name"],
+        "strategy_short_name": strat_meta.get("short_name", strat_meta["name"]),
+        "available_strategies": STRATEGIES,
+        "timeframe": cfg.exchange.timeframe,
+        "available_timeframes": AVAILABLE_TIMEFRAMES,
+        "symbol": cfg.exchange.symbol,
+        "use_fib_filter": cfg.strategy.use_fib_filter,
+        "fast_ema": cfg.strategy.fast_ema,
+        "slow_ema": cfg.strategy.slow_ema,
+        "rsi_period": cfg.strategy.rsi_period,
+        "rsi_overbought": cfg.strategy.rsi_overbought,
+        "adx_trend_threshold": cfg.strategy.adx_trend_threshold,
+        "risk_per_trade_pct": cfg.risk.risk_per_trade_pct,
+        "stop_loss_atr_mult": cfg.risk.stop_loss_atr_mult,
+        "take_profit_atr_mult": cfg.risk.take_profit_atr_mult,
+    }
+
+
+@app.post("/api/bot/settings")
+def save_bot_settings(req: BotSettingsRequest):
+    exec_mode = (req.execution_mode or "auto").strip().lower()
+    if exec_mode not in ["auto", "manual"]:
+        raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+
+    timeframe = (req.timeframe or "15m").strip().lower()
+    if timeframe not in AVAILABLE_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f"Invalid timeframe '{timeframe}'. Supported: {', '.join(AVAILABLE_TIMEFRAMES)}")
+
+    valid_strat_ids = [s["id"] for s in STRATEGIES]
+    strategy_id = (req.strategy or "ema_cross_fib").strip().lower()
+    if strategy_id not in valid_strat_ids:
+        raise HTTPException(status_code=400, detail=f"Invalid strategy '{strategy_id}'. Supported: {', '.join(valid_strat_ids)}")
+
+    symbol = (req.symbol or "BTC/USDT").strip().upper()
+
+    # Update OS env vars
+    os.environ["EXECUTION_MODE"] = exec_mode
+    os.environ["STRATEGY"] = strategy_id
+    os.environ["TIMEFRAME"] = timeframe
+    os.environ["SYMBOL"] = symbol
+
+    # Persist to .env file
+    try:
+        env_file = Path(".env")
+        if env_file.exists():
+            lines = env_file.read_text().splitlines(keepends=True)
+            updates = {
+                "EXECUTION_MODE": exec_mode,
+                "STRATEGY": strategy_id,
+                "TIMEFRAME": timeframe,
+                "SYMBOL": symbol,
+            }
+            written = set()
+            new_lines = []
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k = s.split("=", 1)[0].strip()
+                    if k in updates:
+                        new_lines.append(f"{k}={updates[k]}\n")
+                        written.add(k)
+                        continue
+                new_lines.append(l)
+            for k, v in updates.items():
+                if k not in written:
+                    new_lines.append(f"{k}={v}\n")
+            env_file.write_text("".join(new_lines))
+    except Exception as e:
+        logger.warning(f"Failed updating .env file with new bot settings: {e}")
+
+    # Re-apply to active runner
+    was_running = runner.running
+    if was_running:
+        runner.stop()
+
+    runner.cfg.execution_mode = exec_mode
+    runner.cfg.strategy.strategy_name = strategy_id
+    runner.cfg.exchange.timeframe = timeframe
+    runner.cfg.exchange.symbol = symbol
+
+    if req.use_fib_filter is not None:
+        runner.cfg.strategy.use_fib_filter = req.use_fib_filter
+    if req.fast_ema is not None and req.fast_ema > 0:
+        runner.cfg.strategy.fast_ema = req.fast_ema
+    if req.slow_ema is not None and req.slow_ema > 0:
+        runner.cfg.strategy.slow_ema = req.slow_ema
+    if req.rsi_period is not None and req.rsi_period > 0:
+        runner.cfg.strategy.rsi_period = req.rsi_period
+    if req.rsi_overbought is not None and req.rsi_overbought > 0:
+        runner.cfg.strategy.rsi_overbought = req.rsi_overbought
+    if req.adx_trend_threshold is not None and req.adx_trend_threshold >= 0:
+        runner.cfg.strategy.adx_trend_threshold = req.adx_trend_threshold
+    if req.risk_per_trade_pct is not None and req.risk_per_trade_pct > 0:
+        runner.cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
+    if req.stop_loss_atr_mult is not None and req.stop_loss_atr_mult > 0:
+        runner.cfg.risk.stop_loss_atr_mult = req.stop_loss_atr_mult
+    if req.take_profit_atr_mult is not None and req.take_profit_atr_mult > 0:
+        runner.cfg.risk.take_profit_atr_mult = req.take_profit_atr_mult
+
+    # Recreate bot instance with updated configuration
+    runner.bot = TradingBot(runner.cfg)
+
+    if was_running:
+        runner.start()
+
+    strat_meta = next((s for s in STRATEGIES if s["id"] == strategy_id), STRATEGIES[0])
+    mode_label = "Manual Trading (Signals Only)" if exec_mode == "manual" else "Auto Trading (Algorithmic Execution)"
+
+    return {
+        "success": True,
+        "message": f"Settings saved! Trading mode set to {mode_label}, strategy set to {strat_meta['name']}, and timeframe set to {timeframe}.",
+        "execution_mode": exec_mode,
+        "strategy": strategy_id,
+        "strategy_name": strat_meta["name"],
+        "timeframe": timeframe,
+        "symbol": symbol,
+    }
+
+
+@app.post("/api/bot/trade/manual")
+def execute_manual_trade(req: ManualTradeRequest):
+    bot = runner.get_or_create_bot()
+    act = req.action.strip().lower()
+
+    if act == "buy":
+        try:
+            res = bot.manual_buy(custom_size=req.size or 0.0)
+            return {
+                "success": True,
+                "message": f"Manual BUY order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})",
+                "trade": res,
+            }
+        except Exception as e:
+            logger.exception("Manual BUY order failed")
+            raise HTTPException(status_code=400, detail=str(e))
+    elif act == "sell":
+        try:
+            res = bot.manual_sell()
+            return {
+                "success": True,
+                "message": f"Manual SELL order executed at ${res['price']:,.2f} (PnL: ${res['pnl']:+,.2f})",
+                "trade": res,
+            }
+        except Exception as e:
+            logger.exception("Manual SELL order failed")
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid manual trade action '{req.action}'. Use 'buy' or 'sell'.")
+
+
 @app.post("/api/bot/start")
 def start_bot():
     if runner.running:
         return {"success": False, "message": "Bot is already running"}
     started = runner.start()
-    return {"success": started, "message": "Bot started in " + runner.cfg.mode + " mode"}
+    return {"success": started, "message": "Bot started in " + runner.cfg.mode + " mode (" + runner.cfg.execution_mode.upper() + ")"}
 
 
 @app.post("/api/bot/stop")
@@ -571,6 +846,66 @@ def reset_daily_metrics():
         runner.bot.risk.reset_day()
         return {"success": True, "message": "Daily risk metrics reset"}
     return {"success": False, "message": "Bot is not initialized"}
+
+
+@app.post("/api/bot/mode")
+def set_trading_mode_endpoint(req: TradingModeRequest):
+    """Switch trading mode between Testnet / Paper and Real Trading (Live)."""
+    is_real = (req.trading_mode.lower() == "real")
+    new_mode = "live" if is_real else "paper"
+    new_testnet = not is_real
+
+    # Update environment variables
+    os.environ["MODE"] = new_mode
+    os.environ["TESTNET"] = "false" if is_real else "true"
+
+    # Persist to .env file if it exists
+    try:
+        env_file = Path(".env")
+        if env_file.exists():
+            lines = env_file.read_text().splitlines(keepends=True)
+            updates = {
+                "MODE": new_mode,
+                "TESTNET": "false" if is_real else "true",
+            }
+            written = set()
+            new_lines = []
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k = s.split("=", 1)[0].strip()
+                    if k in updates:
+                        new_lines.append(f"{k}={updates[k]}\n")
+                        written.add(k)
+                        continue
+                new_lines.append(l)
+            for k, v in updates.items():
+                if k not in written:
+                    new_lines.append(f"{k}={v}\n")
+            env_file.write_text("".join(new_lines))
+    except Exception as e:
+        print(f"[CONFIG ERROR] Failed updating .env file for trading mode: {e}")
+
+    # Re-apply to active runner config
+    was_running = runner.running
+    if was_running:
+        runner.stop()
+
+    runner.cfg = BotConfig()
+    runner.cfg.mode = new_mode
+    runner.cfg.exchange.testnet = new_testnet
+
+    if was_running:
+        runner.start()
+
+    mode_label = "Real Trading (LIVE)" if is_real else "Testnet / Paper Trading"
+    return {
+        "success": True,
+        "message": f"Switched trading environment to {mode_label}.",
+        "mode": runner.cfg.mode,
+        "testnet": runner.cfg.exchange.testnet,
+        "is_real": is_real,
+    }
 
 
 LAST_ANALYSIS_CACHE: Dict[str, Any] = {}
@@ -654,6 +989,8 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
             "symbol": req_symbol,
             "exchange": used_exchange,
             "timeframe": req_timeframe,
+            "strategy": strat_cfg.strategy_name,
+            "strategy_name": next((s["name"] for s in STRATEGIES if s["id"] == strat_cfg.strategy_name), strat_cfg.strategy_name),
             "price": round(price, 2),
             "signal": signal.value,
             "ema_fast": round(ema_fast_val, 2),
@@ -895,9 +1232,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <!-- Quick Action Controls -->
       <div class="flex items-center space-x-2.5 text-xs">
         <!-- Download ZIP button -->
-        <a href="/api/download/bot" class="px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 font-semibold rounded-lg transition flex items-center gap-1.5" title="Download Complete Bot Package">
+        <a href="/api/download/bot" class="hidden md:flex px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 font-semibold rounded-lg transition items-center gap-1.5" title="Download Complete Bot Package">
           <i class="fa-solid fa-download"></i>
-          <span>Download BOT (.zip)</span>
+          <span>BOT (.zip)</span>
         </a>
 
         <!-- Bot Status Indicator -->
@@ -915,13 +1252,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Kill Switch -->
         <button onclick="triggerKillSwitch()" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center gap-1" title="Emergency Stop">
           <i class="fa-solid fa-skull-crossbones"></i>
-        </button>
-
-        <!-- Email & SMTP Settings Button -->
-        <button onclick="openEmailSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Email & SMTP Settings">
-          <i class="fa-solid fa-envelope text-xs"></i>
-          <span id="email-status-dot" class="w-2 h-2 rounded-full bg-amber-500 inline-block"></span>
-          <span class="hidden sm:inline text-xs">Email / SMTP</span>
         </button>
 
         <!-- Auth User Menu Button -->
@@ -954,7 +1284,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Paper Cash</div>
+        <div class="text-slate-400 text-[11px] font-medium" id="val-cash-label">Paper Cash</div>
         <div class="text-lg font-bold mt-0.5 text-emerald-400" id="val-cash">$1,000.00</div>
         <div class="text-[10px] text-slate-400 mt-0.5">Position: <span id="val-pos">0.000000</span></div>
       </div>
@@ -1034,6 +1364,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- UNLOCKED STATE: Shown only after account creation and login -->
       <div id="api-keys-unlocked" class="hidden space-y-4">
+        <!-- Mode Switcher Card -->
+        <div class="p-3.5 bg-slate-900/90 rounded-xl border border-bordercol flex flex-wrap items-center justify-between gap-3 shadow-sm">
+          <div class="flex items-center gap-3">
+            <div id="env-icon" class="w-9 h-9 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold text-base">
+              <i class="fa-solid fa-flask"></i>
+            </div>
+            <div>
+              <div class="text-xs font-bold text-white flex items-center gap-2">
+                Active Environment: <span id="env-mode-title" class="text-blue-400">TESTNET / SIMULATION</span>
+              </div>
+              <p id="env-mode-desc" class="text-[11px] text-slate-400">Safe simulated execution. Zero real funds at risk.</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="px-3 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5">
+              <i class="fa-solid fa-flask"></i> Testnet Mode
+            </button>
+            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5">
+              <i class="fa-solid fa-bolt text-rose-400"></i> Real Trading (LIVE)
+            </button>
+            <button type="button" onclick="openSettingsModal()" class="px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 text-xs font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
+              <i class="fa-solid fa-gear"></i> Settings
+            </button>
+          </div>
+        </div>
+
         <form id="exchange-key-form" onsubmit="saveExchangeKey(event)" class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
           <!-- 1. Select Exchange -->
           <div>
@@ -1076,8 +1432,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="md:col-span-4 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-bordercol/50">
             <div class="flex items-center gap-4">
               <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" id="key-testnet" checked class="rounded bg-slate-900 border-bordercol text-emerald-500">
-                <span class="text-slate-300 font-medium">Use Testnet / Sandbox Mode (Recommended first)</span>
+                <input type="checkbox" id="key-testnet" class="rounded bg-slate-900 border-bordercol text-emerald-500">
+                <span id="key-testnet-label" class="text-slate-300 font-medium">Use Testnet / Sandbox Mode (Check only if using Testnet keys)</span>
               </label>
             </div>
 
@@ -1109,14 +1465,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
       <!-- Live Market Analysis (2 cols) -->
       <div class="lg:col-span-2 bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
-        <div class="flex items-center justify-between border-b border-bordercol pb-3">
+        <div class="flex items-center justify-between border-b border-bordercol pb-3 flex-wrap gap-2">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-radar text-emerald-400"></i>
-            <h2 class="font-bold text-sm text-white">Live Market Analysis & Technical Indicators</h2>
+            <div>
+              <h2 class="font-bold text-sm text-white">Live Market Analysis & Technical Indicators</h2>
+              <div class="text-[11px] text-slate-400 flex items-center gap-1.5 flex-wrap">
+                <span id="active-strat-tag" class="text-emerald-400 font-semibold">Strategy: EMA Cross + Fib</span>
+                <span class="text-slate-600">•</span>
+                <span id="active-tf-tag" class="text-sky-300 font-semibold">Timeframe: 15m</span>
+                <span class="text-slate-600">•</span>
+                <span id="active-mode-tag" class="text-purple-300 font-semibold">Auto Trading</span>
+              </div>
+            </div>
           </div>
-          <button onclick="refreshAnalysis()" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1">
-            <i class="fa-solid fa-rotate"></i> Refresh
-          </button>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="openSettingsModal()" id="btn-dash-settings" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-lg shadow transition flex items-center gap-1.5" title="Configure Strategy, Timeframe (5m included), and Manual vs Auto Trading">
+              <i class="fa-solid fa-gear text-indigo-200"></i>
+              <span>Trading Settings</span>
+            </button>
+            <button onclick="refreshAnalysis()" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg border border-bordercol">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
+          </div>
+        </div>
+
+        <!-- Manual Trading Execution Panel (Visible when Execution Mode is Manual) -->
+        <div id="manual-control-panel" class="hidden p-3 rounded-xl border border-amber-500/40 bg-amber-950/30 space-y-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+              <span class="text-xs font-bold text-amber-300">MANUAL TRADING MODE ACTIVE</span>
+              <span class="text-[11px] text-slate-400 hidden sm:inline">— Bot monitors market & generates signals; place orders below</span>
+            </div>
+            <button type="button" onclick="openSettingsModal()" class="text-[11px] text-amber-300 hover:text-amber-100 underline font-medium">
+              <i class="fa-solid fa-gear mr-1"></i>Change Strategy / Timeframe / Switch to Auto
+            </button>
+          </div>
+          <div class="flex items-center gap-3">
+            <button type="button" id="btn-manual-buy" onclick="triggerManualTrade('buy')" class="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5">
+              <i class="fa-solid fa-arrow-trend-up"></i> Manual BUY (Market)
+            </button>
+            <button type="button" id="btn-manual-sell" onclick="triggerManualTrade('sell')" class="flex-1 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5">
+              <i class="fa-solid fa-arrow-trend-down"></i> Manual SELL (Market)
+            </button>
+          </div>
         </div>
 
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
@@ -1422,18 +1815,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <!-- Provider Selection Tabs -->
       <div>
         <label class="block text-slate-400 text-xs mb-1.5 font-medium">Select Email Provider</label>
-        <div class="grid grid-cols-3 gap-2 text-xs">
-          <button type="button" onclick="selectEmailProvider('gmail')" id="tab-prov-gmail" class="py-2 px-2.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300">
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-1.5 text-xs">
+          <button type="button" onclick="selectEmailProvider('gmail')" id="tab-prov-gmail" class="py-2 px-1.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300">
             <i class="fa-brands fa-google text-sm"></i>
-            <span>Gmail SMTP</span>
+            <span class="text-[11px]">Gmail SMTP</span>
           </button>
-          <button type="button" onclick="selectEmailProvider('resend')" id="tab-prov-resend" class="py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+          <button type="button" onclick="selectEmailProvider('brevo')" id="tab-prov-brevo" class="py-2 px-1.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+            <i class="fa-solid fa-paper-plane text-sm"></i>
+            <span class="text-[11px]">Brevo API</span>
+          </button>
+          <button type="button" onclick="selectEmailProvider('resend')" id="tab-prov-resend" class="py-2 px-1.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
             <i class="fa-solid fa-bolt text-sm"></i>
-            <span>Resend API</span>
+            <span class="text-[11px]">Resend API</span>
           </button>
-          <button type="button" onclick="selectEmailProvider('smtp')" id="tab-prov-smtp" class="py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+          <button type="button" onclick="selectEmailProvider('sendgrid')" id="tab-prov-sendgrid" class="py-2 px-1.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+            <i class="fa-solid fa-cloud text-sm"></i>
+            <span class="text-[11px]">SendGrid</span>
+          </button>
+          <button type="button" onclick="selectEmailProvider('smtp')" id="tab-prov-smtp" class="py-2 px-1.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
             <i class="fa-solid fa-server text-sm"></i>
-            <span>Custom SMTP</span>
+            <span class="text-[11px]">Custom SMTP</span>
           </button>
         </div>
       </div>
@@ -1443,20 +1844,68 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input type="hidden" id="email-provider-val" value="gmail">
 
         <!-- Gmail Guide Alert -->
-        <div id="gmail-guide-box" class="p-3 bg-slate-900/90 rounded-lg border border-bordercol space-y-1 text-[11px] text-slate-300">
+        <div id="gmail-guide-box" class="p-3 bg-slate-900/90 rounded-lg border border-emerald-500/30 space-y-1 text-[11px] text-slate-300">
           <div class="font-bold text-emerald-400 flex items-center gap-1.5">
-            <i class="fa-brands fa-google"></i> How to use Gmail SMTP:
+            <i class="fa-brands fa-google"></i> Gmail SMTP (Delivers to All Users - No Domain Required)
           </div>
           <p>1. Go to your <a href="https://myaccount.google.com/apppasswords" target="_blank" class="text-sky-400 underline font-semibold">Google Account Security &rarr; App Passwords</a>.</p>
-          <p>2. Create a new App Password (e.g. named <em>Trading Bot</em>) and copy the 16-letter code.</p>
+          <p>2. Create a new App Password (name it <em>Trading Bot</em>) and copy the 16-letter code.</p>
           <p>3. Enter your Gmail address and the 16-letter App Password below.</p>
+          <p class="text-slate-400 text-[10px] italic pt-0.5">Note: If deployed on Vercel, cloud serverless firewalls block SMTP ports; use Brevo API instead.</p>
+        </div>
+
+        <!-- Brevo Guide Alert -->
+        <div id="brevo-guide-box" class="hidden p-3 bg-slate-900/90 rounded-lg border border-sky-500/30 space-y-1 text-[11px] text-slate-300">
+          <div class="font-bold text-sky-400 flex items-center gap-1.5">
+            <i class="fa-solid fa-paper-plane"></i> Brevo API (Recommended for Vercel - No Domain Required)
+          </div>
+          <p>1. Sign up for free at <a href="https://www.brevo.com" target="_blank" class="text-sky-400 underline font-semibold">brevo.com</a> (300 free emails/day to any user).</p>
+          <p>2. Go to <strong>Senders & IP</strong> and add any sender email (e.g. your personal Gmail). Verify the confirmation code.</p>
+          <p>3. Generate an API Key under <strong>SMTP & API &rarr; API Keys</strong> and paste it below.</p>
+        </div>
+
+        <!-- Resend Verified Domain Banner (shown when a verified domain exists) -->
+        <div id="resend-verified-domain-box" class="hidden p-3 bg-emerald-950/40 rounded-lg border border-emerald-500/40 space-y-1 text-[11px] text-slate-200">
+          <div class="font-bold text-emerald-400 flex items-center justify-between">
+            <span class="flex items-center gap-1.5">
+              <i class="fa-solid fa-circle-check text-emerald-400"></i> Domain Verified & Active
+            </span>
+            <span id="resend-domain-name-badge" class="font-mono text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded border border-emerald-500/30"></span>
+          </div>
+          <p class="text-slate-300">
+            Account verification emails are active and will deliver to <strong>all users</strong> worldwide from <code id="resend-active-sender-code" class="bg-slate-900 px-1.5 py-0.5 rounded text-emerald-300 font-mono"></code>.
+          </p>
+        </div>
+
+        <!-- Resend Guide Alert -->
+        <div id="resend-guide-box" class="hidden p-3 bg-slate-900/90 rounded-lg border border-amber-500/30 space-y-1.5 text-[11px] text-slate-300">
+          <div class="font-bold text-amber-400 flex items-center gap-1.5">
+            <i class="fa-solid fa-triangle-exclamation"></i> Important Resend Setup for All Users
+          </div>
+          <p class="leading-relaxed">
+            Resend's default <code class="bg-slate-800 px-1 py-0.5 rounded text-amber-300">onboarding@resend.dev</code> sender is restricted to <strong>only deliver to the account owner</strong>.
+          </p>
+          <p class="leading-relaxed">
+            To deliver verification emails to <strong>ALL users creating accounts</strong>, you must add & verify your custom domain at <a href="https://resend.com/domains" target="_blank" class="text-sky-400 underline font-semibold">resend.com/domains</a> and set your verified sender address below (e.g. <code class="bg-slate-800 px-1 py-0.5 rounded text-emerald-300">Crypto Bot &lt;noreply@yourdomain.com&gt;</code>).
+          </p>
+          <p class="text-slate-400 text-[10px] italic">Don't have a custom domain? Select <strong>Gmail SMTP</strong> or <strong>Brevo API</strong> above to send to all users without domain verification.</p>
+        </div>
+
+        <!-- SendGrid Guide Alert -->
+        <div id="sendgrid-guide-box" class="hidden p-3 bg-slate-900/90 rounded-lg border border-sky-500/30 space-y-1 text-[11px] text-slate-300">
+          <div class="font-bold text-sky-400 flex items-center gap-1.5">
+            <i class="fa-solid fa-cloud"></i> SendGrid API (100 free emails/day)
+          </div>
+          <p>1. Sign up at <a href="https://sendgrid.com" target="_blank" class="text-sky-400 underline font-semibold">sendgrid.com</a> and complete Single Sender Verification.</p>
+          <p>2. Create an API Key under <strong>Settings &rarr; API Keys</strong> with "Mail Send" permissions.</p>
+          <p>3. Paste the API key and verified sender email below.</p>
         </div>
 
         <!-- Custom SMTP Host & Port (shown for custom SMTP) -->
         <div id="field-smtp-host-row" class="hidden grid grid-cols-3 gap-2">
           <div class="col-span-2">
             <label class="block text-slate-400 mb-1">SMTP Host</label>
-            <input type="text" id="smtp-input-host" placeholder="smtp.mailgun.org / smtp.sendgrid.net" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+            <input type="text" id="smtp-input-host" placeholder="smtp.mailgun.org / smtp.postmarkapp.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
           </div>
           <div>
             <label class="block text-slate-400 mb-1">Port</label>
@@ -1464,11 +1913,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
+        <!-- Brevo API Key (shown for Brevo) -->
+        <div id="field-brevo-row" class="hidden space-y-2">
+          <div>
+            <label class="block text-slate-400 mb-1">Brevo API Key (v3) (<a href="https://app.brevo.com/settings/keys/api" target="_blank" class="text-sky-400 hover:underline">Get free key from brevo.com</a>)</label>
+            <input type="password" id="brevo-input-key" placeholder="xkeysib-..." class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono">
+          </div>
+        </div>
+
         <!-- Resend API Key (shown for Resend) -->
         <div id="field-resend-row" class="hidden space-y-2">
           <div>
-            <label class="block text-slate-400 mb-1">Resend API Key (<a href="https://resend.com/api-keys" target="_blank" class="text-sky-400 hover:underline">Get free key from resend.com</a>)</label>
+            <label class="block text-slate-400 mb-1">Resend API Key (<a href="https://resend.com/api-keys" target="_blank" class="text-sky-400 hover:underline">Get key from resend.com</a>)</label>
             <input type="password" id="resend-input-key" placeholder="re_123456789..." class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono">
+          </div>
+        </div>
+
+        <!-- SendGrid API Key (shown for SendGrid) -->
+        <div id="field-sendgrid-row" class="hidden space-y-2">
+          <div>
+            <label class="block text-slate-400 mb-1">SendGrid API Key (<a href="https://app.sendgrid.com/settings/api_keys" target="_blank" class="text-sky-400 hover:underline">Get key from sendgrid.com</a>)</label>
+            <input type="password" id="sendgrid-input-key" placeholder="SG.xxxxxxxx..." class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono">
           </div>
         </div>
 
@@ -1490,8 +1955,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div>
-          <label class="block text-slate-400 mb-1">Sender "From" Email (optional)</label>
-          <input type="text" id="smtp-input-from" placeholder="Crypto Trading Bot <noreply@domain.com>" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <label class="block text-slate-400 mb-1">Sender "From" Email Address</label>
+          <input type="text" id="smtp-input-from" placeholder="Crypto Trading Bot <noreply@yourdomain.com>" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
         </div>
 
         <button type="submit" id="btn-save-email-settings" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition flex items-center justify-center gap-1.5">
@@ -1512,6 +1977,151 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <div id="test-email-result" class="hidden p-3 rounded-lg border text-xs"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- TRADING BOT SETTINGS MODAL                                                -->
+  <!-- ========================================================================= -->
+  <div id="settings-modal" class="hidden fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-xl w-full p-6 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-bordercol pb-3">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center font-bold">
+            <i class="fa-solid fa-gear text-base"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Bot & Trading Settings</h3>
+            <p class="text-[11px] text-slate-400">Configure manual vs auto trading, strategy choice, timeframe, and risk</p>
+          </div>
+        </div>
+        <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <form id="form-settings" onsubmit="handleSaveSettings(event)" class="space-y-4 text-xs">
+        <!-- 1. Trading Execution Mode (Auto vs Manual) -->
+        <div>
+          <label class="block text-slate-300 font-bold mb-2">1. Trading Execution Mode</label>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <label id="opt-mode-auto-card" class="p-3 rounded-xl border border-purple-500/60 bg-purple-950/30 cursor-pointer transition flex items-start gap-2.5">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-auto" value="auto" checked onchange="onExecutionModeOptionChange()" class="mt-0.5 text-purple-500 focus:ring-0">
+              <div>
+                <div class="font-bold text-white flex items-center gap-1.5">
+                  <i class="fa-solid fa-robot text-purple-400"></i> Auto Trading
+                </div>
+                <p class="text-[11px] text-slate-400 mt-0.5 leading-tight">Bot automatically enters and exits trades when strategy signals fire.</p>
+              </div>
+            </label>
+
+            <label id="opt-mode-manual-card" class="p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-manual" value="manual" onchange="onExecutionModeOptionChange()" class="mt-0.5 text-amber-500 focus:ring-0">
+              <div>
+                <div class="font-bold text-white flex items-center gap-1.5">
+                  <i class="fa-solid fa-hand-pointer text-amber-400"></i> Manual Trading
+                </div>
+                <p class="text-[11px] text-slate-400 mt-0.5 leading-tight">Bot monitors market and generates signals, but YOU place trades manually.</p>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <!-- 2. Strategy Selection -->
+        <div>
+          <label class="block text-slate-300 font-bold mb-1">2. Select Trading Strategy</label>
+          <select id="settings-strategy" onchange="onStrategyOptionChange()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white font-medium focus:border-emerald-500">
+            <!-- Populated dynamically -->
+          </select>
+          <div id="settings-strat-desc" class="p-2.5 bg-slate-900/80 border border-bordercol/60 rounded-lg text-[11px] text-slate-300 mt-1.5 leading-relaxed">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <!-- 3. Timeframe & Symbol -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-slate-300 font-bold mb-1">
+              3. Timeframe <span class="text-emerald-400 font-semibold text-[11px]">(5m included)</span>
+            </label>
+            <select id="settings-timeframe" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white font-medium focus:border-emerald-500">
+              <option value="1m">1m (1 minute)</option>
+              <option value="3m">3m (3 minutes)</option>
+              <option value="5m" class="font-bold text-emerald-400">5m (5 minutes) ★</option>
+              <option value="15m" selected>15m (15 minutes)</option>
+              <option value="30m">30m (30 minutes)</option>
+              <option value="1h">1h (1 hour)</option>
+              <option value="2h">2h (2 hours)</option>
+              <option value="4h">4h (4 hours)</option>
+              <option value="1d">1d (1 day)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-slate-300 font-bold mb-1">Trading Pair / Symbol</label>
+            <input type="text" id="settings-symbol" value="BTC/USDT" placeholder="BTC/USDT" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white font-medium focus:border-emerald-500">
+          </div>
+        </div>
+
+        <!-- 4. Advanced Technical & Risk Settings (collapsible) -->
+        <div class="border border-bordercol rounded-xl overflow-hidden">
+          <button type="button" onclick="toggleAdvancedSettings()" class="w-full p-3 bg-slate-900 flex items-center justify-between text-left text-slate-300 hover:text-white font-semibold">
+            <span class="flex items-center gap-1.5"><i class="fa-solid fa-sliders text-slate-400"></i> Advanced Indicators & Risk Parameters</span>
+            <i class="fa-solid fa-chevron-down text-xs transition-transform" id="adv-chevron"></i>
+          </button>
+          <div id="adv-settings-body" class="hidden p-3.5 space-y-3 bg-slate-950 border-t border-bordercol">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-400 mb-1">Fast EMA Period</label>
+                <input type="number" id="settings-fast-ema" value="12" min="2" max="100" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              </div>
+              <div>
+                <label class="block text-slate-400 mb-1">Slow EMA Period</label>
+                <input type="number" id="settings-slow-ema" value="26" min="5" max="200" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-400 mb-1">RSI Overbought Max</label>
+                <input type="number" id="settings-rsi-ob" value="65" min="50" max="95" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              </div>
+              <div>
+                <label class="block text-slate-400 mb-1">ADX Trend Threshold</label>
+                <input type="number" id="settings-adx-thresh" value="20" min="5" max="50" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="block text-slate-400 mb-1">Risk Per Trade %</label>
+                <input type="number" id="settings-risk-pct" value="1.0" step="0.1" min="0.1" max="10.0" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2 py-1.5 text-white">
+              </div>
+              <div>
+                <label class="block text-slate-400 mb-1">Stop Loss (ATR)</label>
+                <input type="number" id="settings-stop-atr" value="2.0" step="0.1" min="0.5" max="10.0" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2 py-1.5 text-white">
+              </div>
+              <div>
+                <label class="block text-slate-400 mb-1">Take Profit (ATR)</label>
+                <input type="number" id="settings-target-atr" value="4.0" step="0.1" min="1.0" max="20.0" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2 py-1.5 text-white">
+              </div>
+            </div>
+            <div class="flex items-center gap-2 pt-1">
+              <input type="checkbox" id="settings-use-fib" checked class="rounded border-bordercol bg-slate-900 text-emerald-500">
+              <label for="settings-use-fib" class="text-slate-300">Enable Fibonacci Pullback Confluence Filter</label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Result Message Box -->
+        <div id="settings-result-msg" class="hidden p-3 rounded-lg border text-xs"></div>
+
+        <!-- Action Buttons -->
+        <div class="flex items-center justify-end gap-2 pt-2 border-t border-bordercol">
+          <button type="button" onclick="closeSettingsModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg transition">
+            Cancel
+          </button>
+          <button type="submit" id="btn-save-settings" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg shadow transition flex items-center gap-1.5">
+            <i class="fa-solid fa-floppy-disk"></i> Save & Apply Settings
+          </button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -1571,6 +2181,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         passInput.required = false;
         passInput.placeholder = 'Passphrase (Optional)';
       }
+
+      const testnetCheckbox = document.getElementById('key-testnet');
+      const testnetLabel = document.getElementById('key-testnet-label');
+      if (ex && !ex.sandbox) {
+        if (testnetCheckbox) testnetCheckbox.checked = false;
+        if (testnetLabel) {
+          testnetLabel.innerHTML = `Use Testnet / Sandbox Mode <span class="text-amber-400 font-semibold text-[10px]">(${ex.name} operates in Real Trading / Live Mode; no spot sandbox)</span>`;
+        }
+      } else {
+        if (testnetLabel) {
+          testnetLabel.innerText = 'Use Testnet / Sandbox Mode (Recommended first)';
+        }
+      }
     }
 
     async function testExchangeConnection() {
@@ -1607,6 +2230,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.success) {
+          if (typeof data.testnet === 'boolean') {
+            const chk = document.getElementById('key-testnet');
+            if (chk) chk.checked = data.testnet;
+          }
           resBox.className = 'text-xs p-3 rounded-lg border bg-emerald-950/60 border-emerald-500/40 text-emerald-200';
           resBox.innerHTML = `<strong><i class="fa-solid fa-check"></i> ${data.message}</strong><br><span class="text-[11px] text-emerald-300/80">Balances: ${JSON.stringify(data.balances)}</span>`;
         } else {
@@ -1766,11 +2393,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     </a>
                   </div>
                 ` : ''}
-                <div class="pt-1">
-                  <button type="button" onclick="openEmailSettingsModal()" class="text-sky-400 hover:underline flex items-center gap-1 font-semibold">
-                    <i class="fa-solid fa-gear"></i> Configure Email / SMTP Settings
-                  </button>
-                </div>
               `;
             }
           } else {
@@ -1826,9 +2448,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div class="pt-2 flex flex-col gap-2">
                 <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
-                </button>
-                <button type="button" onclick="openEmailSettingsModal()" class="text-[11px] text-sky-400 hover:underline text-center">
-                  <i class="fa-solid fa-gear"></i> Need to configure SMTP? Open Email Settings
                 </button>
               </div>
             `;
@@ -1888,7 +2507,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             notice.innerHTML = `
               <div class="flex items-center gap-2.5 text-amber-400 font-bold text-sm">
                 <i class="fa-solid fa-triangle-exclamation text-xl"></i>
-                <span>Account Created (Email Not Sent)</span>
+                <span>Account Created (Verification Email Delivery Issue)</span>
               </div>
               <p class="text-slate-200 leading-relaxed">${data.message}</p>
               ${data.dev_activation_link ? `
@@ -1896,7 +2515,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <div class="font-bold text-amber-400 flex items-center gap-1.5">
                     <i class="fa-solid fa-bolt"></i> Local / Dev Direct Activation:
                   </div>
-                  <p class="text-[11px] text-slate-300">Because an email service (SMTP / Resend) is not yet configured on this server, you can activate your account directly below:</p>
+                  <p class="text-[11px] text-slate-300">Because live email delivery was not completed, you can activate this account directly:</p>
                   <div class="pt-1">
                     <a href="${data.dev_activation_link}" target="_blank" class="inline-block px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg shadow transition text-xs">
                       Activate Account Directly
@@ -1905,11 +2524,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
               ` : ''}
               <div class="flex flex-col sm:flex-row gap-2 pt-1">
-                <button type="button" onclick="openEmailSettingsModal()" class="flex-1 py-2 bg-sky-700 hover:bg-sky-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
-                  <i class="fa-solid fa-gear"></i> Configure Email / SMTP
+                <button type="button" id="btn-resend-reg-failed" onclick="resendVerificationLink('${email}', 'btn-resend-reg-failed')" class="flex-1 py-2 bg-emerald-700 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
                 </button>
                 <button type="button" onclick="openAuthModal('login')" class="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5 text-xs">
-                  <i class="fa-solid fa-right-to-bracket"></i> Proceed to Login
+                  <i class="fa-solid fa-right-to-bracket text-xs"></i> Proceed to Login
                 </button>
               </div>
             `;
@@ -2021,6 +2640,309 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       checkAuth();
     }
 
+    // --- Trading Environment Switcher (Testnet vs Real Trading) ---
+    async function switchTradingMode(targetMode) {
+      const isReal = (targetMode === 'real');
+      if (isReal) {
+        const confirmed = confirm('⚠️ SWITCH TO REAL TRADING (LIVE)?\\n\\nWhen started, the bot will place REAL orders with REAL FUNDS on your configured exchange.\\n\\nPlease make sure you have verified your exchange credentials and risk settings.\\n\\nClick OK to switch to Real Trading.');
+        if (!confirmed) return;
+      }
+
+      try {
+        const res = await fetch('/api/bot/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ trading_mode: targetMode })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          updateTradingModeUI(data.is_real, data.mode, data.testnet);
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert('Failed to switch trading mode: ' + (data.message || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Error switching trading mode: ' + err);
+      }
+    }
+
+    function updateTradingModeUI(isReal, mode, testnet) {
+      const badgeMode = document.getElementById('badge-mode');
+      const envBtnTestnet = document.getElementById('env-btn-testnet');
+      const envBtnReal = document.getElementById('env-btn-real');
+      const envTitle = document.getElementById('env-mode-title');
+      const envDesc = document.getElementById('env-mode-desc');
+      const envIcon = document.getElementById('env-icon');
+      const cashLabel = document.getElementById('val-cash-label');
+
+      if (isReal) {
+        if (badgeMode) {
+          badgeMode.innerText = 'REAL TRADING (LIVE)';
+          badgeMode.className = 'text-[10px] px-2 py-0.5 rounded-full font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse';
+        }
+        if (envBtnReal) envBtnReal.className = 'px-3 py-1.5 bg-rose-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
+        if (envBtnTestnet) envBtnTestnet.className = 'px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
+        if (envTitle) {
+          envTitle.innerText = 'REAL TRADING (LIVE)';
+          envTitle.className = 'text-rose-400 font-bold';
+        }
+        if (envDesc) envDesc.innerText = 'Live execution with real capital on your exchange account.';
+        if (envIcon) {
+          envIcon.className = 'w-9 h-9 rounded-lg bg-rose-500/20 text-rose-400 flex items-center justify-center font-bold text-base';
+          envIcon.innerHTML = '<i class="fa-solid fa-bolt"></i>';
+        }
+        if (cashLabel) cashLabel.innerText = 'Exchange Balance';
+      } else {
+        if (badgeMode) {
+          badgeMode.innerText = 'TESTNET';
+          badgeMode.className = 'text-[10px] px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30';
+        }
+        if (envBtnTestnet) envBtnTestnet.className = 'px-3 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
+        if (envBtnReal) envBtnReal.className = 'px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
+        if (envTitle) {
+          envTitle.innerText = 'TESTNET / SIMULATION';
+          envTitle.className = 'text-blue-400 font-bold';
+        }
+        if (envDesc) envDesc.innerText = 'Safe simulated execution. Zero real funds at risk.';
+        if (envIcon) {
+          envIcon.className = 'w-9 h-9 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold text-base';
+          envIcon.innerHTML = '<i class="fa-solid fa-flask"></i>';
+        }
+        if (cashLabel) cashLabel.innerText = 'Paper Cash';
+      }
+    }
+
+    // --- Bot Settings & Manual Trading Handlers ---
+    let currentSettings = null;
+    let availableStrategies = [];
+
+    async function openSettingsModal() {
+      const modal = document.getElementById('settings-modal');
+      if (modal) modal.classList.remove('hidden');
+      await loadBotSettings();
+    }
+
+    function closeSettingsModal() {
+      const modal = document.getElementById('settings-modal');
+      if (modal) modal.classList.add('hidden');
+      const msg = document.getElementById('settings-result-msg');
+      if (msg) msg.classList.add('hidden');
+    }
+
+    function toggleAdvancedSettings() {
+      const body = document.getElementById('adv-settings-body');
+      const chev = document.getElementById('adv-chevron');
+      if (body) {
+        if (body.classList.contains('hidden')) {
+          body.classList.remove('hidden');
+          if (chev) chev.style.transform = 'rotate(180deg)';
+        } else {
+          body.classList.add('hidden');
+          if (chev) chev.style.transform = 'rotate(0deg)';
+        }
+      }
+    }
+
+    function onExecutionModeOptionChange() {
+      const autoRadio = document.getElementById('radio-mode-auto');
+      const isAuto = autoRadio ? autoRadio.checked : true;
+      const autoCard = document.getElementById('opt-mode-auto-card');
+      const manualCard = document.getElementById('opt-mode-manual-card');
+
+      if (isAuto) {
+        if (autoCard) autoCard.className = 'p-3 rounded-xl border border-purple-500/60 bg-purple-950/30 cursor-pointer transition flex items-start gap-2.5';
+        if (manualCard) manualCard.className = 'p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600';
+      } else {
+        if (autoCard) autoCard.className = 'p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600';
+        if (manualCard) manualCard.className = 'p-3 rounded-xl border border-amber-500/60 bg-amber-950/30 cursor-pointer transition flex items-start gap-2.5';
+      }
+    }
+
+    function onStrategyOptionChange() {
+      const sel = document.getElementById('settings-strategy');
+      if (!sel) return;
+      const stratId = sel.value;
+      const strat = availableStrategies.find(s => s.id === stratId);
+      const descEl = document.getElementById('settings-strat-desc');
+      if (descEl && strat) {
+        descEl.innerHTML = `<span class="font-bold text-emerald-400">${strat.name}</span>: ${strat.description}`;
+      }
+    }
+
+    async function loadBotSettings() {
+      try {
+        const res = await fetch('/api/bot/settings');
+        const data = await res.json();
+        currentSettings = data;
+        availableStrategies = data.available_strategies || [];
+
+        // 1. Populate strategy select
+        const stratSel = document.getElementById('settings-strategy');
+        if (stratSel) {
+          stratSel.innerHTML = '';
+          availableStrategies.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.id;
+            opt.innerText = s.name + (s.recommended ? ' ★ (Recommended)' : '');
+            if (s.id === data.strategy) opt.selected = true;
+            stratSel.appendChild(opt);
+          });
+          onStrategyOptionChange();
+        }
+
+        // 2. Set execution mode
+        const radioManual = document.getElementById('radio-mode-manual');
+        const radioAuto = document.getElementById('radio-mode-auto');
+        if (data.execution_mode === 'manual') {
+          if (radioManual) radioManual.checked = true;
+        } else {
+          if (radioAuto) radioAuto.checked = true;
+        }
+        onExecutionModeOptionChange();
+
+        // 3. Set timeframe (with 5m included and verified)
+        const tfSel = document.getElementById('settings-timeframe');
+        if (tfSel) {
+          tfSel.value = data.timeframe || '15m';
+        }
+
+        // 4. Set symbol
+        const symInput = document.getElementById('settings-symbol');
+        if (symInput) symInput.value = data.symbol || 'BTC/USDT';
+
+        // 5. Advanced technical parameters
+        if (document.getElementById('settings-fast-ema')) document.getElementById('settings-fast-ema').value = data.fast_ema;
+        if (document.getElementById('settings-slow-ema')) document.getElementById('settings-slow-ema').value = data.slow_ema;
+        if (document.getElementById('settings-rsi-ob')) document.getElementById('settings-rsi-ob').value = data.rsi_overbought;
+        if (document.getElementById('settings-adx-thresh')) document.getElementById('settings-adx-thresh').value = data.adx_trend_threshold;
+        if (document.getElementById('settings-risk-pct')) document.getElementById('settings-risk-pct').value = (data.risk_per_trade_pct * 100).toFixed(1);
+        if (document.getElementById('settings-stop-atr')) document.getElementById('settings-stop-atr').value = data.stop_loss_atr_mult;
+        if (document.getElementById('settings-target-atr')) document.getElementById('settings-target-atr').value = data.take_profit_atr_mult;
+        if (document.getElementById('settings-use-fib')) document.getElementById('settings-use-fib').checked = data.use_fib_filter;
+      } catch (err) {
+        console.error('Failed to load bot settings:', err);
+      }
+    }
+
+    async function handleSaveSettings(e) {
+      e.preventDefault();
+      const btn = document.getElementById('btn-save-settings');
+      const oldHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+      }
+
+      const radioManual = document.getElementById('radio-mode-manual');
+      const isManual = radioManual ? radioManual.checked : false;
+      const payload = {
+        execution_mode: isManual ? 'manual' : 'auto',
+        strategy: document.getElementById('settings-strategy').value,
+        timeframe: document.getElementById('settings-timeframe').value,
+        symbol: document.getElementById('settings-symbol').value.trim().toUpperCase(),
+        use_fib_filter: document.getElementById('settings-use-fib').checked,
+        fast_ema: parseInt(document.getElementById('settings-fast-ema').value) || 12,
+        slow_ema: parseInt(document.getElementById('settings-slow-ema').value) || 26,
+        rsi_overbought: parseFloat(document.getElementById('settings-rsi-ob').value) || 65.0,
+        adx_trend_threshold: parseFloat(document.getElementById('settings-adx-thresh').value) || 20.0,
+        risk_per_trade_pct: (parseFloat(document.getElementById('settings-risk-pct').value) || 1.0) / 100.0,
+        stop_loss_atr_mult: parseFloat(document.getElementById('settings-stop-atr').value) || 2.0,
+        take_profit_atr_mult: parseFloat(document.getElementById('settings-target-atr').value) || 4.0,
+      };
+
+      const msgBox = document.getElementById('settings-result-msg');
+      if (msgBox) msgBox.classList.remove('hidden');
+
+      try {
+        const res = await fetch('/api/bot/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          if (msgBox) {
+            msgBox.className = 'p-3 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs';
+            msgBox.innerHTML = `<strong><i class="fa-solid fa-check"></i> ${data.message}</strong>`;
+          }
+          await fetchStatus();
+          await refreshAnalysis();
+          await refreshLogs();
+          setTimeout(() => closeSettingsModal(), 1800);
+        } else {
+          if (msgBox) {
+            msgBox.className = 'p-3 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs';
+            msgBox.innerText = data.detail || data.message || 'Failed to save settings';
+          }
+        }
+      } catch (err) {
+        if (msgBox) {
+          msgBox.className = 'p-3 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs';
+          msgBox.innerText = 'Network error: ' + err;
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = oldHtml;
+        }
+      }
+    }
+
+    async function quickSetExecutionMode(targetMode) {
+      try {
+        const res = await fetch('/api/bot/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ execution_mode: targetMode })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert('Failed to switch execution mode: ' + (data.detail || data.message));
+        }
+      } catch (err) {
+        alert('Error changing execution mode: ' + err);
+      }
+    }
+
+    async function triggerManualTrade(action) {
+      const actName = action.toUpperCase();
+      if (!confirm(`Confirm manual ${actName} order execution at current market price?`)) return;
+
+      const btn = document.getElementById('btn-manual-' + action.toLowerCase());
+      const oldHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
+      }
+
+      try {
+        const res = await fetch('/api/bot/trade/manual', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: action.toLowerCase() })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          alert(data.message);
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert(`Manual ${actName} failed: ` + (data.detail || data.message));
+        }
+      } catch (err) {
+        alert(`Error executing manual ${actName}: ` + err);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = oldHtml;
+        }
+      }
+    }
+
     // --- Status, Analysis, Backtest & Logs ---
     async function fetchStatus() {
       try {
@@ -2028,8 +2950,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         botRunning = data.running;
 
-        document.getElementById('badge-mode').innerText = (data.mode + (data.testnet ? ' (TESTNET)' : '')).toUpperCase();
+        const isReal = (data.mode === 'live' && !data.testnet);
+        updateTradingModeUI(isReal, data.mode, data.testnet);
         document.getElementById('val-symbol-tag').innerText = `${data.symbol} ${data.timeframe}`;
+
+        // Update Execution Mode & Strategy UI on Dashboard
+        const isManual = (data.execution_mode === 'manual');
+        const activeStratTag = document.getElementById('active-strat-tag');
+        const activeTfTag = document.getElementById('active-tf-tag');
+        const activeModeTag = document.getElementById('active-mode-tag');
+        const manualPanel = document.getElementById('manual-control-panel');
+
+        if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
+        if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
+        if (activeModeTag) {
+          activeModeTag.innerText = isManual ? 'Manual Trading' : 'Auto Trading';
+          activeModeTag.className = isManual ? 'text-amber-400 font-semibold' : 'text-purple-300 font-semibold';
+        }
+        if (manualPanel) {
+          manualPanel.classList.toggle('hidden', !isManual);
+        }
 
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
@@ -2270,6 +3210,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     // --- Email & SMTP Settings Management ---
     let currentEmailProvider = 'gmail';
+    let cachedEmailSettings = null;
 
     async function checkEmailStatusBadge() {
       try {
@@ -2278,9 +3219,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const dot = document.getElementById('email-status-dot');
         if (dot) {
           if (data.is_configured) {
-            dot.className = 'w-2 h-2 rounded-full bg-emerald-400 inline-block';
+            if (data.can_send_to_all_users) {
+              dot.className = 'w-2 h-2 rounded-full bg-emerald-400 inline-block';
+            } else {
+              dot.className = 'w-2 h-2 rounded-full bg-amber-400 inline-block animate-pulse';
+            }
           } else {
-            dot.className = 'w-2 h-2 rounded-full bg-amber-500 inline-block animate-pulse';
+            dot.className = 'w-2 h-2 rounded-full bg-rose-500 inline-block animate-pulse';
           }
         }
       } catch (e) {
@@ -2295,6 +3240,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/api/auth/email-settings');
         const data = await res.json();
+        cachedEmailSettings = data;
 
         // Update banner
         const indicator = document.getElementById('smtp-status-indicator');
@@ -2302,15 +3248,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const tag = document.getElementById('smtp-provider-tag');
 
         if (data.is_configured) {
-          indicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
-          text.innerText = `Configured & Ready (${data.provider.toUpperCase()})`;
-          tag.innerText = data.provider.toUpperCase();
-          tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
+          if (data.can_send_to_all_users) {
+            indicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
+            const domainInfo = data.verified_domain ? ` &bull; Domain: ${data.verified_domain}` : '';
+            text.innerHTML = `<span class="font-bold text-emerald-400">Ready for All Users</span> <span class="text-slate-300">(${data.provider.toUpperCase()}${domainInfo})</span>`;
+            tag.innerText = data.provider.toUpperCase();
+            tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
+          } else {
+            indicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse';
+            text.innerHTML = `<span class="font-bold text-amber-400">Sandbox Testing Only</span> <span class="text-slate-300">(${data.provider.toUpperCase()} - Custom domain required for all users)</span>`;
+            tag.innerText = 'SANDBOX ONLY';
+            tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-amber-950/80 text-amber-300 border border-amber-500/40';
+          }
         } else {
-          indicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse';
-          text.innerText = 'No email service configured (emails cannot be delivered)';
+          indicator.className = 'w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse';
+          text.innerText = 'No email service configured (verification emails cannot be delivered)';
           tag.innerText = 'NOT CONFIGURED';
-          tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-amber-950/80 text-amber-300 border border-amber-500/40';
+          tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-rose-950/80 text-rose-300 border border-rose-500/40';
+        }
+
+        // Configure verified domain badge details
+        const resendDomainBadge = document.getElementById('resend-domain-name-badge');
+        const resendSenderCode = document.getElementById('resend-active-sender-code');
+        if (data.verified_domain) {
+          if (resendDomainBadge) resendDomainBadge.innerText = data.verified_domain;
+          if (resendSenderCode) resendSenderCode.innerText = data.from_email || `Crypto Trading Bot <noreply@${data.verified_domain}>`;
         }
 
         // Populate fields
@@ -2319,6 +3281,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('smtp-input-port').value = data.smtp_port || '587';
         document.getElementById('smtp-input-user').value = data.smtp_user || '';
         document.getElementById('smtp-input-from').value = data.from_email || '';
+        if (data.resend_key_masked) {
+          document.getElementById('resend-input-key').placeholder = `Saved: ${data.resend_key_masked} (leave blank to keep)`;
+        }
+        if (data.brevo_key_masked) {
+          document.getElementById('brevo-input-key').placeholder = `Saved: ${data.brevo_key_masked} (leave blank to keep)`;
+        }
+        if (data.sendgrid_key_masked) {
+          document.getElementById('sendgrid-input-key').placeholder = `Saved: ${data.sendgrid_key_masked} (leave blank to keep)`;
+        }
+        if (data.smtp_pass_masked) {
+          document.getElementById('smtp-input-pass').placeholder = `Saved: ${data.smtp_pass_masked} (leave blank to keep)`;
+        }
       } catch (err) {
         console.error('Failed to load email settings:', err);
       }
@@ -2332,48 +3306,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       currentEmailProvider = p;
       document.getElementById('email-provider-val').value = p;
 
-      const tabGmail = document.getElementById('tab-prov-gmail');
-      const tabResend = document.getElementById('tab-prov-resend');
-      const tabSmtp = document.getElementById('tab-prov-smtp');
+      const tabs = ['gmail', 'brevo', 'resend', 'sendgrid', 'smtp'];
+      const activeClass = 'py-2 px-1.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300';
+      const inactiveClass = 'py-2 px-1.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1';
 
-      const activeClass = 'py-2 px-2.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300';
-      const inactiveClass = 'py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1';
-
-      if (tabGmail) tabGmail.className = p === 'gmail' ? activeClass : inactiveClass;
-      if (tabResend) tabResend.className = p === 'resend' ? activeClass : inactiveClass;
-      if (tabSmtp) tabSmtp.className = p === 'smtp' ? activeClass : inactiveClass;
+      tabs.forEach(t => {
+        const tabEl = document.getElementById(`tab-prov-${t}`);
+        if (tabEl) tabEl.className = (p === t) ? activeClass : inactiveClass;
+      });
 
       const gmailBox = document.getElementById('gmail-guide-box');
+      const brevoBox = document.getElementById('brevo-guide-box');
+      const resendBox = document.getElementById('resend-guide-box');
+      const resendVerifiedBox = document.getElementById('resend-verified-domain-box');
+      const sendgridBox = document.getElementById('sendgrid-guide-box');
+
       const hostRow = document.getElementById('field-smtp-host-row');
+      const brevoRow = document.getElementById('field-brevo-row');
       const resendRow = document.getElementById('field-resend-row');
+      const sendgridRow = document.getElementById('field-sendgrid-row');
       const credsRow = document.getElementById('field-smtp-creds-row');
       const lblUser = document.getElementById('lbl-smtp-user');
       const lblPass = document.getElementById('lbl-smtp-pass');
 
+      if (gmailBox) gmailBox.classList.toggle('hidden', p !== 'gmail');
+      if (brevoBox) brevoBox.classList.toggle('hidden', p !== 'brevo');
+      if (sendgridBox) sendgridBox.classList.toggle('hidden', p !== 'sendgrid');
+
+      if (p === 'resend') {
+        const hasVerified = cachedEmailSettings && cachedEmailSettings.verified_domain;
+        if (resendVerifiedBox) resendVerifiedBox.classList.toggle('hidden', !hasVerified);
+        if (resendBox) resendBox.classList.toggle('hidden', Boolean(hasVerified));
+      } else {
+        if (resendVerifiedBox) resendVerifiedBox.classList.add('hidden');
+        if (resendBox) resendBox.classList.add('hidden');
+      }
+
+      if (hostRow) hostRow.classList.toggle('hidden', p !== 'smtp');
+      if (brevoRow) brevoRow.classList.toggle('hidden', p !== 'brevo');
+      if (resendRow) resendRow.classList.toggle('hidden', p !== 'resend');
+      if (sendgridRow) sendgridRow.classList.toggle('hidden', p !== 'sendgrid');
+      if (credsRow) credsRow.classList.toggle('hidden', p !== 'gmail' && p !== 'smtp');
+
       if (p === 'gmail') {
-        if (gmailBox) gmailBox.classList.remove('hidden');
-        if (hostRow) hostRow.classList.add('hidden');
-        if (resendRow) resendRow.classList.add('hidden');
-        if (credsRow) credsRow.classList.remove('hidden');
         if (lblUser) lblUser.innerText = 'Gmail Address';
         if (lblPass) lblPass.innerText = '16-Character Google App Password';
-        const passIn = document.getElementById('smtp-input-pass');
-        if (passIn) passIn.placeholder = 'abcd efgh ijkl mnop';
-      } else if (p === 'resend') {
-        if (gmailBox) gmailBox.classList.add('hidden');
-        if (hostRow) hostRow.classList.add('hidden');
-        if (resendRow) resendRow.classList.remove('hidden');
-        if (credsRow) credsRow.classList.add('hidden');
-      } else {
-        // Custom SMTP
-        if (gmailBox) gmailBox.classList.add('hidden');
-        if (hostRow) hostRow.classList.remove('hidden');
-        if (resendRow) resendRow.classList.add('hidden');
-        if (credsRow) credsRow.classList.remove('hidden');
+      } else if (p === 'smtp') {
         if (lblUser) lblUser.innerText = 'SMTP Username';
         if (lblPass) lblPass.innerText = 'SMTP Password';
-        const passIn = document.getElementById('smtp-input-pass');
-        if (passIn) passIn.placeholder = 'Your SMTP Password';
       }
     }
 
@@ -2393,6 +3373,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         smtp_pass: document.getElementById('smtp-input-pass').value,
         from_email: document.getElementById('smtp-input-from').value,
         resend_api_key: document.getElementById('resend-input-key').value,
+        brevo_api_key: document.getElementById('brevo-input-key') ? document.getElementById('brevo-input-key').value : '',
+        sendgrid_api_key: document.getElementById('sendgrid-input-key') ? document.getElementById('sendgrid-input-key').value : '',
       };
 
       try {
@@ -2442,22 +3424,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (res.ok && data.success) {
-          resultBox.className = 'p-3 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1';
+          resultBox.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1.5';
           resultBox.innerHTML = `
-            <div class="font-bold text-emerald-400 flex items-center gap-1.5">
+            <div class="font-bold text-emerald-400 flex items-center gap-1.5 text-sm">
               <i class="fa-solid fa-circle-check"></i> Test Email Sent Successfully!
             </div>
             <p>${data.message}</p>
-            <p class="text-[11px] text-slate-400">Please check the inbox and spam folder for <strong>${dest}</strong>.</p>
+            <p class="text-[11px] text-slate-300">A test verification message was dispatched to <strong>${dest}</strong>. Please check the inbox and spam folder.</p>
+            ${!data.can_send_to_all_users ? `
+              <div class="p-2.5 bg-amber-950/60 border border-amber-500/40 rounded text-amber-200 text-[11px] mt-1 space-y-1">
+                <div class="font-bold text-amber-300"><i class="fa-solid fa-triangle-exclamation"></i> Sandbox Notice:</div>
+                <p>This test succeeded because ${dest} matches your verified testing address. However, Resend is using <code>onboarding@resend.dev</code>, which cannot send to other users. To send verification emails to all registering users, please verify your custom domain at <a href="https://resend.com/domains" target="_blank" class="text-sky-300 underline font-semibold">resend.com/domains</a>, or switch to Brevo API / Gmail SMTP.</p>
+              </div>
+            ` : ''}
           `;
           await checkEmailStatusBadge();
         } else {
-          resultBox.className = 'p-3 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs space-y-1';
+          const isSandboxIssue = (data.message && (data.message.includes('403') || data.message.includes('Sandbox') || data.message.includes('testing emails to your own email address')));
+          resultBox.className = 'p-3.5 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs space-y-2';
           resultBox.innerHTML = `
-            <div class="font-bold text-rose-400 flex items-center gap-1.5">
+            <div class="font-bold text-rose-400 flex items-center gap-1.5 text-sm">
               <i class="fa-solid fa-circle-xmark"></i> Test Email Failed
             </div>
-            <p class="font-mono text-[11px] leading-relaxed">${data.message || data.detail}</p>
+            <p class="font-mono text-[11px] leading-relaxed text-slate-200">${data.message || data.detail}</p>
+            ${isSandboxIssue ? `
+              <div class="p-2.5 bg-slate-900/90 border border-amber-500/40 rounded text-amber-200 text-[11px] space-y-1">
+                <div class="font-bold text-amber-300"><i class="fa-solid fa-lightbulb"></i> How to fix this:</div>
+                <p><strong>Option 1 (Custom Domain):</strong> Add and verify your domain at <a href="https://resend.com/domains" target="_blank" class="text-sky-300 underline font-semibold">resend.com/domains</a>, then set your Sender "From" Email to <code>noreply@yourdomain.com</code>.</p>
+                <p><strong>Option 2 (No Domain Needed):</strong> Switch to <strong>Brevo API</strong> (300 free emails/day to any user) or <strong>Gmail SMTP</strong> above.</p>
+              </div>
+            ` : ''}
           `;
         }
       } catch (err) {
@@ -2472,6 +3468,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // Startup
     loadExchanges();
     checkAuth();
+    loadBotSettings();
     fetchStatus();
     refreshAnalysis();
     refreshLogs();

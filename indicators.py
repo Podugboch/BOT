@@ -73,3 +73,31 @@ def fib_retracement_levels(df: pd.DataFrame, lookback: int = 50) -> pd.DataFrame
         "fib_500": swing_high - span * 0.5,
         "fib_618": swing_high - span * 0.618,
     })
+
+
+def bollinger_bands(series: pd.Series, period: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+    """Bollinger Bands volatility bands (middle SMA, upper, lower)."""
+    middle = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return pd.DataFrame({
+        "bb_mid": middle.bfill().ffill(),
+        "bb_upper": upper.bfill().ffill(),
+        "bb_lower": lower.bfill().ffill(),
+    })
+
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal_period: int = 9) -> pd.DataFrame:
+    """Moving Average Convergence Divergence (MACD line, signal line, histogram)."""
+    fast_line = ema(series, fast)
+    slow_line = ema(series, slow)
+    macd_line = fast_line - slow_line
+    sig_line = ema(macd_line, signal_period)
+    hist = macd_line - sig_line
+    return pd.DataFrame({
+        "macd": macd_line,
+        "macd_signal": sig_line,
+        "macd_hist": hist,
+    })
+
