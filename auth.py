@@ -80,6 +80,13 @@ def init_auth_db():
     )
     """)
     cursor.execute("""
+    CREATE TABLE IF NOT EXISTS system_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -90,6 +97,78 @@ def init_auth_db():
     """)
     conn.commit()
     conn.close()
+
+
+def get_system_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM system_settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            return row["value"]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
+def set_system_setting(key: str, value: str):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO system_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """, (key, value, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+        os.environ[key] = value
+    except Exception as e:
+        print(f"[AUTH ERROR] Failed to set system setting {key}: {e}")
+
+
+def get_email_settings() -> Dict[str, Any]:
+    smtp_host = get_system_setting("SMTP_HOST", "") or ""
+    smtp_port = get_system_setting("SMTP_PORT", "587") or "587"
+    smtp_user = get_system_setting("SMTP_USER", "") or ""
+    smtp_pass = get_system_setting("SMTP_PASS", "") or ""
+    from_email = get_system_setting("FROM_EMAIL", "") or ""
+    resend_key = get_system_setting("RESEND_API_KEY", "") or ""
+
+    has_smtp = bool(smtp_host and smtp_user and smtp_pass)
+    has_resend = bool(resend_key)
+    is_configured = has_smtp or has_resend
+
+    active_provider = "none"
+    if has_resend:
+        active_provider = "resend"
+    elif has_smtp:
+        if "gmail" in smtp_host.lower():
+            active_provider = "gmail"
+        else:
+            active_provider = "smtp"
+
+    return {
+        "is_configured": is_configured,
+        "provider": active_provider,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_user": smtp_user,
+        "smtp_pass_masked": f"{smtp_pass[:2]}••••{smtp_pass[-2:]}" if len(smtp_pass) > 4 else ("••••" if smtp_pass else ""),
+        "from_email": from_email,
+        "resend_key_masked": f"{resend_key[:5]}••••" if len(resend_key) > 5 else ("••••" if resend_key else "")
+    }
+
+
+def save_email_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "FROM_EMAIL", "RESEND_API_KEY"]:
+        if k in settings:
+            val = str(settings[k]).strip()
+            set_system_setting(k, val)
+
+    return {"success": True, "message": "Email settings saved successfully", "settings": get_email_settings()}
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
@@ -104,8 +183,9 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
     return secrets.compare_digest(computed_hash, password_hash)
 
 
-def send_email_message(to_email: str, subject: str, body: str, token: str, email_type: str) -> bool:
-    """Stores in outbox for audit and delivers via Resend API or SMTP."""
+def send_email_message(to_email: str, subject: str, body: str, token: str, email_type: str) -> Tuple[bool, str]:
+    """Stores in outbox for audit and delivers via Resend API or SMTP.
+    Returns (success: bool, status_message: str)."""
     # Always record in database outbox for audit log
     try:
         conn = get_db_connection()
@@ -119,11 +199,11 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
         print(f"[AUTH ERROR] Error recording email in outbox: {e}")
 
     # Method 1: Check for Resend API Key (Best for serverless / Vercel cloud delivery)
-    resend_key = os.getenv("RESEND_API_KEY")
+    resend_key = get_system_setting("RESEND_API_KEY")
     if resend_key:
         try:
             import urllib.request
-            from_email = os.getenv("FROM_EMAIL") or os.getenv("SMTP_USER") or "Crypto Trading Bot <noreply@resend.dev>"
+            from_email = get_system_setting("FROM_EMAIL") or get_system_setting("SMTP_USER") or "Crypto Trading Bot <onboarding@resend.dev>"
             req = urllib.request.Request(
                 "https://api.resend.com/emails",
                 data=json.dumps({
@@ -138,19 +218,28 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
                     "User-Agent": "CryptoTradingBot/2.0"
                 }
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 if 200 <= resp.status < 300:
-                    print(f"[AUTH EMAIL] Successfully delivered {email_type} email to {to_email} via Resend API.")
-                    return True
+                    msg = f"Delivered {email_type} email to {to_email} via Resend API"
+                    print(f"[AUTH EMAIL] {msg}")
+                    return True, msg
+                else:
+                    err_msg = f"Resend API returned status code {resp.status}"
+                    print(f"[AUTH EMAIL] {err_msg}")
+                    if not get_system_setting("SMTP_HOST"):
+                        return False, err_msg
         except Exception as e:
-            print(f"[AUTH EMAIL] Resend delivery failed: {e}")
+            err_msg = f"Resend delivery failed: {e}"
+            print(f"[AUTH EMAIL] {err_msg}")
+            if not get_system_setting("SMTP_HOST"):
+                return False, err_msg
 
     # Method 2: Check for standard SMTP configuration (port 465 SSL or 587 STARTTLS)
-    smtp_host = os.getenv("SMTP_HOST") or os.getenv("EMAIL_SERVER")
-    smtp_port = int(os.getenv("SMTP_PORT") or os.getenv("EMAIL_PORT") or "587")
-    smtp_user = os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
-    smtp_pass = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASSWORD")
-    smtp_from = os.getenv("FROM_EMAIL") or smtp_user or "noreply@cryptobot.local"
+    smtp_host = get_system_setting("SMTP_HOST") or get_system_setting("EMAIL_SERVER")
+    smtp_port = int(get_system_setting("SMTP_PORT") or get_system_setting("EMAIL_PORT") or "587")
+    smtp_user = get_system_setting("SMTP_USER") or get_system_setting("EMAIL_USER")
+    smtp_pass = get_system_setting("SMTP_PASS") or get_system_setting("EMAIL_PASSWORD")
+    smtp_from = get_system_setting("FROM_EMAIL") or smtp_user or "noreply@cryptobot.local"
 
     if smtp_host:
         try:
@@ -161,25 +250,67 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
             msg.attach(MIMEText(body, "html"))
 
             if smtp_port == 465:
-                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=12) as server:
                     if smtp_user and smtp_pass:
                         server.login(smtp_user, smtp_pass)
                     server.sendmail(smtp_from, [to_email], msg.as_string())
             else:
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
                     server.starttls()
                     if smtp_user and smtp_pass:
                         server.login(smtp_user, smtp_pass)
                     server.sendmail(smtp_from, [to_email], msg.as_string())
 
-            print(f"[AUTH EMAIL] Successfully delivered {email_type} email to {to_email} via SMTP ({smtp_host}:{smtp_port}).")
-            return True
+            msg = f"Delivered {email_type} email to {to_email} via SMTP ({smtp_host}:{smtp_port})"
+            print(f"[AUTH EMAIL] {msg}")
+            return True, msg
         except Exception as e:
-            print(f"[AUTH EMAIL] SMTP delivery failed to {to_email} ({smtp_host}:{smtp_port}): {e}")
-            return False
+            err_msg = f"SMTP delivery failed to {to_email} ({smtp_host}:{smtp_port}): {e}"
+            print(f"[AUTH EMAIL] {err_msg}")
+            return False, err_msg
 
-    print(f"[AUTH EMAIL] Notice: No SMTP_HOST or RESEND_API_KEY configured. Email recorded in system outbox for {to_email}.")
-    return True
+    not_configured_msg = "No SMTP_HOST or RESEND_API_KEY configured on this server."
+    print(f"[AUTH EMAIL] Notice: {not_configured_msg} Recorded email in system outbox for {to_email}.")
+    return False, not_configured_msg
+
+
+def test_email_connection(to_email: str) -> Dict[str, Any]:
+    """Test sending a verification email to the specified address."""
+    to_email = to_email.strip().lower()
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+        return {"success": False, "message": "Invalid test email address format"}
+
+    settings = get_email_settings()
+    if not settings["is_configured"]:
+        return {
+            "success": False,
+            "message": "Neither SMTP credentials nor a Resend API Key is configured yet. Please enter your email credentials first.",
+            "settings": settings
+        }
+
+    test_token = secrets.token_urlsafe(16)
+    test_body = f"""
+    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
+      <h2 style="color: #22c55e; margin-top: 0;">✓ Email Dispatch Test Successful!</h2>
+      <p>Hello,</p>
+      <p>This is a confirmation test email sent from your <strong>Crypto Trading Bot</strong> platform.</p>
+      <p>Your email service (<strong>{settings['provider'].upper()}</strong>) is configured and working properly!</p>
+      <div style="background: #1e293b; padding: 12px 16px; border-radius: 8px; margin: 20px 0; font-family: monospace; font-size: 12px;">
+        Provider: {settings['provider']}<br>
+        Recipient: {to_email}<br>
+        Dispatched at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+      </div>
+      <p style="font-size: 12px; color: #64748b; border-top: 1px solid #334155; padding-top: 15px;">Crypto Trading Bot Verification Engine</p>
+    </div>
+    """
+
+    success, status = send_email_message(to_email, "✓ Crypto Trading Bot - Email Test Confirmation", test_body, test_token, "test")
+    return {
+        "success": success,
+        "message": status,
+        "recipient": to_email,
+        "provider": settings["provider"]
+    }
 
 
 class AuthService:
@@ -230,15 +361,22 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This activation link expires in 24 hours.</p>
         </div>
         """
-        send_email_message(email, "Activate Your Crypto Trading Bot Account", email_body, activation_token, "activation")
+        email_sent, email_status = send_email_message(email, "Activate Your Crypto Trading Bot Account", email_body, activation_token, "activation")
 
-        # Return only safe response data — verification link is only sent to the user's email
-        return {
+        res = {
             "success": True,
-            "message": f"Account created for {username}. A verification email has been sent to {email}. Please check your email to activate your account.",
             "user_id": user_id,
-            "email": email
+            "email": email,
+            "email_sent": email_sent,
+            "email_status": email_status
         }
+        if email_sent:
+            res["message"] = f"Account created for {username}. A verification email has been sent to {email}. Please check your email to activate your account."
+        else:
+            res["message"] = f"Account created for {username}. Notice: {email_status} To receive verification emails, please configure SMTP or Resend credentials in Email Settings."
+            res["dev_activation_link"] = activation_link
+
+        return res
 
     @staticmethod
     def activate_account(token: str) -> Dict[str, Any]:
@@ -307,13 +445,21 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This verification link expires in 24 hours.</p>
         </div>
         """
-        send_email_message(email, "Activate Your Crypto Trading Bot Account (New Verification Link)", email_body, activation_token, "activation")
+        email_sent, email_status = send_email_message(email, "Activate Your Crypto Trading Bot Account (New Verification Link)", email_body, activation_token, "activation")
 
-        return {
+        res = {
             "success": True,
-            "message": f"A fresh verification email has been sent to {email}. Please check your inbox.",
-            "email": email
+            "email": email,
+            "email_sent": email_sent,
+            "email_status": email_status
         }
+        if email_sent:
+            res["message"] = f"A fresh verification email has been sent to {email}. Please check your inbox."
+        else:
+            res["message"] = f"A new verification token was generated, but the email could not be sent: {email_status}."
+            res["dev_activation_link"] = activation_link
+
+        return res
 
     @staticmethod
     def login(username_or_email: str, password: str) -> Dict[str, Any]:
@@ -393,14 +539,21 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">If you did not request this, please ignore this email. This link expires in 2 hours.</p>
         </div>
         """
-        send_email_message(email, "Reset Your Crypto Trading Bot Password", email_body, reset_token, "reset")
+        email_sent, email_status = send_email_message(email, "Reset Your Crypto Trading Bot Password", email_body, reset_token, "reset")
 
-        # Return safe response — reset link is only sent to the user's email
-        return {
+        res = {
             "success": True,
-            "message": "Password reset email sent. Please check your inbox.",
-            "email": email
+            "email": email,
+            "email_sent": email_sent,
+            "email_status": email_status
         }
+        if email_sent:
+            res["message"] = "Password reset instructions have been sent to your email. Please check your inbox."
+        else:
+            res["message"] = f"Password reset was requested, but email could not be delivered: {email_status}."
+            res["dev_reset_link"] = reset_link
+
+        return res
 
     @staticmethod
     def reset_password(token: str, new_password: str) -> Dict[str, Any]:

@@ -38,7 +38,7 @@ from strategy import Signal, add_indicators, generate_signal, _near_fib_support
 from risk_manager import RiskManager
 from backtester import fetch_historical, run_backtest, summarize
 from bot import TradingBot
-from auth import AuthService, init_auth_db
+from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection
 
 logger = logging.getLogger("web")
 init_auth_db()
@@ -184,6 +184,20 @@ class BacktestRequest(BaseModel):
     risk_per_trade_pct: float = 0.01
 
 
+class EmailSettingsRequest(BaseModel):
+    provider: Optional[str] = "gmail"
+    smtp_host: Optional[str] = ""
+    smtp_port: Optional[str] = "587"
+    smtp_user: Optional[str] = ""
+    smtp_pass: Optional[str] = ""
+    from_email: Optional[str] = ""
+    resend_api_key: Optional[str] = ""
+
+
+class TestEmailRequest(BaseModel):
+    to_email: str
+
+
 # --- Auth Dependency Helper ---
 def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
     if not authorization:
@@ -293,6 +307,78 @@ def reset_password(req: ResetPasswordRequest):
 @app.get("/api/auth/latest-email")
 def get_latest_email(email: Optional[str] = None):
     return {"message": "Verification links are delivered exclusively to the registered email address."}
+
+
+@app.get("/api/auth/email-settings")
+def get_email_settings_endpoint():
+    return get_email_settings()
+
+
+@app.post("/api/auth/email-settings")
+def save_email_settings_endpoint(req: EmailSettingsRequest):
+    settings_dict = {}
+    if req.provider == "gmail":
+        settings_dict["SMTP_HOST"] = "smtp.gmail.com"
+        settings_dict["SMTP_PORT"] = req.smtp_port or "587"
+        settings_dict["SMTP_USER"] = req.smtp_user or ""
+        if req.smtp_pass is not None:
+            settings_dict["SMTP_PASS"] = req.smtp_pass
+        settings_dict["FROM_EMAIL"] = req.from_email or req.smtp_user or ""
+        settings_dict["RESEND_API_KEY"] = ""
+    elif req.provider == "resend":
+        if req.resend_api_key is not None:
+            settings_dict["RESEND_API_KEY"] = req.resend_api_key
+        settings_dict["FROM_EMAIL"] = req.from_email or "Crypto Trading Bot <onboarding@resend.dev>"
+        settings_dict["SMTP_HOST"] = ""
+        settings_dict["SMTP_USER"] = ""
+        settings_dict["SMTP_PASS"] = ""
+    elif req.provider == "none":
+        settings_dict["SMTP_HOST"] = ""
+        settings_dict["SMTP_PORT"] = "587"
+        settings_dict["SMTP_USER"] = ""
+        settings_dict["SMTP_PASS"] = ""
+        settings_dict["FROM_EMAIL"] = ""
+        settings_dict["RESEND_API_KEY"] = ""
+    else:
+        settings_dict["SMTP_HOST"] = req.smtp_host or ""
+        settings_dict["SMTP_PORT"] = req.smtp_port or "587"
+        settings_dict["SMTP_USER"] = req.smtp_user or ""
+        if req.smtp_pass is not None:
+            settings_dict["SMTP_PASS"] = req.smtp_pass
+        settings_dict["FROM_EMAIL"] = req.from_email or req.smtp_user or ""
+        settings_dict["RESEND_API_KEY"] = ""
+
+    res = save_email_settings(settings_dict)
+
+    # Persist to .env if writable
+    try:
+        env_file = Path(".env")
+        if env_file.exists():
+            lines = env_file.read_text().splitlines(keepends=True)
+            written = set()
+            new_lines = []
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k = s.split("=", 1)[0].strip()
+                    if k in settings_dict:
+                        new_lines.append(f"{k}={settings_dict[k]}\n")
+                        written.add(k)
+                        continue
+                new_lines.append(l)
+            for k, v in settings_dict.items():
+                if k not in written and v:
+                    new_lines.append(f"{k}={v}\n")
+            env_file.write_text("".join(new_lines))
+    except Exception as e:
+        logger.warning(f"Could not persist email settings to .env: {e}")
+
+    return res
+
+
+@app.post("/api/auth/test-email")
+def test_email_endpoint(req: TestEmailRequest):
+    return test_email_connection(req.to_email)
 
 
 # ============================================================================
@@ -831,6 +917,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <i class="fa-solid fa-skull-crossbones"></i>
         </button>
 
+        <!-- Email & SMTP Settings Button -->
+        <button onclick="openEmailSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Email & SMTP Settings">
+          <i class="fa-solid fa-envelope text-xs"></i>
+          <span id="email-status-dot" class="w-2 h-2 rounded-full bg-amber-500 inline-block"></span>
+          <span class="hidden sm:inline text-xs">Email / SMTP</span>
+        </button>
+
         <!-- Auth User Menu Button -->
         <div id="auth-buttons" class="flex items-center gap-2">
           <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
@@ -1301,6 +1394,127 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- EMAIL & SMTP SETTINGS MODAL -->
+  <div id="email-settings-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-bordercol pb-3">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center font-bold">
+            <i class="fa-solid fa-envelope"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Email & SMTP Settings</h3>
+            <p class="text-[11px] text-slate-400">Configure email delivery for account verifications & password resets</p>
+          </div>
+        </div>
+        <button onclick="closeEmailSettingsModal()" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <!-- Current Status Badge -->
+      <div id="smtp-current-status-banner" class="p-3 rounded-lg border border-bordercol bg-slate-900/80 text-xs flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span id="smtp-status-indicator" class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+          <span id="smtp-status-text" class="font-medium text-slate-200">Checking email service...</span>
+        </div>
+        <span id="smtp-provider-tag" class="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-slate-800 text-slate-400">NONE</span>
+      </div>
+
+      <!-- Provider Selection Tabs -->
+      <div>
+        <label class="block text-slate-400 text-xs mb-1.5 font-medium">Select Email Provider</label>
+        <div class="grid grid-cols-3 gap-2 text-xs">
+          <button type="button" onclick="selectEmailProvider('gmail')" id="tab-prov-gmail" class="py-2 px-2.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300">
+            <i class="fa-brands fa-google text-sm"></i>
+            <span>Gmail SMTP</span>
+          </button>
+          <button type="button" onclick="selectEmailProvider('resend')" id="tab-prov-resend" class="py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+            <i class="fa-solid fa-bolt text-sm"></i>
+            <span>Resend API</span>
+          </button>
+          <button type="button" onclick="selectEmailProvider('smtp')" id="tab-prov-smtp" class="py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1">
+            <i class="fa-solid fa-server text-sm"></i>
+            <span>Custom SMTP</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Form Inputs -->
+      <form id="form-email-settings" onsubmit="handleSaveEmailSettings(event)" class="space-y-3 text-xs">
+        <input type="hidden" id="email-provider-val" value="gmail">
+
+        <!-- Gmail Guide Alert -->
+        <div id="gmail-guide-box" class="p-3 bg-slate-900/90 rounded-lg border border-bordercol space-y-1 text-[11px] text-slate-300">
+          <div class="font-bold text-emerald-400 flex items-center gap-1.5">
+            <i class="fa-brands fa-google"></i> How to use Gmail SMTP:
+          </div>
+          <p>1. Go to your <a href="https://myaccount.google.com/apppasswords" target="_blank" class="text-sky-400 underline font-semibold">Google Account Security &rarr; App Passwords</a>.</p>
+          <p>2. Create a new App Password (e.g. named <em>Trading Bot</em>) and copy the 16-letter code.</p>
+          <p>3. Enter your Gmail address and the 16-letter App Password below.</p>
+        </div>
+
+        <!-- Custom SMTP Host & Port (shown for custom SMTP) -->
+        <div id="field-smtp-host-row" class="hidden grid grid-cols-3 gap-2">
+          <div class="col-span-2">
+            <label class="block text-slate-400 mb-1">SMTP Host</label>
+            <input type="text" id="smtp-input-host" placeholder="smtp.mailgun.org / smtp.sendgrid.net" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Port</label>
+            <input type="text" id="smtp-input-port" value="587" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          </div>
+        </div>
+
+        <!-- Resend API Key (shown for Resend) -->
+        <div id="field-resend-row" class="hidden space-y-2">
+          <div>
+            <label class="block text-slate-400 mb-1">Resend API Key (<a href="https://resend.com/api-keys" target="_blank" class="text-sky-400 hover:underline">Get free key from resend.com</a>)</label>
+            <input type="password" id="resend-input-key" placeholder="re_123456789..." class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono">
+          </div>
+        </div>
+
+        <!-- SMTP User & Password (shown for Gmail & Custom SMTP) -->
+        <div id="field-smtp-creds-row" class="space-y-3">
+          <div>
+            <label id="lbl-smtp-user" class="block text-slate-400 mb-1">Gmail Address / SMTP User</label>
+            <input type="email" id="smtp-input-user" placeholder="trader@gmail.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          </div>
+          <div>
+            <label id="lbl-smtp-pass" class="block text-slate-400 mb-1">16-Character App Password</label>
+            <div class="relative">
+              <input type="password" id="smtp-input-pass" placeholder="abcd efgh ijkl mnop" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white">
+              <button type="button" onclick="togglePasswordVisibility('smtp-input-pass', 'smtp-pass-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 transition" tabindex="-1">
+                <i class="fa-solid fa-eye text-xs" id="smtp-pass-eye"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-slate-400 mb-1">Sender "From" Email (optional)</label>
+          <input type="text" id="smtp-input-from" placeholder="Crypto Trading Bot <noreply@domain.com>" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+        </div>
+
+        <button type="submit" id="btn-save-email-settings" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition flex items-center justify-center gap-1.5">
+          <i class="fa-solid fa-floppy-disk"></i> Save Email Settings
+        </button>
+      </form>
+
+      <!-- TEST EMAIL DISPATCH SECTION -->
+      <div class="border-t border-bordercol pt-3 space-y-2">
+        <h4 class="text-xs font-bold text-white flex items-center gap-1.5">
+          <i class="fa-solid fa-paper-plane text-sky-400"></i> Send Test Verification Email
+        </h4>
+        <div class="flex gap-2 text-xs">
+          <input type="email" id="test-email-dest" placeholder="Enter recipient email (e.g. your email)" class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <button type="button" id="btn-run-test-email" onclick="runTestEmail()" class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+            <i class="fa-solid fa-paper-plane"></i> Send Test
+          </button>
+        </div>
+        <div id="test-email-result" class="hidden p-3 rounded-lg border text-xs"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Javascript Logic -->
   <script>
     let botRunning = false;
@@ -1527,14 +1741,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (notice) {
           notice.classList.remove('hidden');
           if (data.success) {
-            notice.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1.5';
-            notice.innerHTML = `
-              <div class="flex items-center gap-2 font-bold text-emerald-400">
-                <i class="fa-solid fa-circle-check text-base"></i>
-                <span>Verification Link Resent!</span>
-              </div>
-              <p class="text-slate-200 leading-relaxed">${data.message}</p>
-            `;
+            if (data.email_sent) {
+              notice.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1.5';
+              notice.innerHTML = `
+                <div class="flex items-center gap-2 font-bold text-emerald-400">
+                  <i class="fa-solid fa-circle-check text-base"></i>
+                  <span>Verification Link Resent!</span>
+                </div>
+                <p class="text-slate-200 leading-relaxed">${data.message}</p>
+              `;
+            } else {
+              notice.className = 'p-3.5 rounded-lg border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs space-y-2.5';
+              notice.innerHTML = `
+                <div class="flex items-center gap-2 font-bold text-amber-400">
+                  <i class="fa-solid fa-triangle-exclamation text-base"></i>
+                  <span>Email Not Delivered</span>
+                </div>
+                <p class="text-slate-200 leading-relaxed">${data.message}</p>
+                ${data.dev_activation_link ? `
+                  <div class="p-2.5 bg-slate-900/90 rounded border border-amber-500/30 space-y-1">
+                    <span class="text-[11px] text-amber-300 font-semibold block">Local / Direct Activation:</span>
+                    <a href="${data.dev_activation_link}" target="_blank" class="inline-block px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs rounded transition shadow">
+                      Activate Account Now
+                    </a>
+                  </div>
+                ` : ''}
+                <div class="pt-1">
+                  <button type="button" onclick="openEmailSettingsModal()" class="text-sky-400 hover:underline flex items-center gap-1 font-semibold">
+                    <i class="fa-solid fa-gear"></i> Configure Email / SMTP Settings
+                  </button>
+                </div>
+              `;
+            }
           } else {
             notice.className = 'p-3 rounded-lg border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs';
             notice.innerText = data.message || 'Unable to resend verification link.';
@@ -1585,9 +1823,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <p class="text-slate-300 leading-relaxed mt-1">
                 Your account is not yet activated. Please open the verification email sent to <strong>${data.email}</strong> and click the link to activate your account.
               </p>
-              <div class="pt-2">
+              <div class="pt-2 flex flex-col gap-2">
                 <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
+                </button>
+                <button type="button" onclick="openEmailSettingsModal()" class="text-[11px] text-sky-400 hover:underline text-center">
+                  <i class="fa-solid fa-gear"></i> Need to configure SMTP? Open Email Settings
                 </button>
               </div>
             `;
@@ -1616,31 +1857,63 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         notice.classList.remove('hidden');
         if (res.ok && data.success) {
-          notice.className = 'p-4 rounded-xl border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-3';
-          notice.innerHTML = `
-            <div class="flex items-center gap-2.5 text-emerald-400 font-bold text-sm">
-              <i class="fa-solid fa-envelope-circle-check text-xl"></i>
-              <span>Verification Email Sent!</span>
-            </div>
-            <p class="text-slate-200 leading-relaxed">
-              We have sent an account verification email to <strong>${email}</strong>.
-            </p>
-            <div class="p-3 bg-slate-900/90 rounded-lg border border-bordercol/80 space-y-1 text-[11px] text-slate-300">
-              <div class="font-semibold text-white flex items-center gap-1.5">
-                <i class="fa-solid fa-circle-info text-emerald-400"></i> Next Step:
+          if (data.email_sent) {
+            notice.className = 'p-4 rounded-xl border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-3';
+            notice.innerHTML = `
+              <div class="flex items-center gap-2.5 text-emerald-400 font-bold text-sm">
+                <i class="fa-solid fa-envelope-circle-check text-xl"></i>
+                <span>Verification Email Sent!</span>
               </div>
-              <p>Please check your email inbox (and spam/junk folder) and click the verification link inside the email to activate your account.</p>
-              <p class="text-slate-400 text-[10px] italic pt-1">Account verification must be accepted directly from the email message.</p>
-            </div>
-            <div class="flex flex-col sm:flex-row gap-2 pt-1">
-              <button type="button" id="btn-resend-reg" onclick="resendVerificationLink('${email}', 'btn-resend-reg')" class="flex-1 py-2 bg-emerald-700/90 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
-                <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
-              </button>
-              <button type="button" onclick="openAuthModal('login')" class="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5">
-                <i class="fa-solid fa-right-to-bracket text-xs"></i> Proceed to Login
-              </button>
-            </div>
-          `;
+              <p class="text-slate-200 leading-relaxed">
+                We have sent an account verification email to <strong>${email}</strong>.
+              </p>
+              <div class="p-3 bg-slate-900/90 rounded-lg border border-bordercol/80 space-y-1 text-[11px] text-slate-300">
+                <div class="font-semibold text-white flex items-center gap-1.5">
+                  <i class="fa-solid fa-circle-info text-emerald-400"></i> Next Step:
+                </div>
+                <p>Please check your email inbox (and spam/junk folder) and click the verification link inside the email to activate your account.</p>
+                <p class="text-slate-400 text-[10px] italic pt-1">Account verification must be accepted directly from the email message.</p>
+              </div>
+              <div class="flex flex-col sm:flex-row gap-2 pt-1">
+                <button type="button" id="btn-resend-reg" onclick="resendVerificationLink('${email}', 'btn-resend-reg')" class="flex-1 py-2 bg-emerald-700/90 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
+                  <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
+                </button>
+                <button type="button" onclick="openAuthModal('login')" class="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5">
+                  <i class="fa-solid fa-right-to-bracket text-xs"></i> Proceed to Login
+                </button>
+              </div>
+            `;
+          } else {
+            notice.className = 'p-4 rounded-xl border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs space-y-3';
+            notice.innerHTML = `
+              <div class="flex items-center gap-2.5 text-amber-400 font-bold text-sm">
+                <i class="fa-solid fa-triangle-exclamation text-xl"></i>
+                <span>Account Created (Email Not Sent)</span>
+              </div>
+              <p class="text-slate-200 leading-relaxed">${data.message}</p>
+              ${data.dev_activation_link ? `
+                <div class="p-3 bg-slate-900/90 rounded-lg border border-amber-500/40 space-y-1.5 text-xs text-amber-200">
+                  <div class="font-bold text-amber-400 flex items-center gap-1.5">
+                    <i class="fa-solid fa-bolt"></i> Local / Dev Direct Activation:
+                  </div>
+                  <p class="text-[11px] text-slate-300">Because an email service (SMTP / Resend) is not yet configured on this server, you can activate your account directly below:</p>
+                  <div class="pt-1">
+                    <a href="${data.dev_activation_link}" target="_blank" class="inline-block px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg shadow transition text-xs">
+                      Activate Account Directly
+                    </a>
+                  </div>
+                </div>
+              ` : ''}
+              <div class="flex flex-col sm:flex-row gap-2 pt-1">
+                <button type="button" onclick="openEmailSettingsModal()" class="flex-1 py-2 bg-sky-700 hover:bg-sky-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-gear"></i> Configure Email / SMTP
+                </button>
+                <button type="button" onclick="openAuthModal('login')" class="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-right-to-bracket"></i> Proceed to Login
+                </button>
+              </div>
+            `;
+          }
           document.getElementById('form-register').reset();
         } else {
           notice.className = 'p-3 rounded-lg border bg-rose-950/70 border-rose-500/40 text-rose-200 text-xs';
@@ -1995,12 +2268,214 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    // --- Email & SMTP Settings Management ---
+    let currentEmailProvider = 'gmail';
+
+    async function checkEmailStatusBadge() {
+      try {
+        const res = await fetch('/api/auth/email-settings');
+        const data = await res.json();
+        const dot = document.getElementById('email-status-dot');
+        if (dot) {
+          if (data.is_configured) {
+            dot.className = 'w-2 h-2 rounded-full bg-emerald-400 inline-block';
+          } else {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500 inline-block animate-pulse';
+          }
+        }
+      } catch (e) {
+        console.error('Error checking email status:', e);
+      }
+    }
+
+    async function openEmailSettingsModal() {
+      document.getElementById('email-settings-modal').classList.remove('hidden');
+      document.getElementById('test-email-result').classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/auth/email-settings');
+        const data = await res.json();
+
+        // Update banner
+        const indicator = document.getElementById('smtp-status-indicator');
+        const text = document.getElementById('smtp-status-text');
+        const tag = document.getElementById('smtp-provider-tag');
+
+        if (data.is_configured) {
+          indicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
+          text.innerText = `Configured & Ready (${data.provider.toUpperCase()})`;
+          tag.innerText = data.provider.toUpperCase();
+          tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
+        } else {
+          indicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse';
+          text.innerText = 'No email service configured (emails cannot be delivered)';
+          tag.innerText = 'NOT CONFIGURED';
+          tag.className = 'px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-amber-950/80 text-amber-300 border border-amber-500/40';
+        }
+
+        // Populate fields
+        selectEmailProvider(data.provider !== 'none' ? data.provider : 'gmail');
+        document.getElementById('smtp-input-host').value = data.smtp_host || '';
+        document.getElementById('smtp-input-port').value = data.smtp_port || '587';
+        document.getElementById('smtp-input-user').value = data.smtp_user || '';
+        document.getElementById('smtp-input-from').value = data.from_email || '';
+      } catch (err) {
+        console.error('Failed to load email settings:', err);
+      }
+    }
+
+    function closeEmailSettingsModal() {
+      document.getElementById('email-settings-modal').classList.add('hidden');
+    }
+
+    function selectEmailProvider(p) {
+      currentEmailProvider = p;
+      document.getElementById('email-provider-val').value = p;
+
+      const tabGmail = document.getElementById('tab-prov-gmail');
+      const tabResend = document.getElementById('tab-prov-resend');
+      const tabSmtp = document.getElementById('tab-prov-smtp');
+
+      const activeClass = 'py-2 px-2.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300';
+      const inactiveClass = 'py-2 px-2.5 rounded-lg border border-bordercol text-slate-400 hover:text-white font-semibold text-center transition flex flex-col items-center gap-1';
+
+      if (tabGmail) tabGmail.className = p === 'gmail' ? activeClass : inactiveClass;
+      if (tabResend) tabResend.className = p === 'resend' ? activeClass : inactiveClass;
+      if (tabSmtp) tabSmtp.className = p === 'smtp' ? activeClass : inactiveClass;
+
+      const gmailBox = document.getElementById('gmail-guide-box');
+      const hostRow = document.getElementById('field-smtp-host-row');
+      const resendRow = document.getElementById('field-resend-row');
+      const credsRow = document.getElementById('field-smtp-creds-row');
+      const lblUser = document.getElementById('lbl-smtp-user');
+      const lblPass = document.getElementById('lbl-smtp-pass');
+
+      if (p === 'gmail') {
+        if (gmailBox) gmailBox.classList.remove('hidden');
+        if (hostRow) hostRow.classList.add('hidden');
+        if (resendRow) resendRow.classList.add('hidden');
+        if (credsRow) credsRow.classList.remove('hidden');
+        if (lblUser) lblUser.innerText = 'Gmail Address';
+        if (lblPass) lblPass.innerText = '16-Character Google App Password';
+        const passIn = document.getElementById('smtp-input-pass');
+        if (passIn) passIn.placeholder = 'abcd efgh ijkl mnop';
+      } else if (p === 'resend') {
+        if (gmailBox) gmailBox.classList.add('hidden');
+        if (hostRow) hostRow.classList.add('hidden');
+        if (resendRow) resendRow.classList.remove('hidden');
+        if (credsRow) credsRow.classList.add('hidden');
+      } else {
+        // Custom SMTP
+        if (gmailBox) gmailBox.classList.add('hidden');
+        if (hostRow) hostRow.classList.remove('hidden');
+        if (resendRow) resendRow.classList.add('hidden');
+        if (credsRow) credsRow.classList.remove('hidden');
+        if (lblUser) lblUser.innerText = 'SMTP Username';
+        if (lblPass) lblPass.innerText = 'SMTP Password';
+        const passIn = document.getElementById('smtp-input-pass');
+        if (passIn) passIn.placeholder = 'Your SMTP Password';
+      }
+    }
+
+    async function handleSaveEmailSettings(e) {
+      e.preventDefault();
+      const btn = document.getElementById('btn-save-email-settings');
+      const oldHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+
+      const provider = currentEmailProvider;
+      const payload = {
+        provider: provider,
+        smtp_host: document.getElementById('smtp-input-host').value,
+        smtp_port: document.getElementById('smtp-input-port').value,
+        smtp_user: document.getElementById('smtp-input-user').value,
+        smtp_pass: document.getElementById('smtp-input-pass').value,
+        from_email: document.getElementById('smtp-input-from').value,
+        resend_api_key: document.getElementById('resend-input-key').value,
+      };
+
+      try {
+        const res = await fetch('/api/auth/email-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          alert('Email settings saved successfully!');
+          await openEmailSettingsModal();
+          await checkEmailStatusBadge();
+        } else {
+          alert('Failed to save email settings: ' + (data.detail || data.message));
+        }
+      } catch (err) {
+        alert('Error saving email settings: ' + err);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldHtml;
+      }
+    }
+
+    async function runTestEmail() {
+      const dest = document.getElementById('test-email-dest').value.trim();
+      const resultBox = document.getElementById('test-email-result');
+      if (!dest) {
+        alert('Please enter a recipient email address to send a test to.');
+        return;
+      }
+
+      const btn = document.getElementById('btn-run-test-email');
+      const oldHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sending...';
+
+      resultBox.classList.remove('hidden');
+      resultBox.className = 'p-3 rounded-lg border bg-slate-900 border-bordercol text-slate-300 text-xs flex items-center gap-2';
+      resultBox.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-sky-400"></i> Dispatching test email...';
+
+      try {
+        const res = await fetch('/api/auth/test-email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to_email: dest })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          resultBox.className = 'p-3 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1';
+          resultBox.innerHTML = `
+            <div class="font-bold text-emerald-400 flex items-center gap-1.5">
+              <i class="fa-solid fa-circle-check"></i> Test Email Sent Successfully!
+            </div>
+            <p>${data.message}</p>
+            <p class="text-[11px] text-slate-400">Please check the inbox and spam folder for <strong>${dest}</strong>.</p>
+          `;
+          await checkEmailStatusBadge();
+        } else {
+          resultBox.className = 'p-3 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs space-y-1';
+          resultBox.innerHTML = `
+            <div class="font-bold text-rose-400 flex items-center gap-1.5">
+              <i class="fa-solid fa-circle-xmark"></i> Test Email Failed
+            </div>
+            <p class="font-mono text-[11px] leading-relaxed">${data.message || data.detail}</p>
+          `;
+        }
+      } catch (err) {
+        resultBox.className = 'p-3 rounded-lg border bg-rose-950/80 border-rose-500/40 text-rose-200 text-xs';
+        resultBox.innerText = 'Network error: ' + err;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldHtml;
+      }
+    }
+
     // Startup
     loadExchanges();
     checkAuth();
     fetchStatus();
     refreshAnalysis();
     refreshLogs();
+    checkEmailStatusBadge();
 
     setInterval(fetchStatus, 3000);
     setInterval(refreshAnalysis, 15000);
