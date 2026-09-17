@@ -267,6 +267,55 @@ class AuthService:
         return {"success": True, "message": f"Account {user['username']} successfully activated! You can now log in."}
 
     @staticmethod
+    def resend_activation_email(email: str, base_url: str = "http://localhost:8000") -> Dict[str, Any]:
+        email = email.strip().lower()
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return {"success": False, "message": "Invalid email address format"}
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, email, is_active FROM users WHERE LOWER(email) = ?", (email,))
+        user = cur.fetchone()
+
+        if not user:
+            conn.close()
+            # Do not disclose if user exists, but confirm message
+            return {"success": True, "message": f"If an account is associated with {email} and pending verification, a new verification link has been sent."}
+
+        if user["is_active"] == 1:
+            conn.close()
+            return {"success": False, "already_active": True, "message": "Account is already activated. Please sign in."}
+
+        activation_token = secrets.token_urlsafe(32)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
+        cur.execute("UPDATE users SET activation_token = ?, activation_expires_at = ? WHERE id = ?",
+                    (activation_token, expires_at, user["id"]))
+        conn.commit()
+        conn.close()
+
+        activation_link = f"{base_url}/activate?token={activation_token}"
+        email_body = f"""
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
+          <h2 style="color: #22c55e; margin-top: 0;">Your New Verification Link</h2>
+          <p>Hello <strong>{user['username']}</strong>,</p>
+          <p>You requested a new verification link for your Crypto Trading Bot account. Please click the button below to accept and activate your account:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Activate Account</a>
+          </div>
+          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{activation_link}" style="color: #38bdf8;">{activation_link}</a></p>
+          <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This verification link expires in 24 hours.</p>
+        </div>
+        """
+        send_email_message(email, "Activate Your Crypto Trading Bot Account (New Verification Link)", email_body, activation_token, "activation")
+
+        return {
+            "success": True,
+            "message": f"A fresh verification email has been sent to {email}. Please check your inbox.",
+            "email": email
+        }
+
+    @staticmethod
     def login(username_or_email: str, password: str) -> Dict[str, Any]:
         val = username_or_email.strip().lower()
         conn = get_db_connection()

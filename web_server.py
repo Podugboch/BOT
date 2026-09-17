@@ -149,6 +149,10 @@ class ForgotPasswordRequest(BaseModel):
     email: str
 
 
+class ResendActivationRequest(BaseModel):
+    email: str
+
+
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
@@ -244,6 +248,13 @@ def activate_account(token: str = Query(...)):
     res = AuthService.activate_account(token)
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
+    return res
+
+
+@app.post("/api/auth/resend-activation")
+def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
+    base_url = str(request.base_url).rstrip("/")
+    res = AuthService.resend_activation_email(req.email, base_url=base_url)
     return res
 
 
@@ -1222,8 +1233,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button type="submit" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition">
           Sign In
         </button>
-        <div class="text-center text-slate-400 pt-2">
-          Don't have an account? <a href="javascript:void(0)" onclick="openAuthModal('register')" class="text-emerald-400 font-semibold hover:underline">Register now</a>
+        <div class="text-center text-slate-400 pt-2 space-y-1">
+          <div>Don't have an account? <a href="javascript:void(0)" onclick="openAuthModal('register')" class="text-emerald-400 font-semibold hover:underline">Register now</a></div>
+          <div><a href="javascript:void(0)" onclick="openAuthModal('resend')" class="text-[11px] text-slate-400 hover:text-emerald-400 underline">Didn't receive verification email? Resend link</a></div>
         </div>
       </form>
 
@@ -1249,8 +1261,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button type="submit" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition">
           Create Account
         </button>
-        <div class="text-center text-slate-400 pt-2">
-          Already have an account? <a href="javascript:void(0)" onclick="openAuthModal('login')" class="text-emerald-400 font-semibold hover:underline">Log in</a>
+        <div class="text-center text-slate-400 pt-2 space-y-1">
+          <div>Already have an account? <a href="javascript:void(0)" onclick="openAuthModal('login')" class="text-emerald-400 font-semibold hover:underline">Log in</a></div>
+          <div><a href="javascript:void(0)" onclick="openAuthModal('resend')" class="text-[11px] text-slate-400 hover:text-emerald-400 underline">Need another verification link? Resend here</a></div>
         </div>
       </form>
 
@@ -1258,13 +1271,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <form id="form-forgot" onsubmit="handleForgot(event)" class="hidden space-y-3 text-xs">
         <div>
           <label class="block text-slate-400 mb-1">Registered Email Address</label>
-          <input type="email" id="forgot-email" required class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <input type="email" id="forgot-email" required placeholder="trader@example.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500">
         </div>
         <button type="submit" class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 font-bold text-white rounded-lg shadow transition">
           Send Password Reset Email
         </button>
         <div class="text-center text-slate-400 pt-2">
           <a href="javascript:void(0)" onclick="openAuthModal('login')" class="text-slate-300 hover:underline">Back to Login</a>
+        </div>
+      </form>
+
+      <!-- RESEND VERIFICATION FORM -->
+      <form id="form-resend" onsubmit="handleResendForm(event)" class="hidden space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 mb-1">Registered Email Address</label>
+          <input type="email" id="resend-email" required placeholder="trader@example.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-emerald-500">
+        </div>
+        <button type="submit" id="btn-submit-resend" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition flex items-center justify-center gap-1.5">
+          <i class="fa-solid fa-paper-plane"></i> Resend Verification Link
+        </button>
+        <div class="text-center text-slate-400 pt-2 flex items-center justify-between text-[11px]">
+          <a href="javascript:void(0)" onclick="openAuthModal('login')" class="text-slate-300 hover:underline">Back to Login</a>
+          <a href="javascript:void(0)" onclick="openAuthModal('register')" class="text-emerald-400 hover:underline">Create Account</a>
         </div>
       </form>
 
@@ -1439,6 +1467,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('form-login').classList.add('hidden');
       document.getElementById('form-register').classList.add('hidden');
       document.getElementById('form-forgot').classList.add('hidden');
+      const fResend = document.getElementById('form-resend');
+      if (fResend) fResend.classList.add('hidden');
 
       if (mode === 'login') {
         document.getElementById('modal-title').innerText = 'Account Login';
@@ -1446,12 +1476,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('form-login').classList.remove('hidden');
       } else if (mode === 'register') {
         document.getElementById('modal-title').innerText = 'Create Account';
-        document.getElementById('modal-subtitle').innerText = 'Register an account. An email activation link will be sent.';
+        document.getElementById('modal-subtitle').innerText = 'Register an account. An email verification link will be sent.';
         document.getElementById('form-register').classList.remove('hidden');
       } else if (mode === 'forgot') {
         document.getElementById('modal-title').innerText = 'Reset Password';
         document.getElementById('modal-subtitle').innerText = 'Enter your email to receive a password reset message.';
         document.getElementById('form-forgot').classList.remove('hidden');
+      } else if (mode === 'resend') {
+        document.getElementById('modal-title').innerText = 'Resend Verification Link';
+        document.getElementById('modal-subtitle').innerText = 'Enter your registered email address to receive a new verification link.';
+        if (fResend) fResend.classList.remove('hidden');
       }
     }
 
@@ -1472,6 +1506,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         icon.classList.remove('fa-eye-slash');
         icon.classList.add('fa-eye');
       }
+    }
+
+    async function resendVerificationLink(email, btnId) {
+      const btn = btnId ? document.getElementById(btnId) : null;
+      const oldHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-xs"></i> Resending...';
+      }
+
+      try {
+        const res = await fetch('/api/auth/resend-activation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email })
+        });
+        const data = await res.json();
+        const notice = document.getElementById('modal-notice');
+        if (notice) {
+          notice.classList.remove('hidden');
+          if (data.success) {
+            notice.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-1.5';
+            notice.innerHTML = `
+              <div class="flex items-center gap-2 font-bold text-emerald-400">
+                <i class="fa-solid fa-circle-check text-base"></i>
+                <span>Verification Link Resent!</span>
+              </div>
+              <p class="text-slate-200 leading-relaxed">${data.message}</p>
+            `;
+          } else {
+            notice.className = 'p-3 rounded-lg border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs';
+            notice.innerText = data.message || 'Unable to resend verification link.';
+          }
+        }
+      } catch (err) {
+        alert('Error resending verification link: ' + err);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = oldHtml;
+        }
+      }
+    }
+
+    async function handleResendForm(e) {
+      e.preventDefault();
+      const email = document.getElementById('resend-email').value;
+      await resendVerificationLink(email, 'btn-submit-resend');
     }
 
     async function handleLogin(e) {
@@ -1501,8 +1583,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span>Account Verification Required</span>
               </div>
               <p class="text-slate-300 leading-relaxed mt-1">
-                Your account is not yet activated. Please open the verification email sent to <strong>${data.email}</strong> and click the activation link to verify your account before signing in.
+                Your account is not yet activated. Please open the verification email sent to <strong>${data.email}</strong> and click the link to activate your account.
               </p>
+              <div class="pt-2">
+                <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
+                  <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
+                </button>
+              </div>
             `;
           } else {
             notice.innerText = data.detail || data.message || 'Login failed';
@@ -1545,9 +1632,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <p>Please check your email inbox (and spam/junk folder) and click the verification link inside the email to activate your account.</p>
               <p class="text-slate-400 text-[10px] italic pt-1">Account verification must be accepted directly from the email message.</p>
             </div>
-            <div class="pt-1">
-              <button type="button" onclick="openAuthModal('login')" class="w-full py-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5">
-                <i class="fa-solid fa-right-to-bracket"></i> Proceed to Login
+            <div class="flex flex-col sm:flex-row gap-2 pt-1">
+              <button type="button" id="btn-resend-reg" onclick="resendVerificationLink('${email}', 'btn-resend-reg')" class="flex-1 py-2 bg-emerald-700/90 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
+                <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
+              </button>
+              <button type="button" onclick="openAuthModal('login')" class="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5">
+                <i class="fa-solid fa-right-to-bracket text-xs"></i> Proceed to Login
               </button>
             </div>
           `;
