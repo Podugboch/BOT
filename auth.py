@@ -19,6 +19,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Detect serverless environment for DB path
 if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
@@ -102,8 +105,8 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
 
 
 def send_email_message(to_email: str, subject: str, body: str, token: str, email_type: str) -> bool:
-    """Stores in outbox for in-app preview and sends via SMTP if configured."""
-    # Always record in database outbox for immediate preview & reliable testing
+    """Stores in outbox for audit and delivers via Resend API or SMTP."""
+    # Always record in database outbox for audit log
     try:
         conn = get_db_connection()
         conn.execute(
@@ -113,31 +116,69 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Error recording email in outbox: {e}")
+        print(f"[AUTH ERROR] Error recording email in outbox: {e}")
 
-    # Send real SMTP email if configured
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    from_email = os.getenv("FROM_EMAIL", smtp_user or "noreply@cryptobot.local")
+    # Method 1: Check for Resend API Key (Best for serverless / Vercel cloud delivery)
+    resend_key = os.getenv("RESEND_API_KEY")
+    if resend_key:
+        try:
+            import urllib.request
+            from_email = os.getenv("FROM_EMAIL") or os.getenv("SMTP_USER") or "Crypto Trading Bot <noreply@resend.dev>"
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=json.dumps({
+                    "from": from_email,
+                    "to": [to_email],
+                    "subject": subject,
+                    "html": body,
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {resend_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "CryptoTradingBot/2.0"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    print(f"[AUTH EMAIL] Successfully delivered {email_type} email to {to_email} via Resend API.")
+                    return True
+        except Exception as e:
+            print(f"[AUTH EMAIL] Resend delivery failed: {e}")
 
-    if smtp_host and smtp_user and smtp_pass:
+    # Method 2: Check for standard SMTP configuration (port 465 SSL or 587 STARTTLS)
+    smtp_host = os.getenv("SMTP_HOST") or os.getenv("EMAIL_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT") or os.getenv("EMAIL_PORT") or "587")
+    smtp_user = os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
+    smtp_pass = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASSWORD")
+    smtp_from = os.getenv("FROM_EMAIL") or smtp_user or "noreply@cryptobot.local"
+
+    if smtp_host:
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
-            msg["From"] = from_email
+            msg["From"] = smtp_from
             msg["To"] = to_email
             msg.attach(MIMEText(body, "html"))
 
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=5) as server:
-                server.starttls()
-                server.login(smtp_user, smtp_pass)
-                server.sendmail(from_email, [to_email], msg.as_string())
+            if smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
+                    if smtp_user and smtp_pass:
+                        server.login(smtp_user, smtp_pass)
+                    server.sendmail(smtp_from, [to_email], msg.as_string())
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+                    server.starttls()
+                    if smtp_user and smtp_pass:
+                        server.login(smtp_user, smtp_pass)
+                    server.sendmail(smtp_from, [to_email], msg.as_string())
+
+            print(f"[AUTH EMAIL] Successfully delivered {email_type} email to {to_email} via SMTP ({smtp_host}:{smtp_port}).")
             return True
         except Exception as e:
-            print(f"SMTP sending failed (preview retained in outbox): {e}")
+            print(f"[AUTH EMAIL] SMTP delivery failed to {to_email} ({smtp_host}:{smtp_port}): {e}")
             return False
+
+    print(f"[AUTH EMAIL] Notice: No SMTP_HOST or RESEND_API_KEY configured. Email recorded in system outbox for {to_email}.")
     return True
 
 
@@ -175,13 +216,13 @@ class AuthService:
         conn.commit()
         conn.close()
 
-        # Send activation email
+        # Send activation email to recipient
         activation_link = f"{base_url}/activate?token={activation_token}"
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Activate Your Crypto Trading Bot Account</h2>
           <p>Hello <strong>{username}</strong>,</p>
-          <p>Thank you for creating an account on the Crypto Trading Bot platform. Please click the button below to accept and activate your account:</p>
+          <p>Thank you for registering on the Crypto Trading Bot platform. Please click the button below to accept and activate your account:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Activate Account</a>
           </div>
@@ -191,12 +232,12 @@ class AuthService:
         """
         send_email_message(email, "Activate Your Crypto Trading Bot Account", email_body, activation_token, "activation")
 
+        # Return only safe response data — verification link is only sent to the user's email
         return {
             "success": True,
-            "message": f"Account created for {username}. Please check your email for the activation link.",
+            "message": f"Account created for {username}. A verification email has been sent to {email}. Please check your email to activate your account.",
             "user_id": user_id,
-            "activation_token": activation_token,
-            "activation_link": activation_link
+            "email": email
         }
 
     @staticmethod
@@ -305,11 +346,11 @@ class AuthService:
         """
         send_email_message(email, "Reset Your Crypto Trading Bot Password", email_body, reset_token, "reset")
 
+        # Return safe response — reset link is only sent to the user's email
         return {
             "success": True,
             "message": "Password reset email sent. Please check your inbox.",
-            "reset_token": reset_token,
-            "reset_link": reset_link
+            "email": email
         }
 
     @staticmethod

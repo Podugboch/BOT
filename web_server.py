@@ -281,11 +281,7 @@ def reset_password(req: ResetPasswordRequest):
 
 @app.get("/api/auth/latest-email")
 def get_latest_email(email: Optional[str] = None):
-    """Convenience endpoint to retrieve the activation/reset link for testing."""
-    preview = AuthService.get_latest_email_preview(email)
-    if not preview:
-        return {"found": False, "message": "No emails generated yet"}
-    return {"found": True, "email": preview}
+    return {"message": "Verification links are delivered exclusively to the registered email address."}
 
 
 # ============================================================================
@@ -684,11 +680,21 @@ def reset_password_page(token: str = Query(...)):
           <input type="hidden" id="reset-token" value="{token}">
           <div>
             <label class="block text-slate-400 mb-1">New Password (min 6 characters)</label>
-            <input type="password" id="new-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+            <div class="relative">
+              <input type="password" id="new-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
+              <button type="button" onclick="togglePasswordVisibility('new-pw', 'new-pw-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 transition" tabindex="-1">
+                <i class="fa-solid fa-eye text-xs" id="new-pw-eye"></i>
+              </button>
+            </div>
           </div>
           <div>
             <label class="block text-slate-400 mb-1">Confirm New Password</label>
-            <input type="password" id="confirm-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+            <div class="relative">
+              <input type="password" id="confirm-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
+              <button type="button" onclick="togglePasswordVisibility('confirm-pw', 'confirm-pw-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 transition" tabindex="-1">
+                <i class="fa-solid fa-eye text-xs" id="confirm-pw-eye"></i>
+              </button>
+            </div>
           </div>
           <div id="reset-msg" class="hidden text-xs p-2 rounded"></div>
           <button type="submit" class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 font-bold text-white rounded-lg shadow transition">
@@ -723,6 +729,21 @@ def reset_password_page(token: str = Query(...)):
           }} else {{
             msg.className = 'text-xs p-2 rounded bg-rose-950 text-rose-300 block';
             msg.innerText = data.detail || data.message || 'Reset failed';
+          }}
+        }}
+
+        function togglePasswordVisibility(inputId, iconId) {{
+          const input = document.getElementById(inputId);
+          const icon = document.getElementById(iconId);
+          if (!input || !icon) return;
+          if (input.type === 'password') {{
+            input.type = 'text';
+            icon.classList.remove('fa-eye');
+            icon.classList.add('fa-eye-slash');
+          }} else {{
+            input.type = 'password';
+            icon.classList.remove('fa-eye-slash');
+            icon.classList.add('fa-eye');
           }}
         }}
       </script>
@@ -928,13 +949,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <!-- 3. API Secret -->
           <div>
             <label class="block text-slate-300 font-semibold mb-1">3. API Secret</label>
-            <input type="password" id="key-api-secret" required placeholder="Paste API Secret" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
+            <div class="relative">
+              <input type="password" id="key-api-secret" required placeholder="Paste API Secret" class="w-full bg-slate-900 border border-bordercol rounded-lg pl-3 pr-9 py-2 text-white focus:border-emerald-500">
+              <button type="button" onclick="togglePasswordVisibility('key-api-secret', 'key-api-secret-eye')" class="absolute inset-y-0 right-0 pr-2.5 flex items-center text-slate-400 hover:text-slate-200 transition" title="Toggle visibility" tabindex="-1">
+                <i class="fa-solid fa-eye text-xs" id="key-api-secret-eye"></i>
+              </button>
+            </div>
           </div>
 
           <!-- 4. Passphrase (Dynamic) -->
           <div id="passphrase-container">
             <label class="block text-slate-300 font-semibold mb-1" id="passphrase-label">4. Passphrase</label>
-            <input type="password" id="key-api-passphrase" placeholder="Passphrase (if needed)" class="w-full bg-slate-900 border border-bordercol rounded-lg px-3 py-2 text-white focus:border-emerald-500">
+            <div class="relative">
+              <input type="password" id="key-api-passphrase" placeholder="Passphrase (if needed)" class="w-full bg-slate-900 border border-bordercol rounded-lg pl-3 pr-9 py-2 text-white focus:border-emerald-500">
+              <button type="button" onclick="togglePasswordVisibility('key-api-passphrase', 'key-api-passphrase-eye')" class="absolute inset-y-0 right-0 pr-2.5 flex items-center text-slate-400 hover:text-slate-200 transition" title="Toggle visibility" tabindex="-1">
+                <i class="fa-solid fa-eye text-xs" id="key-api-passphrase-eye"></i>
+              </button>
+            </div>
           </div>
 
           <!-- Options & Action Buttons -->
@@ -1174,14 +1205,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <form id="form-login" onsubmit="handleLogin(event)" class="space-y-3 text-xs">
         <div>
           <label class="block text-slate-400 mb-1">Username or Email</label>
-          <input type="text" id="login-user" required class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <input type="text" id="login-user" required placeholder="Enter username or email" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-emerald-500">
         </div>
         <div>
           <div class="flex justify-between mb-1">
             <label class="text-slate-400">Password</label>
             <a href="javascript:void(0)" onclick="openAuthModal('forgot')" class="text-amber-400 hover:underline">Forgot password?</a>
           </div>
-          <input type="password" id="login-pass" required class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <div class="relative">
+            <input type="password" id="login-pass" required placeholder="Enter your password" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-emerald-500">
+            <button type="button" onclick="togglePasswordVisibility('login-pass', 'login-pass-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 focus:outline-none cursor-pointer" title="Toggle password visibility" tabindex="-1">
+              <i class="fa-solid fa-eye text-xs" id="login-pass-eye"></i>
+            </button>
+          </div>
         </div>
         <button type="submit" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition">
           Sign In
@@ -1195,15 +1231,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <form id="form-register" onsubmit="handleRegister(event)" class="hidden space-y-3 text-xs">
         <div>
           <label class="block text-slate-400 mb-1">Username</label>
-          <input type="text" id="reg-user" required minlength="3" placeholder="TraderPro" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <input type="text" id="reg-user" required minlength="3" placeholder="TraderPro" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-emerald-500">
         </div>
         <div>
           <label class="block text-slate-400 mb-1">Email Address</label>
-          <input type="email" id="reg-email" required placeholder="trader@example.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <input type="email" id="reg-email" required placeholder="trader@example.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-emerald-500">
         </div>
         <div>
           <label class="block text-slate-400 mb-1">Password (min 6 chars)</label>
-          <input type="password" id="reg-pass" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <div class="relative">
+            <input type="password" id="reg-pass" required minlength="6" placeholder="Create a strong password" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-emerald-500">
+            <button type="button" onclick="togglePasswordVisibility('reg-pass', 'reg-pass-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 focus:outline-none cursor-pointer" title="Toggle password visibility" tabindex="-1">
+              <i class="fa-solid fa-eye text-xs" id="reg-pass-eye"></i>
+            </button>
+          </div>
         </div>
         <button type="submit" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition">
           Create Account
@@ -1418,6 +1459,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('auth-modal').classList.add('hidden');
     }
 
+    function togglePasswordVisibility(inputId, iconId) {
+      const input = document.getElementById(inputId);
+      const icon = document.getElementById(iconId);
+      if (!input || !icon) return;
+      if (input.type === 'password') {
+        input.type = 'text';
+        icon.classList.remove('fa-eye');
+        icon.classList.add('fa-eye-slash');
+      } else {
+        input.type = 'password';
+        icon.classList.remove('fa-eye-slash');
+        icon.classList.add('fa-eye');
+      }
+    }
+
     async function handleLogin(e) {
       e.preventDefault();
       const user = document.getElementById('login-user').value;
@@ -1439,10 +1495,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           notice.classList.remove('hidden');
           notice.className = 'p-3 rounded-lg border bg-rose-950/70 border-rose-500/40 text-rose-200 text-xs';
           if (data.needs_activation) {
-            notice.innerHTML = `<strong>Account Not Activated</strong><br>${data.message}<br>
-              <button onclick="previewActivationEmail('${data.email}')" class="mt-2 text-xs px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-semibold">
-                Click here to view & activate now
-              </button>`;
+            notice.innerHTML = `
+              <div class="flex items-center gap-2 font-bold text-amber-400">
+                <i class="fa-solid fa-envelope-open-text text-base"></i>
+                <span>Account Verification Required</span>
+              </div>
+              <p class="text-slate-300 leading-relaxed mt-1">
+                Your account is not yet activated. Please open the verification email sent to <strong>${data.email}</strong> and click the activation link to verify your account before signing in.
+              </p>
+            `;
           } else {
             notice.innerText = data.detail || data.message || 'Login failed';
           }
@@ -1468,18 +1529,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         notice.classList.remove('hidden');
         if (res.ok && data.success) {
-          notice.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-2';
+          notice.className = 'p-4 rounded-xl border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-3';
           notice.innerHTML = `
-            <strong><i class="fa-solid fa-envelope-circle-check"></i> Account Registered!</strong>
-            <p>An activation email message has been sent to <strong>${email}</strong> for acceptance and activation.</p>
-            <div class="p-2 bg-slate-900 rounded border border-emerald-500/30 text-[11px]">
-              <span>Quick Activation Link:</span><br>
-              <a href="${data.activation_link}" class="text-emerald-400 font-bold underline break-all">${data.activation_link}</a>
+            <div class="flex items-center gap-2.5 text-emerald-400 font-bold text-sm">
+              <i class="fa-solid fa-envelope-circle-check text-xl"></i>
+              <span>Verification Email Sent!</span>
             </div>
-            <a href="${data.activation_link}" class="inline-block mt-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded">
-              Accept & Activate Account Now
-            </a>
+            <p class="text-slate-200 leading-relaxed">
+              We have sent an account verification email to <strong>${email}</strong>.
+            </p>
+            <div class="p-3 bg-slate-900/90 rounded-lg border border-bordercol/80 space-y-1 text-[11px] text-slate-300">
+              <div class="font-semibold text-white flex items-center gap-1.5">
+                <i class="fa-solid fa-circle-info text-emerald-400"></i> Next Step:
+              </div>
+              <p>Please check your email inbox (and spam/junk folder) and click the verification link inside the email to activate your account.</p>
+              <p class="text-slate-400 text-[10px] italic pt-1">Account verification must be accepted directly from the email message.</p>
+            </div>
+            <div class="pt-1">
+              <button type="button" onclick="openAuthModal('login')" class="w-full py-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5">
+                <i class="fa-solid fa-right-to-bracket"></i> Proceed to Login
+              </button>
+            </div>
           `;
+          document.getElementById('form-register').reset();
         } else {
           notice.className = 'p-3 rounded-lg border bg-rose-950/70 border-rose-500/40 text-rose-200 text-xs';
           notice.innerText = data.detail || data.message || 'Registration failed';
@@ -1502,25 +1574,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         notice.classList.remove('hidden');
-        notice.className = 'p-3 rounded-lg border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs space-y-2';
+        notice.className = 'p-3.5 rounded-lg border bg-amber-950/80 border-amber-500/40 text-amber-200 text-xs space-y-2';
         notice.innerHTML = `
-          <strong><i class="fa-solid fa-envelope"></i> ${data.message}</strong>
-          ${data.reset_link ? `<div class="p-2 bg-slate-900 rounded text-[11px]">Quick Reset Link: <a href="${data.reset_link}" class="text-amber-400 underline break-all">${data.reset_link}</a></div>` : ''}
+          <div class="flex items-center gap-2 font-bold text-amber-400">
+            <i class="fa-solid fa-envelope"></i>
+            <span>Password Reset Email Sent</span>
+          </div>
+          <p class="text-slate-300 leading-relaxed">
+            If an account exists for <strong>${email}</strong>, password reset instructions have been dispatched. Please check your inbox (and spam folder) to set a new password.
+          </p>
         `;
       } catch (err) {
         alert('Reset error: ' + err);
-      }
-    }
-
-    async function previewActivationEmail(email) {
-      try {
-        const res = await fetch('/api/auth/latest-email?email=' + encodeURIComponent(email));
-        const data = await res.json();
-        if (data.found && data.email) {
-          window.location.href = `/activate?token=${data.email.token}`;
-        }
-      } catch (e) {
-        alert('Error fetching activation link: ' + e);
       }
     }
 
