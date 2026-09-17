@@ -19,6 +19,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -228,6 +230,17 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
                     print(f"[AUTH EMAIL] {err_msg}")
                     if not get_system_setting("SMTP_HOST"):
                         return False, err_msg
+        except urllib.error.HTTPError as e:
+            try:
+                raw_err = e.read().decode("utf-8")
+                err_json = json.loads(raw_err)
+                detail = err_json.get("message", raw_err)
+            except Exception:
+                detail = str(e)
+            err_msg = f"Resend API error ({e.code}): {detail}"
+            print(f"[AUTH EMAIL] {err_msg}")
+            if not get_system_setting("SMTP_HOST"):
+                return False, err_msg
         except Exception as e:
             err_msg = f"Resend delivery failed: {e}"
             print(f"[AUTH EMAIL] {err_msg}")
