@@ -14,6 +14,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 import pandas as pd
 
 from config import BotConfig
@@ -26,20 +27,25 @@ log = logging.getLogger("bot")
 
 def setup_logging():
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.INFO)
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    stream_handler.setLevel(logging.INFO)
+    log_path = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
-    has_file = any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "").endswith("bot.log") for h in root.handlers)
-    if not has_file:
-        root.addHandler(file_handler)
+    try:
+        file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.INFO)
+        has_file = any(isinstance(h, logging.FileHandler) for h in root.handlers)
+        if not has_file:
+            root.addHandler(file_handler)
+    except Exception:
+        # Gracefully proceed if running in a read-only or serverless environment
+        pass
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(logging.INFO)
 
     has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers)
     if not has_stream:

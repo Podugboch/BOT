@@ -1111,7 +1111,7 @@ def run_backtest_endpoint(req: BacktestRequest):
 
 @app.get("/api/logs")
 def get_logs(lines: int = 50):
-    log_file = Path("bot.log")
+    log_file = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
     if not log_file.exists() or log_file.stat().st_size == 0:
         if runner.running:
             return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}

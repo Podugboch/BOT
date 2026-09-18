@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Optional, Set
 from cryptography.fernet import Fernet, InvalidToken
 
-DEFAULT_KEY_FILE = Path(__file__).resolve().parent / ".secret_key"
+if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+    DEFAULT_KEY_FILE = Path("/tmp/.secret_key")
+else:
+    DEFAULT_KEY_FILE = Path(__file__).resolve().parent / ".secret_key"
 ENC_PREFIX = "enc:"
 
 SENSITIVE_ENV_KEYS: Set[str] = {
@@ -212,6 +215,11 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
       - Writes the sanitized .env through an atomic temporary file and rename.
     """
     target = env_file_path or Path(".env")
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        for k in SENSITIVE_ENV_KEYS:
+            os.environ.pop(k, None)
+        return False
+
     if not target.exists() or not target.is_file():
         for k in SENSITIVE_ENV_KEYS:
             os.environ.pop(k, None)

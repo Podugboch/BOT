@@ -121,7 +121,7 @@ class BotConfig:
     taker_fee_pct: float = 0.001       # 0.10% per fill — set to your exchange's real fee
     slippage_pct: float = 0.0005       # 0.05% assumed slippage per fill
     poll_interval_sec: int = 60
-    kill_switch_file: str = "KILL"     # touch this file to halt the bot immediately
+    kill_switch_file: str = field(default_factory=lambda: "/tmp/KILL" if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else "KILL")
 
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
