@@ -1,0 +1,33 @@
+name: "Auto-Generate Issues from Code TODOs"
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'BOT.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  build-todo-issues:
+    name: "Scan Code & Generate Issues"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: "Convert TODO & FIXME Comments into GitHub Issues"
+        uses: alstr/todo-to-issue-action@v5
+        with:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOSE_ISSUES: "true"
+          AUTO_ASSIGN: "true"
+          IDENTIFIERS: '[{"name": "TODO", "labels": ["todo", "enhancement"]}, {"name": "FIXME", "labels": ["bug", "fixme"]}, {"name": "BUG", "labels": ["bug"]}]'
+          IGNORE: ".*\\.log,.*\\.md,.*\\.lock,.*\\.json,.*\\.svg,.*\\.png,.*\\.jpg,.*\\.zip,.*\\.db,.*\\.cache,.*\\.venv"
