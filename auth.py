@@ -186,7 +186,10 @@ def set_system_setting(key: str, value: str):
         """, (key, stored_value, datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
-        os.environ[key] = value
+        if key not in SENSITIVE_ENV_KEYS:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
     except Exception as e:
         print(f"[AUTH ERROR] Failed to set system setting {key}: {e}")
 

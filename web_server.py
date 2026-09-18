@@ -44,21 +44,22 @@ AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 
 setup_logging()
 logger = logging.getLogger("web")
-from secret_manager import sanitize_env_file
-sanitize_env_file()
 init_auth_db()
 
-# Preload decrypted credentials into memory if present in vault
+from secret_manager import migrate_and_sanitize_env_file, SENSITIVE_ENV_KEYS
+migrate_and_sanitize_env_file()
+
+# Preload non-sensitive exchange metadata into environment if present in vault
 latest_key = AuthService.get_latest_raw_exchange_key()
 if latest_key:
     if not os.getenv("EXCHANGE_ID") and latest_key.get("exchange_id"):
         os.environ["EXCHANGE_ID"] = latest_key["exchange_id"]
-    if not os.getenv("EXCHANGE_API_KEY") and latest_key.get("api_key"):
-        os.environ["EXCHANGE_API_KEY"] = latest_key["api_key"]
-    if not os.getenv("EXCHANGE_API_SECRET") and latest_key.get("api_secret"):
-        os.environ["EXCHANGE_API_SECRET"] = latest_key["api_secret"]
-    if not os.getenv("EXCHANGE_API_PASSPHRASE") and latest_key.get("api_passphrase"):
-        os.environ["EXCHANGE_API_PASSPHRASE"] = latest_key["api_passphrase"]
+    if not os.getenv("TESTNET") and "testnet" in latest_key:
+        os.environ["TESTNET"] = "true" if latest_key["testnet"] else "false"
+
+# Ensure sensitive credentials are never present in os.environ at runtime
+for k in SENSITIVE_ENV_KEYS:
+    os.environ.pop(k, None)
 
 app = FastAPI(title="Crypto Trading Bot Dashboard & Auth", version="2.0.0")
 
@@ -607,12 +608,13 @@ def save_exchange_credentials(req: SaveExchangeKeyRequest, authorization: Option
         user["id"], req.exchange_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
     )
 
-    # In-memory updates for active process and bot runner
+    # In-memory updates for non-sensitive routing metadata only
     os.environ["EXCHANGE_ID"] = req.exchange_id
-    os.environ["EXCHANGE_API_KEY"] = req.api_key
-    os.environ["EXCHANGE_API_SECRET"] = req.api_secret
-    os.environ["EXCHANGE_API_PASSPHRASE"] = req.api_passphrase or ""
     os.environ["TESTNET"] = "true" if req.testnet else "false"
+
+    # Remove sensitive keys from os.environ to prevent runtime exposure
+    for k in ["EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"]:
+        os.environ.pop(k, None)
 
     # Persist only non-sensitive configuration to .env (do NOT write API keys/secrets to .env)
     env_file = Path(".env")

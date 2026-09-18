@@ -14,6 +14,7 @@ import os
 import json
 import sqlite3
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from urllib.error import HTTPError
 
@@ -415,4 +416,94 @@ class TestSecretEncryptionAndVault:
         env_content2 = fake_env.read_text()
         assert "re_secret_key_should_not_be_in_env" not in env_content2
         assert "EMAIL_PROVIDER=resend" in env_content2
+
+    def test_production_mode_requires_external_key(self, monkeypatch):
+        from secret_manager import get_master_key, reset_cipher
+        reset_cipher()
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.delenv("BOT_SECRET_KEY", raising=False)
+        monkeypatch.delenv("SECRET_KEY", raising=False)
+        monkeypatch.delenv("APP_SECRET_KEY", raising=False)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            get_master_key()
+        assert "Production / Live mode requires an externally managed master encryption key" in str(exc_info.value)
+        reset_cipher()
+
+    def test_atomic_env_migration_preserves_secrets(self, tmp_path, monkeypatch):
+        from secret_manager import migrate_and_sanitize_env_file
+        # Create legacy .env with raw credentials
+        legacy_env = tmp_path / ".legacy_env"
+        legacy_env.write_text(
+            "EXCHANGE_ID=binance\n"
+            "EXCHANGE_API_KEY=legacy_binance_key_999\n"
+            "EXCHANGE_API_SECRET=legacy_binance_secret_888\n"
+            "SMTP_PASS=legacy_smtp_secret_777\n"
+            "RESEND_API_KEY=re_legacy_token_666\n"
+        )
+
+        ok = migrate_and_sanitize_env_file(legacy_env)
+        assert ok is True
+
+        # Verify credentials were safely migrated into encrypted database vault
+        latest = AuthService.get_latest_raw_exchange_key()
+        assert latest is not None
+        assert latest["api_key"] == "legacy_binance_key_999"
+        assert latest["api_secret"] == "legacy_binance_secret_888"
+        assert get_system_setting("SMTP_PASS") == "legacy_smtp_secret_777"
+        assert get_system_setting("RESEND_API_KEY") == "re_legacy_token_666"
+
+        # Verify plaintext credentials removed from .env
+        sanitized_content = legacy_env.read_text()
+        assert "legacy_binance_key_999" not in sanitized_content
+        assert "legacy_binance_secret_888" not in sanitized_content
+        assert "legacy_smtp_secret_777" not in sanitized_content
+        assert "re_legacy_token_666" not in sanitized_content
+
+        # Verify sensitive credentials removed from process environment
+        assert "EXCHANGE_API_KEY" not in os.environ
+        assert "EXCHANGE_API_SECRET" not in os.environ
+        assert "SMTP_PASS" not in os.environ
+        assert "RESEND_API_KEY" not in os.environ
+
+    def test_runtime_os_environ_does_not_contain_secrets(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+        from config import BotConfig
+
+        fake_env = tmp_path / ".test_env"
+        fake_env.write_text("EXCHANGE_ID=binance\nTESTNET=true\n")
+        orig_path = Path
+        monkeypatch.setattr("web_server.Path", lambda p: fake_env if p == ".env" else orig_path(p))
+
+        client = TestClient(app)
+        AuthService.register("runtime_user", "runtime@market.io", "Pass123456")
+        conn = get_db_connection()
+        tok = conn.execute("SELECT activation_token FROM users WHERE username = 'runtime_user'").fetchone()["activation_token"]
+        conn.close()
+        AuthService.activate_account(tok)
+        login = AuthService.login("runtime_user", "Pass123456")
+        auth_header = {"Authorization": f"Bearer {login['token']}"}
+
+        # Save exchange credentials via endpoint
+        client.post("/api/exchange/save", json={
+            "exchange_id": "kraken",
+            "api_key": "kraken_secret_key_123",
+            "api_secret": "kraken_secret_sec_456",
+            "api_passphrase": "",
+            "testnet": False
+        }, headers=auth_header)
+
+        # Confirm sensitive exchange keys are NOT in os.environ
+        assert "EXCHANGE_API_KEY" not in os.environ
+        assert "EXCHANGE_API_SECRET" not in os.environ
+
+        # But runner.cfg and new BotConfig have them directly in memory
+        assert runner.cfg.exchange.api_key == "kraken_secret_key_123"
+        assert runner.cfg.exchange.api_secret == "kraken_secret_sec_456"
+
+        new_cfg = BotConfig()
+        assert new_cfg.exchange.api_key == "kraken_secret_key_123"
+        assert new_cfg.exchange.api_secret == "kraken_secret_sec_456"
+
 
