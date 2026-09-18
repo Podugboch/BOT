@@ -37,11 +37,12 @@ from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager
 from backtester import fetch_historical, run_backtest, summarize
-from bot import TradingBot
+from bot import TradingBot, setup_logging
 from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection
 
 AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 
+setup_logging()
 logger = logging.getLogger("web")
 init_auth_db()
 
@@ -93,8 +94,17 @@ class BotRunner:
         self.running = True
         self.last_error = None
 
+        logger.info(
+            "Bot background engine started. Mode: %s | Execution: %s | Strategy: %s | Symbol: %s (%s)",
+            self.cfg.mode.upper(),
+            getattr(self.cfg, "execution_mode", "auto").upper(),
+            self.cfg.strategy.strategy_name,
+            self.cfg.exchange.symbol,
+            self.cfg.exchange.timeframe,
+        )
+
         def _run_loop():
-            logger.info("Bot thread started.")
+            logger.info("Bot execution loop active. Polling interval: %ds.", self.cfg.poll_interval_sec)
             try:
                 while self.running:
                     step_ok = self.bot.step()
@@ -108,6 +118,7 @@ class BotRunner:
                             break
                         time.sleep(1)
                     if self.bot.kill_switch_active():
+                        logger.warning("Kill switch file detected — halting bot runner loop.")
                         self.running = False
                         break
             except Exception as e:
@@ -120,12 +131,16 @@ class BotRunner:
         return True
 
     def stop(self):
+        was_running = self.running
         self.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
+        if was_running:
+            logger.info("Bot background engine stopped by user.")
         return True
 
     def trigger_kill(self):
+        logger.critical("EMERGENCY KILL SWITCH TRIGGERED: Halting bot immediately.")
         with open(self.cfg.kill_switch_file, "w") as f:
             f.write("HALT")
         self.stop()
@@ -1050,12 +1065,18 @@ def run_backtest_endpoint(req: BacktestRequest):
 @app.get("/api/logs")
 def get_logs(lines: int = 50):
     log_file = Path("bot.log")
-    if not log_file.exists():
+    if not log_file.exists() or log_file.stat().st_size == 0:
+        if runner.running:
+            return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}
         return {"logs": ["No logs recorded yet. Start the bot to generate activity."]}
     try:
-        with open(log_file, "r") as f:
-            all_lines = f.readlines()
-            return {"logs": [line.strip() for line in all_lines[-lines:]]}
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = [line.strip() for line in f.readlines() if line.strip()]
+            if not all_lines:
+                if runner.running:
+                    return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}
+                return {"logs": ["No logs recorded yet. Start the bot to generate activity."]}
+            return {"logs": all_lines[-lines:]}
     except Exception as e:
         return {"logs": [f"Error reading log file: {e}"]}
 
@@ -1480,10 +1501,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <div class="flex items-center gap-2">
-            <button type="button" onclick="openSettingsModal()" id="btn-dash-settings" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-lg shadow transition flex items-center gap-1.5" title="Configure Strategy, Timeframe (5m included), and Manual vs Auto Trading">
-              <i class="fa-solid fa-gear text-indigo-200"></i>
-              <span>Trading Settings</span>
-            </button>
             <button onclick="refreshAnalysis()" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg border border-bordercol">
               <i class="fa-solid fa-rotate"></i> Refresh
             </button>

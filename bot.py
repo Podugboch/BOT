@@ -25,11 +25,31 @@ log = logging.getLogger("bot")
 
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.FileHandler("bot.log"), logging.StreamHandler(sys.stdout)],
-    )
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    has_file = any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "").endswith("bot.log") for h in root.handlers)
+    if not has_file:
+        root.addHandler(file_handler)
+
+    has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers)
+    if not has_stream:
+        root.addHandler(stream_handler)
+
+    log.setLevel(logging.INFO)
+    logging.getLogger("web").setLevel(logging.INFO)
+
+
+setup_logging()
 
 
 class TradingBot:
@@ -77,18 +97,27 @@ class TradingBot:
         # In manual execution mode, monitor market and signals without auto-placing orders
         if getattr(self.cfg, "execution_mode", "auto") == "manual":
             sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position))
+            rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
+            adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
             if self.position is not None:
                 hit_stop = price <= self.position["stop"]
                 hit_target = price >= self.position["target"]
+                pnl_approx = (price - self.position["entry"]) * self.position["size"]
                 if hit_stop:
-                    log.warning("MANUAL MODE: Stop loss price reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
+                    log.warning("MANUAL MODE: Stop loss reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
                 elif hit_target:
                     log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
                 elif sig == Signal.SELL:
                     log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+                else:
+                    log.info("MANUAL MODE: Position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
+                             self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
             else:
                 if sig == Signal.BUY:
                     log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
+                else:
+                    log.info("MANUAL MODE [%s %s]: price=$%.2f | signal=%s | RSI=%.1f | ADX=%.1f (monitoring only)",
+                             self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, rsi_val, adx_val)
             return True
 
         try:
@@ -136,7 +165,7 @@ class TradingBot:
             "fee_paid": fill["fee"],
             "manual": True,
         }
-        log.info("MANUAL BUY: entry=%.2f stop=%.2f target=%.2f size=%.6f", fill["price"], stop, target, size)
+        log.info("MANUAL BUY EXECUTED: entry=%.2f stop=%.2f target=%.2f size=%.6f", fill["price"], stop, target, size)
         return {
             "success": True,
             "action": "BUY",
@@ -162,7 +191,7 @@ class TradingBot:
         self.risk.record_trade_result(pnl)
         closed_position = dict(self.position)
         self.position = None
-        log.info("MANUAL SELL: pnl=%.2f equity=%.2f", pnl, self.risk.state.equity)
+        log.info("MANUAL SELL EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
         return {
             "success": True,
             "action": "SELL",
@@ -176,18 +205,26 @@ class TradingBot:
 
     def _maybe_enter(self, df, price):
         sig = generate_signal(df, self.cfg.strategy, position_open=False)
+        rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
+        adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
+        trend = "BULLISH" if ("ema_fast" in df and "ema_slow" in df and df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]) else "BEARISH"
+
         if sig != Signal.BUY:
+            log.info("Market check [%s %s]: price=$%.2f | signal=%s | trend=%s | RSI=%.1f | ADX=%.1f | equity=$%.2f",
+                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, trend, rsi_val, adx_val, self.risk.state.equity)
             return
-        atr_val = float(df["atr"].iloc[-1])
+
+        atr_val = float(df["atr"].iloc[-1]) if "atr" in df and pd.notna(df["atr"].iloc[-1]) else (price * 0.02)
         stop, target = self.risk.stop_and_target(price, atr_val, "BUY")
         size = self.risk.position_size(price, stop)
         if size <= 0:
+            log.warning("Signal is BUY at $%.2f, but position sizing calculated 0 (check equity/risk)", price)
             return
         fill = self.exchange.place_order("BUY", size, price)
         self.position = {"entry": fill["price"], "size": size, "stop": stop,
                           "target": target, "fee_paid": fill["fee"]}
-        log.info("Opened position: entry=%.2f stop=%.2f target=%.2f size=%.6f",
-                  fill["price"], stop, target, size)
+        log.info("OPENED POSITION: entry=%.2f stop=%.2f target=%.2f size=%.6f (Signal: %s)",
+                  fill["price"], stop, target, size, sig.name)
 
     def _maybe_exit(self, df, price):
         hit_stop = price <= self.position["stop"]
@@ -195,15 +232,18 @@ class TradingBot:
         sig = generate_signal(df, self.cfg.strategy, position_open=True)
 
         if not (hit_stop or hit_target or sig == Signal.SELL):
+            pnl_approx = (price - self.position["entry"]) * self.position["size"]
+            log.info("Holding position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
+                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
             return
 
         fill = self.exchange.place_order("SELL", self.position["size"], price)
         pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]
                - self.position["fee_paid"] - fill["fee"])
         self.risk.record_trade_result(pnl)
-        log.info("Closed position (%s): pnl=%.2f equity=%.2f",
+        log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f",
                   "stop" if hit_stop else ("target" if hit_target else "signal"),
-                  pnl, self.risk.state.equity)
+                  self.position["entry"], fill["price"], pnl, self.risk.state.equity)
         self.position = None
 
     def run(self):
