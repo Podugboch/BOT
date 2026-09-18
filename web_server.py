@@ -389,6 +389,21 @@ def reset_password(req: ResetPasswordRequest):
     return res
 
 
+@app.post("/api/auth/delete-all-accounts")
+def delete_all_accounts_endpoint():
+    res = AuthService.delete_all_accounts()
+    return res
+
+
+@app.delete("/api/auth/account")
+def delete_my_account(authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    res = AuthService.delete_account(user["id"])
+    return res
+
+
 @app.get("/api/auth/latest-email")
 def get_latest_email(email: Optional[str] = None):
     return {"message": "Verification links are delivered exclusively to the registered email address."}

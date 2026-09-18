@@ -1122,6 +1122,29 @@ class AuthService:
         return None
 
     @staticmethod
+    def delete_all_accounts() -> Dict[str, Any]:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions")
+        cur.execute("DELETE FROM exchange_keys")
+        cur.execute("DELETE FROM email_outbox")
+        cur.execute("DELETE FROM users")
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "All registered user accounts and sessions have been permanently deleted"}
+
+    @staticmethod
+    def delete_account(user_id: int) -> Dict[str, Any]:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        cur.execute("DELETE FROM exchange_keys WHERE user_id = ?", (user_id,))
+        cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Account deleted successfully"}
+
+    @staticmethod
     def get_latest_email_preview(email: Optional[str] = None) -> Optional[Dict[str, Any]]:
         conn = get_db_connection()
         cur = conn.cursor()

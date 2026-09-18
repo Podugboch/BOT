@@ -274,6 +274,31 @@ class TestAuthRegistrationFlow:
 
         assert tok1 != tok2
 
+    def test_delete_account_and_delete_all_accounts(self):
+        AuthService.register("user_del_1", "del1@market.io", "Pass123456")
+        AuthService.register("user_del_2", "del2@market.io", "Pass123456")
+
+        conn = get_db_connection()
+        u1 = conn.execute("SELECT id FROM users WHERE username = 'user_del_1'").fetchone()
+        conn.close()
+
+        # Test delete single account
+        res = AuthService.delete_account(u1["id"])
+        assert res["success"]
+
+        conn = get_db_connection()
+        assert conn.execute("SELECT count(*) FROM users WHERE username = 'user_del_1'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM users WHERE username = 'user_del_2'").fetchone()[0] == 1
+        conn.close()
+
+        # Test delete all accounts
+        res_all = AuthService.delete_all_accounts()
+        assert res_all["success"]
+
+        conn = get_db_connection()
+        assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+        conn.close()
+
 
 class TestSecretEncryptionAndVault:
     def test_fernet_encrypt_decrypt(self):
