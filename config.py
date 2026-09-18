@@ -25,12 +25,12 @@ try:
     def _fallback_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         try:
             return _orig_getaddrinfo(host, port, family, type, proto, flags)
-        except socket.gaierror:
+        except (socket.gaierror, socket.herror) as orig_err:
             try:
                 ip = _resolver.resolve(host, "A")[0].to_text()
                 return _orig_getaddrinfo(ip, port, family, type, proto, flags)
             except Exception:
-                raise
+                raise orig_err
 
     socket.getaddrinfo = _fallback_getaddrinfo
 except ImportError:

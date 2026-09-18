@@ -924,6 +924,15 @@ def set_trading_mode_endpoint(req: TradingModeRequest):
 
 
 LAST_ANALYSIS_CACHE: Dict[str, Any] = {}
+PUBLIC_EXCHANGE_CLIENTS: Dict[str, ExchangeClient] = {}
+
+
+def get_public_exchange_client(exchange_id: str, symbol: str, timeframe: str) -> ExchangeClient:
+    key = f"{exchange_id}_{symbol}_{timeframe}"
+    if key not in PUBLIC_EXCHANGE_CLIENTS:
+        ex_cfg = ExchangeConfig(exchange_id=exchange_id, symbol=symbol, timeframe=timeframe, testnet=False)
+        PUBLIC_EXCHANGE_CLIENTS[key] = ExchangeClient(ex_cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+    return PUBLIC_EXCHANGE_CLIENTS[key]
 
 
 @app.get("/api/analysis")
@@ -938,11 +947,10 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
 
     # 1. Try to fetch candles from requested exchange (live public OHLCV data)
     try:
-        ex_cfg = ExchangeConfig(exchange_id=req_exchange, symbol=req_symbol, timeframe=req_timeframe, testnet=False)
-        client = ExchangeClient(ex_cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+        client = get_public_exchange_client(req_exchange, req_symbol, req_timeframe)
         df = client.fetch_ohlcv(limit=100)
     except Exception as e:
-        logger.warning(f"Could not fetch OHLCV from primary exchange {req_exchange}: {e}")
+        logger.debug(f"Primary exchange {req_exchange} OHLCV unavailable ({e}), trying fallback...")
 
     # 2. Fallback to reliable major exchange if requested exchange fails or returns too few candles
     if df is None or len(df) < 30:
@@ -950,8 +958,7 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
             if fb_id == req_exchange:
                 continue
             try:
-                ex_cfg = ExchangeConfig(exchange_id=fb_id, symbol=req_symbol, timeframe=req_timeframe, testnet=False)
-                client = ExchangeClient(ex_cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+                client = get_public_exchange_client(fb_id, req_symbol, req_timeframe)
                 fb_df = client.fetch_ohlcv(limit=100)
                 if fb_df is not None and len(fb_df) >= 30:
                     df = fb_df

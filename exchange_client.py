@@ -35,6 +35,7 @@ class ExchangeClient:
             "enableRateLimit": True,
             "timeout": 15000,
             "options": {
+                "defaultType": "spot",
                 "adjustForTimeDifference": True,
                 "recvWindow": 60000,
             },
@@ -48,7 +49,8 @@ class ExchangeClient:
             except Exception:
                 pass
 
-        if self.exchange.has.get("fetchTime") and hasattr(self.exchange, "load_time_difference"):
+        # Time difference synchronization is only required for live order signing
+        if self.mode == "live" and cfg.api_key and self.exchange.has.get("fetchTime") and hasattr(self.exchange, "load_time_difference"):
             try:
                 self.exchange.load_time_difference()
             except Exception as e:
