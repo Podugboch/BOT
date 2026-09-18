@@ -155,69 +155,158 @@ def is_encrypted(value: Optional[str]) -> bool:
     return False
 
 
-def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
+def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = False) -> None:
     """
-    Atomically migrates any legacy plaintext credentials from .env into the
-    encrypted database vault, verifies successful persistence and decryption,
-    and only then removes sensitive values from .env.
-    Also strips sensitive keys from os.environ to prevent runtime exposure.
+    Safely loads environment variables from .env file:
+    Loads ONLY non-sensitive configuration keys into os.environ.
+    Strictly blocks sensitive credentials (API keys, secrets, email tokens) from
+    ever being injected into os.environ from the .env file.
     """
     target = env_file_path or Path(".env")
     if not target.exists() or not target.is_file():
         # Clear any sensitive env vars from process environment
         for k in SENSITIVE_ENV_KEYS:
             os.environ.pop(k, None)
+        return
+
+    try:
+        from dotenv import dotenv_values
+        values = dotenv_values(str(target))
+        for k, v in values.items():
+            if not k or k in SENSITIVE_ENV_KEYS:
+                # NEVER load sensitive keys from .env into os.environ
+                continue
+            if v is not None:
+                if override or k not in os.environ:
+                    os.environ[k] = str(v)
+    except Exception:
+        try:
+            for line in target.read_text().splitlines():
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k, v = s.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in SENSITIVE_ENV_KEYS:
+                        if override or k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+    # Ensure sensitive credentials are never in os.environ
+    for k in SENSITIVE_ENV_KEYS:
+        os.environ.pop(k, None)
+
+
+def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
+    """
+    Atomically migrates any legacy plaintext credentials from .env into the
+    encrypted database vault within a single transactional boundary.
+    Directly queries the database in the transaction to verify persistence and decryption.
+    If database persistence or verification fails:
+      - Rolls back all database changes.
+      - Leaves .env COMPLETELY INTACT.
+      - Never sanitizes .env.
+    If verification succeeds:
+      - Commits the database transaction.
+      - Writes the sanitized .env through an atomic temporary file and rename.
+    """
+    target = env_file_path or Path(".env")
+    if not target.exists() or not target.is_file():
+        for k in SENSITIVE_ENV_KEYS:
+            os.environ.pop(k, None)
         return False
 
     try:
         lines = target.read_text().splitlines(keepends=True)
-        env_vars = {}
-        for line in lines:
-            s = line.strip()
-            if s and not s.startswith("#") and "=" in s:
-                k, v = s.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                if k in SENSITIVE_ENV_KEYS and v:
-                    env_vars[k] = v
+    except Exception as e:
+        print(f"[SECURITY WARNING] Could not read .env file: {e}")
+        return False
 
-        if env_vars:
-            # Atomic migration into database vault
-            from auth import AuthService, set_system_setting, get_system_setting, get_db_connection
+    env_vars = {}
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k, v = s.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip("'\"")
+            if k in SENSITIVE_ENV_KEYS and v:
+                env_vars[k] = v
 
-            # 1. Exchange keys migration
-            ex_key = env_vars.get("EXCHANGE_API_KEY")
-            ex_sec = env_vars.get("EXCHANGE_API_SECRET")
-            ex_pass = env_vars.get("EXCHANGE_API_PASSPHRASE", "")
-            if ex_key and ex_sec:
-                # Check if exchange keys already exist in DB
-                existing = AuthService.get_latest_raw_exchange_key()
-                if not existing or not existing.get("api_key"):
-                    conn = get_db_connection()
-                    user = conn.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1").fetchone()
-                    conn.close()
-                    user_id = user["id"] if user else 1
-                    ex_id = os.getenv("EXCHANGE_ID", "mexc")
-                    testnet_val = os.getenv("TESTNET", "true").lower() == "true"
-                    AuthService.save_exchange_key(user_id, ex_id, ex_key, ex_sec, ex_pass, testnet_val)
-                    # Verify persistence
-                    verified = AuthService.get_latest_raw_exchange_key()
-                    if not verified or verified.get("api_key") != ex_key or verified.get("api_secret") != ex_sec:
-                        raise RuntimeError("Atomic .env migration failed: Exchange key verification mismatch")
+    if not env_vars:
+        for k in SENSITIVE_ENV_KEYS:
+            os.environ.pop(k, None)
+        return True
 
-            # 2. Sensitive email settings migration
-            email_keys = ["SMTP_PASS", "RESEND_API_KEY", "BREVO_API_KEY", "SENDGRID_API_KEY"]
-            for ek in email_keys:
-                if ek in env_vars:
-                    val = env_vars[ek]
-                    set_system_setting(ek, val)
-                    # Verify persistence
-                    read_back = get_system_setting(ek)
-                    if read_back != val:
-                        raise RuntimeError(f"Atomic .env migration failed: {ek} verification mismatch")
+    from auth import AuthService, set_system_setting, get_db_connection
 
-        # Now sanitize .env file safely
-        modified = False
+    # Single database transaction with rollback on failure
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        cur = conn.cursor()
+
+        # 1. Exchange keys migration
+        ex_key = env_vars.get("EXCHANGE_API_KEY")
+        ex_sec = env_vars.get("EXCHANGE_API_SECRET")
+        ex_pass = env_vars.get("EXCHANGE_API_PASSPHRASE", "")
+        if ex_key and ex_sec:
+            cur.execute("SELECT id FROM exchange_keys LIMIT 1")
+            existing_row = cur.fetchone()
+            if not existing_row:
+                cur.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+                user = cur.fetchone()
+                user_id = user["id"] if user else 1
+                ex_id = os.getenv("EXCHANGE_ID", "mexc")
+                testnet_val = os.getenv("TESTNET", "true").lower() == "true"
+                AuthService.save_exchange_key(user_id, ex_id, ex_key, ex_sec, ex_pass, testnet_val, conn=conn)
+
+        # 2. Sensitive email settings migration
+        email_keys = ["SMTP_PASS", "RESEND_API_KEY", "BREVO_API_KEY", "SENDGRID_API_KEY"]
+        for ek in email_keys:
+            if ek in env_vars:
+                set_system_setting(ek, env_vars[ek], conn=conn)
+
+        # 3. VERIFY DIRECTLY FROM DATABASE (NOT VIA os.environ fallback!)
+        if ex_key and ex_sec:
+            cur.execute("SELECT api_key, api_secret, api_passphrase FROM exchange_keys ORDER BY id DESC LIMIT 1")
+            ex_row = cur.fetchone()
+            if not ex_row:
+                raise RuntimeError("Verification failed: exchange credentials row not found in database")
+            dec_key = decrypt_secret(ex_row["api_key"])
+            dec_sec = decrypt_secret(ex_row["api_secret"])
+            if dec_key != ex_key or dec_sec != ex_sec:
+                raise RuntimeError("Verification failed: decrypted exchange credentials do not match source values")
+
+        for ek in email_keys:
+            if ek in env_vars:
+                cur.execute("SELECT value FROM system_settings WHERE key = ?", (ek,))
+                s_row = cur.fetchone()
+                if not s_row:
+                    raise RuntimeError(f"Verification failed: setting {ek} not found in database")
+                dec_val = decrypt_secret(s_row["value"])
+                if dec_val != env_vars[ek]:
+                    raise RuntimeError(f"Verification failed: decrypted setting {ek} does not match source value")
+
+        # Everything is written and verified in the database! Commit the transaction!
+        conn.commit()
+    except Exception as e:
+        # Roll back all database changes on ANY failure
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[SECURITY ERROR] Atomic migration failed, database rolled back, .env left intact: {e}")
+        # Leave .env COMPLETELY INTACT!
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # 4. Write sanitized .env through atomic temporary file + rename
+    try:
         new_lines = []
         for line in lines:
             s = line.strip()
@@ -225,24 +314,31 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
                 k, v = s.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                if k in SENSITIVE_ENV_KEYS:
-                    if v:
-                        modified = True
-                        new_lines.append(f"# {k} is stored securely in the encrypted vault (users.db)\n")
-                        continue
+                if k in SENSITIVE_ENV_KEYS and v:
+                    new_lines.append(f"# {k} is stored securely in the encrypted vault (users.db)\n")
+                    continue
             new_lines.append(line)
 
-        if modified:
-            target.write_text("".join(new_lines))
-
-        # Remove sensitive credentials from runtime process memory (os.environ)
-        for k in SENSITIVE_ENV_KEYS:
-            os.environ.pop(k, None)
-
-        return True
+        temp_file = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+        try:
+            temp_file.write_text("".join(new_lines))
+            temp_file.replace(target)  # Atomic rename on POSIX
+        except Exception as write_err:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Atomic file replace failed: {write_err}") from write_err
     except Exception as e:
-        print(f"[SECURITY WARNING] Failed during atomic .env migration/sanitization: {e}")
+        print(f"[SECURITY ERROR] Failed to write sanitized .env atomically: {e}")
         return False
+
+    # 5. Remove sensitive credentials from runtime process memory (os.environ)
+    for k in SENSITIVE_ENV_KEYS:
+        os.environ.pop(k, None)
+
+    return True
 
 
 # Backwards-compatible alias

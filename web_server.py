@@ -31,6 +31,10 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
+from secret_manager import safe_load_dotenv, migrate_and_sanitize_env_file, SENSITIVE_ENV_KEYS
+safe_load_dotenv()
+migrate_and_sanitize_env_file()
+
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
 from exchange_client import ExchangeClient
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
@@ -45,9 +49,6 @@ AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 setup_logging()
 logger = logging.getLogger("web")
 init_auth_db()
-
-from secret_manager import migrate_and_sanitize_env_file, SENSITIVE_ENV_KEYS
-migrate_and_sanitize_env_file()
 
 # Preload non-sensitive exchange metadata into environment if present in vault
 latest_key = AuthService.get_latest_raw_exchange_key()

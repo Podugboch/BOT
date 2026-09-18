@@ -506,4 +506,93 @@ class TestSecretEncryptionAndVault:
         assert new_cfg.exchange.api_key == "kraken_secret_key_123"
         assert new_cfg.exchange.api_secret == "kraken_secret_sec_456"
 
+    def test_safe_load_dotenv_blocks_sensitive_keys_from_os_environ(self, tmp_path, monkeypatch):
+        from secret_manager import safe_load_dotenv, SENSITIVE_ENV_KEYS
+
+        dirty_env = tmp_path / ".dirty_env"
+        dirty_env.write_text(
+            "TEST_PORT=9999\n"
+            "TEST_APP_NAME=CryptoBot\n"
+            "EXCHANGE_API_KEY=exposed_key_111\n"
+            "EXCHANGE_API_SECRET=exposed_secret_222\n"
+            "SMTP_PASS=exposed_smtp_333\n"
+            "RESEND_API_KEY=exposed_resend_444\n"
+        )
+        for k in ["TEST_PORT", "TEST_APP_NAME"] + list(SENSITIVE_ENV_KEYS):
+            monkeypatch.delenv(k, raising=False)
+
+        safe_load_dotenv(dirty_env, override=True)
+
+        # Non-sensitive keys must be loaded
+        assert os.environ.get("TEST_PORT") == "9999"
+        assert os.environ.get("TEST_APP_NAME") == "CryptoBot"
+
+        # Sensitive keys MUST NEVER be in os.environ
+        assert "EXCHANGE_API_KEY" not in os.environ
+        assert "EXCHANGE_API_SECRET" not in os.environ
+        assert "SMTP_PASS" not in os.environ
+        assert "RESEND_API_KEY" not in os.environ
+
+    def test_migration_aborts_and_rolls_back_on_db_error_preserving_env(self, tmp_path, monkeypatch):
+        from secret_manager import migrate_and_sanitize_env_file
+        dirty_env = tmp_path / ".env_fail_test"
+        orig_content = (
+            "EXCHANGE_ID=coinbase\n"
+            "EXCHANGE_API_KEY=my_cb_key_555\n"
+            "EXCHANGE_API_SECRET=my_cb_secret_666\n"
+            "SMTP_PASS=my_smtp_pass_777\n"
+        )
+        dirty_env.write_text(orig_content)
+
+        def mock_failing_set_system_setting(*args, **kwargs):
+            raise sqlite3.OperationalError("Simulated disk I/O error during insert")
+
+        monkeypatch.setattr("auth.set_system_setting", mock_failing_set_system_setting)
+
+        res = migrate_and_sanitize_env_file(dirty_env)
+        assert res is False
+
+        # .env must be 100% INTACT! Not modified, not deleted
+        assert dirty_env.read_text() == orig_content
+
+        # Verify transaction rolled back in DB: exchange_keys must NOT contain the credentials
+        conn = get_db_connection()
+        row = conn.execute("SELECT * FROM exchange_keys WHERE api_key LIKE '%my_cb_key_555%'").fetchone()
+        conn.close()
+        assert row is None
+
+    def test_migration_atomic_rename_failure_preserves_env(self, tmp_path, monkeypatch):
+        from secret_manager import migrate_and_sanitize_env_file
+        dirty_env = tmp_path / ".env_rename_fail"
+        orig_content = (
+            "EXCHANGE_ID=kraken\n"
+            "EXCHANGE_API_KEY=kraken_key_test\n"
+            "EXCHANGE_API_SECRET=kraken_sec_test\n"
+        )
+        dirty_env.write_text(orig_content)
+
+        def failing_replace(self, target):
+            raise OSError("Simulated cross-device link or permission error on rename")
+
+        monkeypatch.setattr(Path, "replace", failing_replace)
+
+        res = migrate_and_sanitize_env_file(dirty_env)
+        assert res is False
+        assert dirty_env.read_text() == orig_content
+
+    def test_set_system_setting_raises_explicit_error_on_failure(self):
+        closed_conn = sqlite3.connect(":memory:")
+        closed_conn.close()
+        with pytest.raises(RuntimeError) as exc_info:
+            set_system_setting("SOME_KEY", "SOME_VAL", conn=closed_conn)
+        assert "Failed to persist system setting" in str(exc_info.value)
+
+    def test_save_exchange_key_raises_explicit_error_on_failure(self):
+        closed_conn = sqlite3.connect(":memory:")
+        closed_conn.close()
+        with pytest.raises(RuntimeError) as exc_info:
+            AuthService.save_exchange_key(1, "binance", "k", "s", conn=closed_conn)
+        assert "Failed to save exchange key" in str(exc_info.value)
+
+
 

@@ -8,10 +8,10 @@ Copy .env.example to .env and fill it in, or export the vars directly.
 import os
 import socket
 from dataclasses import dataclass, field
-from dotenv import load_dotenv
+from secret_manager import safe_load_dotenv
 
-# Automatically load environment variables from .env
-load_dotenv()
+# Safely load non-sensitive environment variables from .env
+safe_load_dotenv()
 
 # Fallback DNS resolution in case host/ISP DNS blocks crypto exchange domains
 try:

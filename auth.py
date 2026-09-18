@@ -23,11 +23,15 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import urllib.request
 import urllib.error
-from dotenv import load_dotenv
+from secret_manager import (
+    safe_load_dotenv,
+    encrypt_secret,
+    decrypt_secret,
+    is_encrypted,
+    SENSITIVE_ENV_KEYS,
+)
 
-load_dotenv()
-
-from secret_manager import encrypt_secret, decrypt_secret, is_encrypted, SENSITIVE_ENV_KEYS
+safe_load_dotenv()
 
 # Detect serverless environment for DB path
 if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
@@ -152,6 +156,11 @@ def init_auth_db():
     conn.commit()
     migrate_unencrypted_secrets(conn)
     conn.close()
+    try:
+        from secret_manager import migrate_and_sanitize_env_file
+        migrate_and_sanitize_env_file()
+    except Exception as e:
+        print(f"[AUTH ERROR] Failed to run env migration in init_auth_db: {e}")
 
 
 def get_system_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -174,9 +183,12 @@ def get_system_setting(key: str, default: Optional[str] = None) -> Optional[str]
     return env_val
 
 
-def set_system_setting(key: str, value: str):
-    try:
+def set_system_setting(key: str, value: str, conn: Optional[sqlite3.Connection] = None):
+    should_close = False
+    if conn is None:
         conn = get_db_connection()
+        should_close = True
+    try:
         cur = conn.cursor()
         stored_value = encrypt_secret(value) if key in SENSITIVE_ENV_KEYS and value else value
         cur.execute("""
@@ -184,14 +196,21 @@ def set_system_setting(key: str, value: str):
             VALUES (?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
         """, (key, stored_value, datetime.now(timezone.utc).isoformat()))
-        conn.commit()
-        conn.close()
+        if should_close:
+            conn.commit()
         if key not in SENSITIVE_ENV_KEYS:
             os.environ[key] = value
         else:
             os.environ.pop(key, None)
     except Exception as e:
         print(f"[AUTH ERROR] Failed to set system setting {key}: {e}")
+        raise RuntimeError(f"Failed to persist system setting '{key}': {e}") from e
+    finally:
+        if should_close:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_resend_verified_domains(resend_key: str) -> list:
@@ -962,26 +981,39 @@ class AuthService:
         }
 
     @staticmethod
-    def save_exchange_key(user_id: int, exchange_id: str, api_key: str, api_secret: str, api_passphrase: str = "", testnet: bool = True) -> Dict[str, Any]:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        created_at = datetime.now(timezone.utc).isoformat()
-        enc_api_key = encrypt_secret(api_key)
-        enc_api_secret = encrypt_secret(api_secret)
-        enc_api_passphrase = encrypt_secret(api_passphrase) if api_passphrase else ""
-        cur.execute("""
-            INSERT INTO exchange_keys (user_id, exchange_id, api_key, api_secret, api_passphrase, testnet, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, exchange_id) DO UPDATE SET
-                api_key = excluded.api_key,
-                api_secret = excluded.api_secret,
-                api_passphrase = excluded.api_passphrase,
-                testnet = excluded.testnet,
-                created_at = excluded.created_at
-        """, (user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, 1 if testnet else 0, created_at))
-        conn.commit()
-        conn.close()
-        return {"success": True, "message": f"Credentials for {exchange_id} saved successfully"}
+    def save_exchange_key(user_id: int, exchange_id: str, api_key: str, api_secret: str, api_passphrase: str = "", testnet: bool = True, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+        should_close = False
+        if conn is None:
+            conn = get_db_connection()
+            should_close = True
+        try:
+            cur = conn.cursor()
+            created_at = datetime.now(timezone.utc).isoformat()
+            enc_api_key = encrypt_secret(api_key)
+            enc_api_secret = encrypt_secret(api_secret)
+            enc_api_passphrase = encrypt_secret(api_passphrase) if api_passphrase else ""
+            cur.execute("""
+                INSERT INTO exchange_keys (user_id, exchange_id, api_key, api_secret, api_passphrase, testnet, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, exchange_id) DO UPDATE SET
+                    api_key = excluded.api_key,
+                    api_secret = excluded.api_secret,
+                    api_passphrase = excluded.api_passphrase,
+                    testnet = excluded.testnet,
+                    created_at = excluded.created_at
+            """, (user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, 1 if testnet else 0, created_at))
+            if should_close:
+                conn.commit()
+            return {"success": True, "message": f"Credentials for {exchange_id} saved successfully"}
+        except Exception as e:
+            print(f"[AUTH ERROR] Failed to save exchange key for user {user_id} and {exchange_id}: {e}")
+            raise RuntimeError(f"Failed to save exchange key: {e}") from e
+        finally:
+            if should_close:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def get_exchange_keys(user_id: int) -> list:
