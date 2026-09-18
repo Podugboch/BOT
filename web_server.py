@@ -1299,12 +1299,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- Quick Action Controls -->
       <div class="flex items-center space-x-2.5 text-xs">
-        <!-- Download ZIP button -->
-        <a href="/api/download/bot" class="hidden md:flex px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 font-semibold rounded-lg transition items-center gap-1.5" title="Download Complete Bot Package">
-          <i class="fa-solid fa-download"></i>
-          <span>BOT (.zip)</span>
-        </a>
-
         <!-- Bot Status Indicator -->
         <div class="flex items-center gap-2 bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-bordercol">
           <span class="inline-block w-2 h-2 rounded-full" id="status-dot"></span>
