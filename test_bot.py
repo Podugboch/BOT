@@ -305,6 +305,63 @@ class TestTradingBot:
         assert sell_res["success"] is True
         assert bot.position is None
 
+    def test_transient_enter_error_does_not_halt_bot(self, sample_ohlcv):
+        cfg = BotConfig()
+        cfg.execution_mode = "auto"
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+
+        # Simulate transient error (e.g., CCXT NetworkError / order timeout) during entry
+        def mock_maybe_enter(df, price):
+            raise RuntimeError("CCXT: Network timeout while placing entry order")
+
+        bot._maybe_enter = mock_maybe_enter
+        res = bot.step()
+        assert res is True
+        assert bot.position is None
+
+    def test_transient_exit_error_does_not_halt_bot(self, sample_ohlcv):
+        cfg = BotConfig()
+        cfg.execution_mode = "auto"
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.position = {
+            "entry": 50000.0,
+            "size": 0.01,
+            "stop": 49000.0,
+            "target": 52000.0,
+            "fee_paid": 0.5,
+        }
+
+        # Simulate transient error during exit
+        def mock_maybe_exit(df, price):
+            raise RuntimeError("CCXT: Temporary 502 Bad Gateway during exit order")
+
+        bot._maybe_exit = mock_maybe_exit
+        res = bot.step()
+        assert res is True
+        # Position remains open to allow retry on next cycle
+        assert bot.position is not None
+
+    def test_transient_indicator_error_does_not_halt_bot(self):
+        cfg = BotConfig()
+        bot = TradingBot(cfg)
+        # Return valid OHLCV dataframe that fails in indicator calculation
+        df = pd.DataFrame({"ts": [1, 2], "open": [1, 2], "high": [1, 2], "low": [1, 2], "close": ["invalid", "data"], "volume": [1, 2]})
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: df
+
+        res = bot.step()
+        assert res is True
+
+    def test_risk_manager_kill_switch_halts_step(self):
+        cfg = BotConfig()
+        bot = TradingBot(cfg)
+        assert bot.kill_switch_active() is False
+
+        bot.risk.state.kill_switch_triggered = True
+        assert bot.kill_switch_active() is True
+        assert bot.step() is False
+
 
 # ============================================================================
 # MULTI-STRATEGY & SETTINGS ENDPOINT TESTS

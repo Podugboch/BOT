@@ -107,18 +107,29 @@ class BotRunner:
             logger.info("Bot execution loop active. Polling interval: %ds.", self.cfg.poll_interval_sec)
             try:
                 while self.running:
-                    step_ok = self.bot.step()
+                    step_ok = False
+                    try:
+                        step_ok = self.bot.step()
+                    except Exception as e:
+                        logger.warning("Transient error during bot step: %s — will retry next cycle.", e)
+                        self.last_error = str(e)
+                        step_ok = True
+
                     self.last_step_time = datetime.now(timezone.utc).isoformat()
                     if not step_ok:
-                        logger.warning("Bot step returned False — halting runner loop.")
-                        self.running = False
-                        break
+                        if self.bot and self.bot.kill_switch_active():
+                            logger.warning("Kill switch active — halting bot runner loop.")
+                            self.running = False
+                            break
+                        else:
+                            logger.warning("Bot step returned False without active kill switch — retrying on next cycle.")
+
                     for _ in range(self.cfg.poll_interval_sec):
-                        if not self.running or self.bot.kill_switch_active():
+                        if not self.running or (self.bot and self.bot.kill_switch_active()):
                             break
                         time.sleep(1)
-                    if self.bot.kill_switch_active():
-                        logger.warning("Kill switch file detected — halting bot runner loop.")
+                    if self.bot and self.bot.kill_switch_active():
+                        logger.warning("Kill switch active — halting bot runner loop.")
                         self.running = False
                         break
             except Exception as e:

@@ -63,7 +63,7 @@ class TradingBot:
         self.last_day = datetime.now(timezone.utc).date()
 
     def kill_switch_active(self) -> bool:
-        return os.path.exists(self.cfg.kill_switch_file)
+        return os.path.exists(self.cfg.kill_switch_file) or getattr(self.risk.state, "kill_switch_triggered", False)
 
     def maybe_reset_day(self):
         today = datetime.now(timezone.utc).date()
@@ -73,9 +73,12 @@ class TradingBot:
             log.info("New UTC trading day — daily loss counter reset.")
 
     def step(self) -> bool:
-        """One decision cycle. Returns False if the bot should stop."""
+        """One decision cycle. Returns False only if an active kill switch is triggered."""
         if self.kill_switch_active():
-            log.critical("Kill switch file '%s' detected — halting.", self.cfg.kill_switch_file)
+            if os.path.exists(self.cfg.kill_switch_file):
+                log.critical("Kill switch file '%s' detected — halting.", self.cfg.kill_switch_file)
+            else:
+                log.critical("Risk manager kill switch triggered — halting.")
             return False
 
         self.maybe_reset_day()
@@ -90,34 +93,42 @@ class TradingBot:
             log.warning("Insufficient market data returned (%s bars) — skipping this cycle.", 0 if df is None else len(df))
             return True
 
-        df = add_indicators(df, self.cfg.strategy)
-        price = float(df["close"].iloc[-1])
+        try:
+            df = add_indicators(df, self.cfg.strategy)
+            price = float(df["close"].iloc[-1])
+        except Exception as e:
+            log.warning("Indicator calculation failed: %s — skipping this cycle, will retry.", e)
+            return True
+
         can_trade, reason = self.risk.can_trade()
 
         # In manual execution mode, monitor market and signals without auto-placing orders
         if getattr(self.cfg, "execution_mode", "auto") == "manual":
-            sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position))
-            rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
-            adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
-            if self.position is not None:
-                hit_stop = price <= self.position["stop"]
-                hit_target = price >= self.position["target"]
-                pnl_approx = (price - self.position["entry"]) * self.position["size"]
-                if hit_stop:
-                    log.warning("MANUAL MODE: Stop loss reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
-                elif hit_target:
-                    log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
-                elif sig == Signal.SELL:
-                    log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+            try:
+                sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position))
+                rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
+                adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
+                if self.position is not None:
+                    hit_stop = price <= self.position["stop"]
+                    hit_target = price >= self.position["target"]
+                    pnl_approx = (price - self.position["entry"]) * self.position["size"]
+                    if hit_stop:
+                        log.warning("MANUAL MODE: Stop loss reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
+                    elif hit_target:
+                        log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
+                    elif sig == Signal.SELL:
+                        log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+                    else:
+                        log.info("MANUAL MODE: Position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
+                                 self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
                 else:
-                    log.info("MANUAL MODE: Position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
-                             self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
-            else:
-                if sig == Signal.BUY:
-                    log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
-                else:
-                    log.info("MANUAL MODE [%s %s]: price=$%.2f | signal=%s | RSI=%.1f | ADX=%.1f (monitoring only)",
-                             self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, rsi_val, adx_val)
+                    if sig == Signal.BUY:
+                        log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
+                    else:
+                        log.info("MANUAL MODE [%s %s]: price=$%.2f | signal=%s | RSI=%.1f | ADX=%.1f (monitoring only)",
+                                 self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, rsi_val, adx_val)
+            except Exception as e:
+                log.warning("Manual mode monitoring error: %s — will retry on next cycle.", e)
             return True
 
         try:
@@ -128,9 +139,9 @@ class TradingBot:
                 self._maybe_enter(df, price)
             else:
                 self._maybe_exit(df, price)
-        except Exception:
-            log.exception("Error during trade decision/execution — halting to avoid unknown state.")
-            return False
+        except Exception as e:
+            log.warning("Transient error during trade decision/execution: %s — will retry on next cycle.", e)
+            return True
 
         return True
 
