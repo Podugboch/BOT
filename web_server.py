@@ -58,9 +58,10 @@ if latest_key:
     if not os.getenv("TESTNET") and "testnet" in latest_key:
         os.environ["TESTNET"] = "true" if latest_key["testnet"] else "false"
 
-# Ensure sensitive credentials are never present in os.environ at runtime
-for k in SENSITIVE_ENV_KEYS:
-    os.environ.pop(k, None)
+# Ensure sensitive exchange credentials are never present in os.environ at runtime
+if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
+    for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
+        os.environ.pop(k, None)
 
 app = FastAPI(title="Crypto Trading Bot Dashboard & Auth", version="2.0.0")
 
@@ -322,12 +323,18 @@ def create_bot_zip() -> str:
     return str(zip_path)
 
 
+def get_request_base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    return f"{proto}://{host}".rstrip("/")
+
+
 # ============================================================================
 # API ENDPOINTS: AUTHENTICATION & USER MANAGEMENT
 # ============================================================================
 @app.post("/api/auth/register")
 def register(req: RegisterRequest, request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = get_request_base_url(request)
     res = AuthService.register(req.username, req.email, req.password, base_url=base_url)
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
@@ -345,7 +352,7 @@ def activate_account(token: str = Query(...)):
 
 @app.post("/api/auth/resend-activation")
 def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = get_request_base_url(request)
     res = AuthService.resend_activation_email(req.email, base_url=base_url)
     return res
 
@@ -369,7 +376,7 @@ def get_profile(authorization: Optional[str] = Header(None)):
 
 @app.post("/api/auth/forgot-password")
 def forgot_password(req: ForgotPasswordRequest, request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = get_request_base_url(request)
     res = AuthService.request_password_reset(req.email, base_url=base_url)
     return res
 

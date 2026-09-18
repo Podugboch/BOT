@@ -94,6 +94,41 @@ def migrate_unencrypted_secrets(conn: sqlite3.Connection):
         print(f"[AUTH ERROR] Failed during unencrypted secret migration: {e}")
 
 
+def sync_env_to_system_settings(conn: sqlite3.Connection):
+    """
+    Persists any platform-level environment variables (e.g. Vercel, Docker, AWS Lambda)
+    into the encrypted system_settings table so they are securely available to the application.
+    """
+    keys = [
+        "EMAIL_PROVIDER",
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_USER",
+        "SMTP_PASS",
+        "FROM_EMAIL",
+        "RESEND_API_KEY",
+        "BREVO_API_KEY",
+        "SENDGRID_API_KEY",
+    ]
+    try:
+        cur = conn.cursor()
+        for k in keys:
+            val = (os.getenv(k) or "").strip()
+            if val:
+                cur.execute("SELECT value FROM system_settings WHERE key = ?", (k,))
+                row = cur.fetchone()
+                if not row or not row["value"]:
+                    stored_val = encrypt_secret(val) if k in SENSITIVE_ENV_KEYS else val
+                    cur.execute("""
+                        INSERT INTO system_settings (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """, (k, stored_val, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    except Exception as e:
+        print(f"[AUTH WARNING] Could not sync environment settings to database: {e}")
+
+
 def init_auth_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -155,6 +190,7 @@ def init_auth_db():
     """)
     conn.commit()
     migrate_unencrypted_secrets(conn)
+    sync_env_to_system_settings(conn)
     conn.close()
     try:
         from secret_manager import migrate_and_sanitize_env_file
@@ -234,21 +270,34 @@ def get_resend_verified_domains(resend_key: str) -> list:
 
 
 def get_email_settings() -> Dict[str, Any]:
-    provider = (get_system_setting("EMAIL_PROVIDER", "") or "").strip().lower()
-    smtp_host = (get_system_setting("SMTP_HOST", "") or "").strip()
-    smtp_port = (get_system_setting("SMTP_PORT", "587") or "587").strip()
-    smtp_user = (get_system_setting("SMTP_USER", "") or "").strip()
-    smtp_pass = (get_system_setting("SMTP_PASS", "") or "").strip()
-    from_email = (get_system_setting("FROM_EMAIL", "") or "").strip()
-    resend_key = (get_system_setting("RESEND_API_KEY", "") or "").strip()
-    brevo_key = (get_system_setting("BREVO_API_KEY", "") or "").strip()
-    sendgrid_key = (get_system_setting("SENDGRID_API_KEY", "") or "").strip()
+    provider = (get_system_setting("EMAIL_PROVIDER", "") or os.getenv("EMAIL_PROVIDER", "") or "").strip().lower()
+    smtp_host = (get_system_setting("SMTP_HOST", "") or os.getenv("SMTP_HOST", "") or "").strip()
+    smtp_port = (get_system_setting("SMTP_PORT", "587") or os.getenv("SMTP_PORT", "587") or "587").strip()
+    smtp_user = (get_system_setting("SMTP_USER", "") or os.getenv("SMTP_USER", "") or "").strip()
+    smtp_pass = (get_system_setting("SMTP_PASS", "") or os.getenv("SMTP_PASS", "") or "").strip()
+    from_email = (get_system_setting("FROM_EMAIL", "") or os.getenv("FROM_EMAIL", "") or "").strip()
+    resend_key = (get_system_setting("RESEND_API_KEY", "") or os.getenv("RESEND_API_KEY", "") or "").strip()
+    brevo_key = (get_system_setting("BREVO_API_KEY", "") or os.getenv("BREVO_API_KEY", "") or "").strip()
+    sendgrid_key = (get_system_setting("SENDGRID_API_KEY", "") or os.getenv("SENDGRID_API_KEY", "") or "").strip()
 
     has_smtp = bool(smtp_host and smtp_user and smtp_pass)
     has_resend = bool(resend_key)
     has_brevo = bool(brevo_key)
     has_sendgrid = bool(sendgrid_key)
     is_configured = has_smtp or has_resend or has_brevo or has_sendgrid
+
+    # Auto-detect active provider if not explicitly chosen
+    if not provider or provider == "none":
+        if has_resend:
+            provider = "resend"
+        elif has_brevo:
+            provider = "brevo"
+        elif has_smtp:
+            provider = "smtp"
+        elif has_sendgrid:
+            provider = "sendgrid"
+        else:
+            provider = "none"
 
     # Check if Resend has verified domains on account
     resend_domains = []
@@ -578,16 +627,16 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
     settings = get_email_settings()
     active_prov = settings.get("provider", "none")
 
-    resend_key = get_system_setting("RESEND_API_KEY", "") or ""
-    brevo_key = get_system_setting("BREVO_API_KEY", "") or ""
-    sendgrid_key = get_system_setting("SENDGRID_API_KEY", "") or ""
+    resend_key = get_system_setting("RESEND_API_KEY", "") or os.getenv("RESEND_API_KEY", "") or ""
+    brevo_key = get_system_setting("BREVO_API_KEY", "") or os.getenv("BREVO_API_KEY", "") or ""
+    sendgrid_key = get_system_setting("SENDGRID_API_KEY", "") or os.getenv("SENDGRID_API_KEY", "") or ""
 
-    smtp_host = get_system_setting("SMTP_HOST", "") or get_system_setting("EMAIL_SERVER", "") or ""
-    smtp_port = int(get_system_setting("SMTP_PORT", "587") or get_system_setting("EMAIL_PORT", "587") or "587")
-    smtp_user = get_system_setting("SMTP_USER", "") or get_system_setting("EMAIL_USER", "") or ""
-    smtp_pass = get_system_setting("SMTP_PASS", "") or get_system_setting("EMAIL_PASSWORD", "") or ""
+    smtp_host = get_system_setting("SMTP_HOST", "") or os.getenv("SMTP_HOST", "") or os.getenv("EMAIL_SERVER", "") or ""
+    smtp_port = int(get_system_setting("SMTP_PORT", "587") or os.getenv("SMTP_PORT", "587") or os.getenv("EMAIL_PORT", "587") or "587")
+    smtp_user = get_system_setting("SMTP_USER", "") or os.getenv("SMTP_USER", "") or os.getenv("EMAIL_USER", "") or ""
+    smtp_pass = get_system_setting("SMTP_PASS", "") or os.getenv("SMTP_PASS", "") or os.getenv("EMAIL_PASSWORD", "") or ""
 
-    from_email = get_system_setting("FROM_EMAIL", "") or smtp_user or ""
+    from_email = get_system_setting("FROM_EMAIL", "") or os.getenv("FROM_EMAIL", "") or smtp_user or ""
 
     # Define dispatch candidates
     candidates = []

@@ -167,9 +167,6 @@ def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = Fals
     """
     target = env_file_path or Path(".env")
     if not target.exists() or not target.is_file():
-        # Clear any sensitive env vars from process environment
-        for k in SENSITIVE_ENV_KEYS:
-            os.environ.pop(k, None)
         return
 
     try:
@@ -196,9 +193,10 @@ def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = Fals
         except Exception:
             pass
 
-    # Ensure sensitive credentials are never in os.environ
-    for k in SENSITIVE_ENV_KEYS:
-        os.environ.pop(k, None)
+    # Ensure sensitive credentials loaded from .env are never in os.environ
+    if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
+        for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
+            os.environ.pop(k, None)
 
 
 def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
@@ -216,13 +214,9 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
     """
     target = env_file_path or Path(".env")
     if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
-        for k in SENSITIVE_ENV_KEYS:
-            os.environ.pop(k, None)
         return False
 
     if not target.exists() or not target.is_file():
-        for k in SENSITIVE_ENV_KEYS:
-            os.environ.pop(k, None)
         return False
 
     try:
