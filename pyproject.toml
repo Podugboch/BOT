@@ -11,7 +11,8 @@ dependencies = [
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "ccxt>=4.3.0",
-    "dnspython>=2.0.0"
+    "dnspython>=2.0.0",
+    "cryptography>=41.0.0"
 ]
 
 [tool.pytest.ini_options]

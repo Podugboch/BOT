@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from secret_manager import encrypt_secret, decrypt_secret, is_encrypted, SENSITIVE_ENV_KEYS
+
 # Detect serverless environment for DB path
 if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
     DB_PATH = Path("/tmp/crypto_bot_users.db")
@@ -38,6 +40,54 @@ def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def migrate_unencrypted_secrets(conn: sqlite3.Connection):
+    """Encrypts any existing plaintext exchange keys and system settings in the database."""
+    try:
+        cur = conn.cursor()
+        # 1. Exchange keys table
+        cur.execute("SELECT id, api_key, api_secret, api_passphrase FROM exchange_keys")
+        rows = cur.fetchall()
+        for r in rows:
+            pk = r["id"]
+            k = r["api_key"]
+            s = r["api_secret"]
+            p = r["api_passphrase"]
+            needs_update = False
+            enc_k = k
+            enc_s = s
+            enc_p = p
+            if k and not is_encrypted(k):
+                enc_k = encrypt_secret(k)
+                needs_update = True
+            if s and not is_encrypted(s):
+                enc_s = encrypt_secret(s)
+                needs_update = True
+            if p and not is_encrypted(p):
+                enc_p = encrypt_secret(p)
+                needs_update = True
+            if needs_update:
+                cur.execute(
+                    "UPDATE exchange_keys SET api_key = ?, api_secret = ?, api_passphrase = ? WHERE id = ?",
+                    (enc_k, enc_s, enc_p, pk)
+                )
+
+        # 2. System settings table
+        cur.execute("SELECT key, value FROM system_settings")
+        s_rows = cur.fetchall()
+        for r in s_rows:
+            key = r["key"]
+            val = r["value"]
+            if key in SENSITIVE_ENV_KEYS and val and not is_encrypted(val):
+                cur.execute(
+                    "UPDATE system_settings SET value = ? WHERE key = ?",
+                    (encrypt_secret(val), key)
+                )
+
+        conn.commit()
+    except Exception as e:
+        print(f"[AUTH ERROR] Failed during unencrypted secret migration: {e}")
 
 
 def init_auth_db():
@@ -100,6 +150,7 @@ def init_auth_db():
     )
     """)
     conn.commit()
+    migrate_unencrypted_secrets(conn)
     conn.close()
 
 
@@ -111,21 +162,28 @@ def get_system_setting(key: str, default: Optional[str] = None) -> Optional[str]
         row = cur.fetchone()
         conn.close()
         if row and row["value"]:
-            return row["value"]
+            val = row["value"]
+            if key in SENSITIVE_ENV_KEYS or is_encrypted(val):
+                return decrypt_secret(val)
+            return val
     except Exception:
         pass
-    return os.getenv(key, default)
+    env_val = os.getenv(key, default)
+    if env_val and (key in SENSITIVE_ENV_KEYS or is_encrypted(env_val)):
+        return decrypt_secret(env_val)
+    return env_val
 
 
 def set_system_setting(key: str, value: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        stored_value = encrypt_secret(value) if key in SENSITIVE_ENV_KEYS and value else value
         cur.execute("""
             INSERT INTO system_settings (key, value, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """, (key, value, datetime.now(timezone.utc).isoformat()))
+        """, (key, stored_value, datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
         os.environ[key] = value
@@ -905,6 +963,9 @@ class AuthService:
         conn = get_db_connection()
         cur = conn.cursor()
         created_at = datetime.now(timezone.utc).isoformat()
+        enc_api_key = encrypt_secret(api_key)
+        enc_api_secret = encrypt_secret(api_secret)
+        enc_api_passphrase = encrypt_secret(api_passphrase) if api_passphrase else ""
         cur.execute("""
             INSERT INTO exchange_keys (user_id, exchange_id, api_key, api_secret, api_passphrase, testnet, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -914,7 +975,7 @@ class AuthService:
                 api_passphrase = excluded.api_passphrase,
                 testnet = excluded.testnet,
                 created_at = excluded.created_at
-        """, (user_id, exchange_id, api_key, api_secret, api_passphrase, 1 if testnet else 0, created_at))
+        """, (user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, 1 if testnet else 0, created_at))
         conn.commit()
         conn.close()
         return {"success": True, "message": f"Credentials for {exchange_id} saved successfully"}
@@ -929,11 +990,13 @@ class AuthService:
 
         result = []
         for r in rows:
-            key_preview = r["api_key"][:4] + "***" + r["api_key"][-4:] if len(r["api_key"]) > 8 else "***"
+            raw_key = decrypt_secret(r["api_key"])
+            key_preview = raw_key[:4] + "***" + raw_key[-4:] if len(raw_key) > 8 else "***"
+            has_pass = bool(decrypt_secret(r["api_passphrase"])) if r["api_passphrase"] else False
             result.append({
                 "exchange_id": r["exchange_id"],
                 "api_key_masked": key_preview,
-                "has_passphrase": bool(r["api_passphrase"]),
+                "has_passphrase": has_pass,
                 "testnet": bool(r["testnet"]),
                 "created_at": r["created_at"],
             })
@@ -948,7 +1011,30 @@ class AuthService:
         row = cur.fetchone()
         conn.close()
         if row:
-            return dict(row)
+            return {
+                "api_key": decrypt_secret(row["api_key"]),
+                "api_secret": decrypt_secret(row["api_secret"]),
+                "api_passphrase": decrypt_secret(row["api_passphrase"]) if row["api_passphrase"] else "",
+                "testnet": bool(row["testnet"]),
+            }
+        return None
+
+    @staticmethod
+    def get_latest_raw_exchange_key() -> Optional[Dict[str, Any]]:
+        """Returns the most recently saved raw exchange key (decrypted) for background bot execution."""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT exchange_id, api_key, api_secret, api_passphrase, testnet FROM exchange_keys ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {
+                "exchange_id": row["exchange_id"],
+                "api_key": decrypt_secret(row["api_key"]),
+                "api_secret": decrypt_secret(row["api_secret"]),
+                "api_passphrase": decrypt_secret(row["api_passphrase"]) if row["api_passphrase"] else "",
+                "testnet": bool(row["testnet"]),
+            }
         return None
 
     @staticmethod

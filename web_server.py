@@ -44,7 +44,21 @@ AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 
 setup_logging()
 logger = logging.getLogger("web")
+from secret_manager import sanitize_env_file
+sanitize_env_file()
 init_auth_db()
+
+# Preload decrypted credentials into memory if present in vault
+latest_key = AuthService.get_latest_raw_exchange_key()
+if latest_key:
+    if not os.getenv("EXCHANGE_ID") and latest_key.get("exchange_id"):
+        os.environ["EXCHANGE_ID"] = latest_key["exchange_id"]
+    if not os.getenv("EXCHANGE_API_KEY") and latest_key.get("api_key"):
+        os.environ["EXCHANGE_API_KEY"] = latest_key["api_key"]
+    if not os.getenv("EXCHANGE_API_SECRET") and latest_key.get("api_secret"):
+        os.environ["EXCHANGE_API_SECRET"] = latest_key["api_secret"]
+    if not os.getenv("EXCHANGE_API_PASSPHRASE") and latest_key.get("api_passphrase"):
+        os.environ["EXCHANGE_API_PASSPHRASE"] = latest_key["api_passphrase"]
 
 app = FastAPI(title="Crypto Trading Bot Dashboard & Auth", version="2.0.0")
 
@@ -285,6 +299,7 @@ def create_bot_zip() -> str:
         "backtester.py",
         "web_server.py",
         "auth.py",
+        "secret_manager.py",
         "requirements.txt",
         ".env.example",
         "README.md",
@@ -422,10 +437,11 @@ def save_email_settings_endpoint(req: EmailSettingsRequest):
 
     res = save_email_settings(settings_dict)
 
-    # Persist to .env if writable and file exists
+    # Persist only non-sensitive email configuration to .env if writable and file exists
     try:
         env_file = Path(".env")
         if env_file.exists():
+            from secret_manager import SENSITIVE_ENV_KEYS
             lines = env_file.read_text().splitlines(keepends=True)
             written = set()
             new_lines = []
@@ -433,13 +449,16 @@ def save_email_settings_endpoint(req: EmailSettingsRequest):
                 s = l.strip()
                 if s and not s.startswith("#") and "=" in s:
                     k = s.split("=", 1)[0].strip()
+                    if k in SENSITIVE_ENV_KEYS:
+                        # Omit sensitive credentials from plaintext file
+                        continue
                     if k in settings_dict and settings_dict[k]:
                         new_lines.append(f"{k}={settings_dict[k]}\n")
                         written.add(k)
                         continue
                 new_lines.append(l)
             for k, v in settings_dict.items():
-                if k not in written and v:
+                if k not in written and v and k not in SENSITIVE_ENV_KEYS:
                     new_lines.append(f"{k}={v}\n")
             env_file.write_text("".join(new_lines))
     except Exception as e:
@@ -583,50 +602,57 @@ def save_exchange_credentials(req: SaveExchangeKeyRequest, authorization: Option
             detail="Authentication required. Please create an account and log in to manage exchange API keys."
         )
 
-    # Store in DB per user
+    # Store in DB per user (encrypted at rest)
     AuthService.save_exchange_key(
         user["id"], req.exchange_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
     )
 
-    # Also update .env and active BotConfig so the live bot can use it immediately
+    # In-memory updates for active process and bot runner
+    os.environ["EXCHANGE_ID"] = req.exchange_id
+    os.environ["EXCHANGE_API_KEY"] = req.api_key
+    os.environ["EXCHANGE_API_SECRET"] = req.api_secret
+    os.environ["EXCHANGE_API_PASSPHRASE"] = req.api_passphrase or ""
+    os.environ["TESTNET"] = "true" if req.testnet else "false"
+
+    # Persist only non-sensitive configuration to .env (do NOT write API keys/secrets to .env)
     env_file = Path(".env")
-    lines = []
     if env_file.exists():
-        with open(env_file, "r") as f:
-            lines = f.readlines()
+        try:
+            from secret_manager import SENSITIVE_ENV_KEYS
+            lines = env_file.read_text().splitlines(keepends=True)
+            new_lines = []
+            written = set()
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k = s.split("=", 1)[0].strip()
+                    if k in SENSITIVE_ENV_KEYS:
+                        # Strip plaintext credential from .env
+                        continue
+                    if k == "EXCHANGE_ID":
+                        new_lines.append(f"EXCHANGE_ID={req.exchange_id}\n")
+                        written.add(k)
+                        continue
+                    if k == "TESTNET":
+                        new_lines.append(f"TESTNET={'true' if req.testnet else 'false'}\n")
+                        written.add(k)
+                        continue
+                new_lines.append(l)
 
-    updates = {
-        "EXCHANGE_ID": req.exchange_id,
-        "EXCHANGE_API_KEY": req.api_key,
-        "EXCHANGE_API_SECRET": req.api_secret,
-        "EXCHANGE_API_PASSPHRASE": req.api_passphrase or "",
-        "TESTNET": "true" if req.testnet else "false",
-    }
+            if "EXCHANGE_ID" not in written:
+                new_lines.append(f"EXCHANGE_ID={req.exchange_id}\n")
+            if "TESTNET" not in written:
+                new_lines.append(f"TESTNET={'true' if req.testnet else 'false'}\n")
 
-    new_lines = []
-    written = set()
-    for l in lines:
-        s = l.strip()
-        if s and not s.startswith("#") and "=" in s:
-            k = s.split("=", 1)[0].strip()
-            if k in updates:
-                new_lines.append(f"{k}={updates[k]}\n")
-                written.add(k)
-                continue
-        new_lines.append(l)
-
-    for k, v in updates.items():
-        if k not in written:
-            new_lines.append(f"{k}={v}\n")
-
-    with open(env_file, "w") as f:
-        f.writelines(new_lines)
+            env_file.write_text("".join(new_lines))
+        except Exception as e:
+            logger.warning(f"Failed updating .env with exchange metadata: {e}")
 
     # Refresh runner exchange config
     runner.cfg = BotConfig()
     return {
         "success": True,
-        "message": f"API keys for {req.exchange_id} saved and applied to active configuration.",
+        "message": f"API keys for {req.exchange_id} saved securely to encrypted vault and applied to active configuration.",
         "exchange_id": req.exchange_id,
         "testnet": req.testnet,
     }

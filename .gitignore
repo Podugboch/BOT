@@ -11,3 +11,5 @@ KILL
 .DS_Store
 BOT.zip
 .vercel
+.secret_key
+*.key

@@ -272,3 +272,147 @@ class TestAuthRegistrationFlow:
         conn.close()
 
         assert tok1 != tok2
+
+
+class TestSecretEncryptionAndVault:
+    def test_fernet_encrypt_decrypt(self):
+        from secret_manager import encrypt_secret, decrypt_secret, is_encrypted
+        secret = "super_confidential_api_secret_999"
+        encrypted = encrypt_secret(secret)
+        assert is_encrypted(encrypted)
+        assert not is_encrypted(secret)
+        assert encrypted != secret
+        assert encrypted.startswith("enc:")
+        assert decrypt_secret(encrypted) == secret
+
+    def test_legacy_plaintext_fallback(self):
+        from secret_manager import decrypt_secret
+        assert decrypt_secret("raw_legacy_secret") == "raw_legacy_secret"
+        assert decrypt_secret("") == ""
+
+    def test_exchange_keys_encrypted_at_rest_in_sqlite(self):
+        reg = AuthService.register("vault_user", "vault@market.io", "Pass123456")
+        conn = get_db_connection()
+        user = conn.execute("SELECT id FROM users WHERE username = 'vault_user'").fetchone()
+        user_id = user["id"]
+        conn.close()
+
+        raw_api_key = "mx0v_my_super_secure_key"
+        raw_api_secret = "9fdcf827_secret_hash_code"
+        raw_passphrase = "my_passphrase_123"
+
+        AuthService.save_exchange_key(user_id, "binance", raw_api_key, raw_api_secret, raw_passphrase, testnet=True)
+
+        # Inspect raw SQLite database directly to confirm encryption at rest
+        conn = get_db_connection()
+        raw_row = conn.execute("SELECT api_key, api_secret, api_passphrase FROM exchange_keys WHERE user_id = ?", (user_id,)).fetchone()
+        conn.close()
+
+        assert raw_row["api_key"] != raw_api_key
+        assert raw_row["api_key"].startswith("enc:")
+        assert raw_row["api_secret"] != raw_api_secret
+        assert raw_row["api_secret"].startswith("enc:")
+        assert raw_row["api_passphrase"] != raw_passphrase
+        assert raw_row["api_passphrase"].startswith("enc:")
+
+        # AuthService.get_raw_exchange_key returns decrypted credentials
+        raw_creds = AuthService.get_raw_exchange_key(user_id, "binance")
+        assert raw_creds["api_key"] == raw_api_key
+        assert raw_creds["api_secret"] == raw_api_secret
+        assert raw_creds["api_passphrase"] == raw_passphrase
+
+        # AuthService.get_exchange_keys returns masked preview only
+        masked_list = AuthService.get_exchange_keys(user_id)
+        assert len(masked_list) == 1
+        assert raw_api_key not in masked_list[0]["api_key_masked"]
+        assert raw_api_secret not in str(masked_list[0])
+        assert "***" in masked_list[0]["api_key_masked"]
+
+    def test_email_credentials_encrypted_in_system_settings(self):
+        raw_pass = "smtp_super_secret_password_456"
+        raw_resend = "re_secret_resend_api_token"
+        save_email_settings({
+            "EMAIL_PROVIDER": "smtp",
+            "SMTP_HOST": "smtp.mail.com",
+            "SMTP_USER": "mailer@mail.com",
+            "SMTP_PASS": raw_pass,
+            "RESEND_API_KEY": raw_resend,
+        })
+
+        # Inspect raw SQLite table
+        conn = get_db_connection()
+        rows = dict(conn.execute("SELECT key, value FROM system_settings").fetchall())
+        conn.close()
+
+        assert rows["SMTP_PASS"] != raw_pass
+        assert rows["SMTP_PASS"].startswith("enc:")
+        assert rows["RESEND_API_KEY"] != raw_resend
+        assert rows["RESEND_API_KEY"].startswith("enc:")
+        # Non-sensitive settings remain normal
+        assert rows["SMTP_HOST"] == "smtp.mail.com"
+
+        # get_system_setting and get_email_settings decrypt properly
+        assert get_system_setting("SMTP_PASS") == raw_pass
+        assert get_system_setting("RESEND_API_KEY") == raw_resend
+
+    def test_unencrypted_db_migration(self):
+        from auth import migrate_unencrypted_secrets
+        # Insert raw plaintext row directly into DB bypassing encryption
+        conn = get_db_connection()
+        conn.execute("INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES ('SMTP_PASS', 'plaintext_pass', '2026-01-01')")
+        conn.commit()
+        migrate_unencrypted_secrets(conn)
+        row = conn.execute("SELECT value FROM system_settings WHERE key = 'SMTP_PASS'").fetchone()
+        conn.close()
+        assert row["value"] != "plaintext_pass"
+        assert row["value"].startswith("enc:")
+        assert get_system_setting("SMTP_PASS") == "plaintext_pass"
+
+    def test_save_exchange_and_email_does_not_write_plaintext_to_env(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from web_server import app
+
+        fake_env = tmp_path / ".test_env"
+        fake_env.write_text("EXCHANGE_ID=binance\nTESTNET=true\n")
+        orig_path = Path
+        monkeypatch.setattr("web_server.Path", lambda p: fake_env if p == ".env" else orig_path(p))
+
+        client = TestClient(app)
+        AuthService.register("env_test_user", "env_user@test.io", "Pass123456")
+        conn = get_db_connection()
+        tok = conn.execute("SELECT activation_token FROM users WHERE username = 'env_test_user'").fetchone()["activation_token"]
+        conn.close()
+        AuthService.activate_account(tok)
+        login = AuthService.login("env_test_user", "Pass123456")
+        auth_header = {"Authorization": f"Bearer {login['token']}"}
+
+        # Save exchange key via endpoint
+        res = client.post("/api/exchange/save", json={
+            "exchange_id": "coinbase",
+            "api_key": "my_super_secret_cb_key",
+            "api_secret": "my_super_secret_cb_secret",
+            "api_passphrase": "cb_passphrase",
+            "testnet": False
+        }, headers=auth_header)
+        assert res.status_code == 200
+
+        # Check content of fake .env file
+        env_content = fake_env.read_text()
+        assert "my_super_secret_cb_key" not in env_content
+        assert "my_super_secret_cb_secret" not in env_content
+        assert "cb_passphrase" not in env_content
+        assert "EXCHANGE_ID=coinbase" in env_content
+
+        # Save email settings via endpoint
+        email_res = client.post("/api/auth/email-settings", json={
+            "provider": "resend",
+            "resend_api_key": "re_secret_key_should_not_be_in_env",
+            "from_email": "Crypto Bot <noreply@example.com>"
+        })
+        assert email_res.status_code == 200
+
+        env_content2 = fake_env.read_text()
+        assert "re_secret_key_should_not_be_in_env" not in env_content2
+        assert "EMAIL_PROVIDER=resend" in env_content2
+
