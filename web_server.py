@@ -1163,12 +1163,13 @@ def activate_page(token: str = Query(...)):
     <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>{title}</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
-      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center shadow-2xl space-y-4">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-8 text-center shadow-2xl space-y-4">
         <i class="fa-solid {status_icon} text-5xl"></i>
         <h1 class="text-2xl font-bold">{title}</h1>
         <p class="text-sm text-slate-400">{res['message']}</p>
@@ -1189,12 +1190,13 @@ def reset_password_page(token: str = Query(...)):
     <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>Reset Your Password</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
-      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl space-y-5">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-8 shadow-2xl space-y-5">
         <div class="text-center">
           <i class="fa-solid fa-key text-4xl text-amber-400 mb-2"></i>
           <h1 class="text-2xl font-bold">Set New Password</h1>
@@ -1281,7 +1283,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Crypto Trading Bot - Dashboard & Exchange Keys</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -1300,121 +1302,249 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
   </script>
+  <style>
+    html, body {
+      overflow-x: hidden;
+      max-width: 100vw;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .safe-area-bottom {
+      padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+    }
+    .pb-safe-main {
+      padding-bottom: max(5.5rem, calc(4.5rem + env(safe-area-inset-bottom)));
+    }
+    button, a {
+      touch-action: manipulation;
+    }
+    ::-webkit-scrollbar {
+      width: 5px;
+      height: 5px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0b1120;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+    #log-container {
+      word-break: break-all;
+      white-space: pre-wrap;
+    }
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateY(-6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .animate-slideDown {
+      animation: slideDown 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+  </style>
 </head>
-<body class="bg-darkbg text-slate-100 min-h-screen font-sans antialiased">
+<body class="bg-darkbg text-slate-100 min-h-screen font-sans antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
 
   <!-- Top Navigation -->
-  <header class="border-b border-bordercol bg-cardbg/90 backdrop-blur sticky top-0 z-40">
-    <div class="max-w-7xl mx-auto px-4 py-2.5 flex items-center justify-between">
-      <div class="flex items-center space-x-3">
-        <div class="h-9 w-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold">
-          <i class="fa-solid fa-chart-line"></i>
+  <header class="border-b border-bordercol bg-cardbg/95 backdrop-blur-md sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-3 sm:px-4 py-2 sm:py-2.5">
+      <div class="flex items-center justify-between gap-2">
+        <!-- Brand & Title -->
+        <div class="flex items-center space-x-2.5 sm:space-x-3 min-w-0">
+          <div class="h-8 w-8 sm:h-9 sm:w-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold shrink-0">
+            <i class="fa-solid fa-chart-line text-sm sm:text-base"></i>
+          </div>
+          <div class="min-w-0">
+            <h1 class="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5 sm:gap-2 truncate">
+              <span class="truncate">Crypto Bot</span>
+              <span id="badge-mode" class="text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">PAPER</span>
+            </h1>
+            <p class="text-[10px] sm:text-[11px] text-slate-400 truncate hidden xs:block sm:block">EMA Cross + RSI + ADX + Fib Retracement + Risk Layer</p>
+          </div>
         </div>
-        <div>
-          <h1 class="text-base font-bold tracking-tight text-white flex items-center gap-2">
-            Crypto Trading Bot
-            <span id="badge-mode" class="text-[10px] px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30">PAPER</span>
-          </h1>
-          <p class="text-[11px] text-slate-400">EMA Cross + RSI + ADX + Fib Retracement + Risk Layer</p>
+
+        <!-- Desktop Quick Action Controls (Hidden on mobile < md) -->
+        <div class="hidden md:flex items-center space-x-2 text-xs">
+          <!-- Bot Status Indicator -->
+          <div class="flex items-center gap-2 bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-bordercol">
+            <span class="inline-block w-2 h-2 rounded-full" id="status-dot"></span>
+            <span id="status-text" class="font-semibold text-slate-300">IDLE</span>
+          </div>
+
+          <!-- Start / Stop Button -->
+          <button id="btn-toggle" onclick="toggleBot()" class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+            <i class="fa-solid fa-play" id="btn-toggle-icon"></i>
+            <span id="btn-toggle-text">Start Bot</span>
+          </button>
+
+          <!-- Kill Switch -->
+          <button onclick="triggerKillSwitch()" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center gap-1" title="Emergency Stop">
+            <i class="fa-solid fa-skull-crossbones"></i>
+          </button>
+
+          <!-- Bot Settings Button -->
+          <button type="button" onclick="openSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
+            <i class="fa-solid fa-gear text-amber-400"></i>
+            <span>Settings</span>
+          </button>
+
+          <!-- Email Settings Button -->
+          <button type="button" onclick="openEmailSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Email & Verification Credentials">
+            <span id="email-status-dot" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
+            <i class="fa-solid fa-envelope text-sky-400"></i>
+            <span>Email</span>
+          </button>
+
+          <!-- Auth User Menu Button -->
+          <div id="auth-buttons" class="flex items-center gap-2">
+            <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
+              Login
+            </button>
+            <button onclick="openAuthModal('register')" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition">
+              Register
+            </button>
+          </div>
+          <div id="user-badge" class="hidden items-center gap-2 bg-slate-900 border border-bordercol px-2.5 py-1 rounded-lg">
+            <i class="fa-solid fa-user-circle text-emerald-400"></i>
+            <span id="user-name-display" class="font-semibold text-slate-200"></span>
+            <button onclick="confirmDeleteAccount()" class="text-slate-500 hover:text-rose-400 text-xs ml-1" title="Delete My Account"><i class="fa-solid fa-trash-can"></i></button>
+            <button onclick="logout()" class="text-slate-400 hover:text-rose-400 ml-1" title="Logout"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
+          </div>
+        </div>
+
+        <!-- Mobile Header Action Controls (Visible only on < md) -->
+        <div class="flex md:hidden items-center gap-1.5">
+          <!-- Compact Status Badge -->
+          <div class="flex items-center gap-1.5 bg-slate-900/90 px-2 py-1 rounded-lg border border-bordercol text-[11px]">
+            <span class="inline-block w-2 h-2 rounded-full" id="status-dot-mobile"></span>
+            <span id="status-text-mobile" class="font-semibold text-slate-300">IDLE</span>
+          </div>
+
+          <!-- Quick Mobile Start/Stop Toggle Button -->
+          <button id="btn-toggle-mobile" onclick="toggleBot()" class="px-2.5 py-1.5 bg-emerald-600 active:bg-emerald-700 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1">
+            <i class="fa-solid fa-play text-[10px]" id="btn-toggle-icon-mobile"></i>
+            <span id="btn-toggle-text-mobile">Start</span>
+          </button>
+
+          <!-- Mobile Menu Hamburger Button -->
+          <button id="btn-mobile-menu" onclick="toggleMobileMenu()" class="p-1.5 px-2.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 border border-bordercol rounded-lg transition text-sm focus:outline-none flex items-center justify-center" aria-label="Toggle navigation menu">
+            <i class="fa-solid fa-bars" id="mobile-menu-icon"></i>
+          </button>
         </div>
       </div>
 
-      <!-- Quick Action Controls -->
-      <div class="flex items-center space-x-2.5 text-xs">
-        <!-- Bot Status Indicator -->
-        <div class="flex items-center gap-2 bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-bordercol">
-          <span class="inline-block w-2 h-2 rounded-full" id="status-dot"></span>
-          <span id="status-text" class="font-semibold text-slate-300">IDLE</span>
-        </div>
-
-        <!-- Start / Stop Button -->
-        <button id="btn-toggle" onclick="toggleBot()" class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
-          <i class="fa-solid fa-play" id="btn-toggle-icon"></i>
-          <span id="btn-toggle-text">Start Bot</span>
-        </button>
-
-        <!-- Kill Switch -->
-        <button onclick="triggerKillSwitch()" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center gap-1" title="Emergency Stop">
-          <i class="fa-solid fa-skull-crossbones"></i>
-        </button>
-
-        <!-- Auth User Menu Button -->
-        <div id="auth-buttons" class="flex items-center gap-2">
-          <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
-            Login
-          </button>
-          <button onclick="openAuthModal('register')" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition">
-            Register
+      <!-- Mobile Dropdown Navigation Drawer -->
+      <div id="mobile-menu-panel" class="hidden md:hidden pt-3 mt-2 border-t border-bordercol/80 space-y-2.5 text-xs animate-slideDown">
+        <!-- Emergency Stop Banner Button -->
+        <div>
+          <button onclick="triggerKillSwitch()" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center justify-center gap-2">
+            <i class="fa-solid fa-skull-crossbones"></i>
+            <span>Emergency Kill Switch</span>
           </button>
         </div>
-        <div id="user-badge" class="hidden items-center gap-2 bg-slate-900 border border-bordercol px-2.5 py-1 rounded-lg">
-          <i class="fa-solid fa-user-circle text-emerald-400"></i>
-          <span id="user-name-display" class="font-semibold text-slate-200"></span>
-          <button onclick="logout()" class="text-slate-400 hover:text-rose-400 ml-1" title="Logout"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
+
+        <!-- Settings & Email Shortcut Buttons -->
+        <div class="grid grid-cols-2 gap-2">
+          <button type="button" onclick="openSettingsModal(); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-gear text-amber-400"></i>
+            <span>Bot Settings</span>
+          </button>
+          <button type="button" onclick="openEmailSettingsModal(); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
+            <span id="email-status-dot-mobile" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
+            <i class="fa-solid fa-envelope text-sky-400"></i>
+            <span>Email & SMTP</span>
+          </button>
+        </div>
+
+        <!-- Auth Controls (Mobile Drawer) -->
+        <div id="auth-buttons-mobile" class="grid grid-cols-2 gap-2 pt-2 border-t border-bordercol/60">
+          <button onclick="openAuthModal('login'); toggleMobileMenu();" class="py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition text-center flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-right-to-bracket text-xs"></i>
+            <span>Login</span>
+          </button>
+          <button onclick="openAuthModal('register'); toggleMobileMenu();" class="py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition text-center flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-user-plus text-xs"></i>
+            <span>Register</span>
+          </button>
+        </div>
+
+        <div id="user-badge-mobile" class="hidden flex-col gap-2 p-2.5 bg-slate-900 rounded-lg border border-bordercol">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-user-circle text-emerald-400 text-base"></i>
+              <span id="user-name-display-mobile" class="font-semibold text-slate-200"></span>
+            </div>
+            <button onclick="logout(); toggleMobileMenu();" class="text-xs px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-rose-300 rounded border border-bordercol flex items-center gap-1">
+              <i class="fa-solid fa-arrow-right-from-bracket"></i> Logout
+            </button>
+          </div>
+          <div class="pt-1.5 border-t border-bordercol/50 flex justify-end">
+            <button onclick="confirmDeleteAccount()" class="text-[11px] text-rose-400 hover:text-rose-300 underline flex items-center gap-1">
+              <i class="fa-solid fa-trash-can"></i> Delete My Account
+            </button>
+          </div>
         </div>
       </div>
     </div>
   </header>
 
   <!-- Main Container -->
-  <main class="max-w-7xl mx-auto px-4 py-5 space-y-5">
+  <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-5 space-y-4 sm:space-y-5 pb-safe-main md:pb-6">
 
     <!-- KPI Cards Grid -->
-    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Portfolio Equity</div>
-        <div class="text-lg font-bold mt-0.5 text-white" id="val-equity">$1,000.00</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">Peak: <span id="val-peak">$1,000.00</span></div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Portfolio Equity</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-white truncate" id="val-equity">$1,000.00</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Peak: <span id="val-peak">$1,000.00</span></div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium" id="val-cash-label">Paper Cash</div>
-        <div class="text-lg font-bold mt-0.5 text-emerald-400" id="val-cash">$1,000.00</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">Position: <span id="val-pos">0.000000</span></div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium" id="val-cash-label">Paper Cash</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-emerald-400 truncate" id="val-cash">$1,000.00</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Position: <span id="val-pos">0.000000</span></div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Max Drawdown</div>
-        <div class="text-lg font-bold mt-0.5 text-slate-200" id="val-drawdown">0.0%</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">Limit: 15.0% Kill</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Max Drawdown</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-drawdown">0.0%</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Limit: 15.0% Kill</div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Daily Loss</div>
-        <div class="text-lg font-bold mt-0.5 text-slate-200" id="val-daily-loss">0.0%</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">Limit: 3.0% Circuit</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Daily Loss</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-daily-loss">0.0%</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Limit: 3.0% Circuit</div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Loss Streak</div>
-        <div class="text-lg font-bold mt-0.5 text-slate-200" id="val-streak">0 / 4</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">Cooloff at 4</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Loss Streak</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-streak">0 / 4</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Cooloff at 4</div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-3">
-        <div class="text-slate-400 text-[11px] font-medium">Live Signal</div>
-        <div class="text-lg font-bold mt-0.5 text-yellow-400" id="val-signal">HOLD</div>
-        <div class="text-[10px] text-slate-400 mt-0.5" id="val-symbol-tag">BTC/USDT 15m</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Live Signal</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-yellow-400 truncate" id="val-signal">HOLD</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate" id="val-symbol-tag">BTC/USDT 15m</div>
       </div>
     </div>
 
     <!-- Active Position Banner -->
-    <div id="position-banner" class="hidden bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-3.5 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></div>
-        <div>
+    <div id="position-banner" class="hidden bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-3 sm:p-3.5 flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-2.5 sm:gap-3 min-w-0">
+        <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></div>
+        <div class="min-w-0">
           <span class="font-bold text-emerald-400 text-xs">ACTIVE POSITION:</span>
-          <span class="text-xs text-slate-300 ml-2" id="pos-details"></span>
+          <span class="text-xs text-slate-300 ml-1.5 break-all" id="pos-details"></span>
         </div>
       </div>
-      <span class="text-[10px] text-emerald-300 font-semibold px-2 py-0.5 bg-emerald-900/60 rounded">IN MARKET</span>
+      <span class="text-[10px] text-emerald-300 font-semibold px-2 py-0.5 bg-emerald-900/60 rounded shrink-0">IN MARKET</span>
     </div>
 
     <!-- ========================================================================= -->
     <!-- EXCHANGE API KEYS CONFIGURATION SECTION                                   -->
     <!-- ========================================================================= -->
     <div class="bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
-      <div class="flex items-center justify-between border-b border-bordercol pb-3">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-bordercol pb-3 gap-2">
         <div class="flex items-center gap-2">
           <i class="fa-solid fa-key text-amber-400"></i>
           <div>
@@ -1422,13 +1552,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <p class="text-[11px] text-slate-400">Select an exchange first, then enter your API credentials with trade permissions.</p>
           </div>
         </div>
-        <span class="text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium">
+        <span class="self-start sm:self-auto text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium shrink-0">
           <i class="fa-solid fa-shield-halved"></i> Trade-only keys (No withdrawal)
         </span>
       </div>
 
       <!-- LOCKED STATE: Shown when user is not logged in -->
-      <div id="api-keys-locked" class="bg-slate-900/90 border border-bordercol/80 rounded-xl p-8 text-center space-y-3">
+      <div id="api-keys-locked" class="bg-slate-900/90 border border-bordercol/80 rounded-xl p-5 sm:p-8 text-center space-y-3">
         <div class="inline-flex p-3 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 mb-1">
           <i class="fa-solid fa-lock text-2xl"></i>
         </div>
@@ -1436,12 +1566,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <p class="text-xs text-slate-400 max-w-md mx-auto">
           You must create an account and log in before you can access, configure, or test exchange API keys.
         </p>
-        <div class="flex items-center justify-center gap-3 pt-2">
-          <button onclick="openAuthModal('login')" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol text-xs font-semibold rounded-lg transition">
-            <i class="fa-solid fa-right-to-bracket mr-1"></i> Log In
+        <div class="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-2">
+          <button onclick="openAuthModal('login')" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol text-xs font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-right-to-bracket"></i> Log In
           </button>
-          <button onclick="openAuthModal('register')" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition">
-            <i class="fa-solid fa-user-plus mr-1"></i> Create Account
+          <button onclick="openAuthModal('register')" class="w-full sm:w-auto px-5 py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-user-plus"></i> Create Account
           </button>
         </div>
       </div>
@@ -1449,32 +1579,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <!-- UNLOCKED STATE: Shown only after account creation and login -->
       <div id="api-keys-unlocked" class="hidden space-y-4">
         <!-- Mode Switcher Card -->
-        <div class="p-3.5 bg-slate-900/90 rounded-xl border border-bordercol flex flex-wrap items-center justify-between gap-3 shadow-sm">
+        <div class="p-3 sm:p-3.5 bg-slate-900/90 rounded-xl border border-bordercol flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm">
           <div class="flex items-center gap-3">
-            <div id="env-icon" class="w-9 h-9 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold text-base">
+            <div id="env-icon" class="w-9 h-9 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold text-base shrink-0">
               <i class="fa-solid fa-flask"></i>
             </div>
             <div>
               <div class="text-xs font-bold text-white flex items-center gap-2">
-                Active Environment: <span id="env-mode-title" class="text-blue-400">TESTNET / SIMULATION</span>
+                Active Environment: <span id="env-mode-title" class="text-blue-400 font-bold">TESTNET / SIMULATION</span>
               </div>
               <p id="env-mode-desc" class="text-[11px] text-slate-400">Safe simulated execution. Zero real funds at risk.</p>
             </div>
           </div>
-          <div class="flex items-center gap-2">
-            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="px-3 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5">
+          <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 w-full sm:w-auto">
+            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5">
               <i class="fa-solid fa-flask"></i> Testnet Mode
             </button>
-            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5">
+            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5">
               <i class="fa-solid fa-bolt text-rose-400"></i> Real Trading (LIVE)
             </button>
-            <button type="button" onclick="openSettingsModal()" class="px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 text-xs font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
+            <button type="button" onclick="openSettingsModal()" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 text-xs font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
               <i class="fa-solid fa-gear"></i> Settings
             </button>
           </div>
         </div>
 
-        <form id="exchange-key-form" onsubmit="saveExchangeKey(event)" class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
+        <form id="exchange-key-form" onsubmit="saveExchangeKey(event)" class="grid grid-cols-1 md:grid-cols-4 gap-3 sm:gap-4 text-xs">
           <!-- 1. Select Exchange -->
           <div>
             <label class="block text-slate-300 font-semibold mb-1">1. Choose Exchange</label>
@@ -1513,19 +1643,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
 
           <!-- Options & Action Buttons -->
-          <div class="md:col-span-4 flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-bordercol/50">
-            <div class="flex items-center gap-4">
-              <label class="flex items-center gap-2 cursor-pointer">
+          <div class="md:col-span-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-2 border-t border-bordercol/50">
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-2 cursor-pointer text-xs">
                 <input type="checkbox" id="key-testnet" class="rounded bg-slate-900 border-bordercol text-emerald-500">
                 <span id="key-testnet-label" class="text-slate-300 font-medium">Use Testnet / Sandbox Mode (Check only if using Testnet keys)</span>
               </label>
             </div>
 
-            <div class="flex items-center gap-2">
-              <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5">
+            <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+              <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
                 <i class="fa-solid fa-plug"></i> Test Connection
               </button>
-              <button type="submit" id="btn-save-key" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+              <button type="submit" id="btn-save-key" class="w-full sm:w-auto px-5 py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
                 <i class="fa-solid fa-floppy-disk"></i> Save & Apply Credentials
               </button>
             </div>
@@ -1582,70 +1712,70 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <i class="fa-solid fa-gear mr-1"></i>Change Strategy / Timeframe / Switch to Auto
             </button>
           </div>
-          <div class="flex items-center gap-3">
-            <button type="button" id="btn-manual-buy" onclick="triggerManualTrade('buy')" class="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5">
+          <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
+            <button type="button" id="btn-manual-buy" onclick="triggerManualTrade('buy')" class="w-full sm:flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5 min-h-[42px]">
               <i class="fa-solid fa-arrow-trend-up"></i> Manual BUY (Market)
             </button>
-            <button type="button" id="btn-manual-sell" onclick="triggerManualTrade('sell')" class="flex-1 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5">
+            <button type="button" id="btn-manual-sell" onclick="triggerManualTrade('sell')" class="w-full sm:flex-1 py-2.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5 min-h-[42px]">
               <i class="fa-solid fa-arrow-trend-down"></i> Manual SELL (Market)
             </button>
           </div>
         </div>
 
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-          <div class="bg-slate-900/80 p-3 rounded-lg border border-bordercol/60">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2.5 sm:gap-3 text-xs">
+          <div class="bg-slate-900/80 p-2.5 sm:p-3 rounded-lg border border-bordercol/60">
             <div class="text-slate-400">Market Price</div>
-            <div class="text-base font-bold text-white mt-0.5" id="an-price">Loading...</div>
-            <div class="text-[10px] text-slate-400 mt-1" id="an-exchange">Exchange: binance</div>
+            <div class="text-sm sm:text-base font-bold text-white mt-0.5 truncate" id="an-price">Loading...</div>
+            <div class="text-[10px] text-slate-400 mt-1 truncate" id="an-exchange">Exchange: binance</div>
           </div>
 
-          <div class="bg-slate-900/80 p-3 rounded-lg border border-bordercol/60">
+          <div class="bg-slate-900/80 p-2.5 sm:p-3 rounded-lg border border-bordercol/60">
             <div class="text-slate-400">EMA Trend (12 / 26)</div>
-            <div class="text-base font-bold mt-0.5" id="an-trend">--</div>
-            <div class="text-[10px] text-slate-400 mt-1" id="an-emas">Fast: -- | Slow: --</div>
+            <div class="text-sm sm:text-base font-bold mt-0.5 truncate" id="an-trend">--</div>
+            <div class="text-[10px] text-slate-400 mt-1 truncate" id="an-emas">Fast: -- | Slow: --</div>
           </div>
 
-          <div class="bg-slate-900/80 p-3 rounded-lg border border-bordercol/60">
+          <div class="bg-slate-900/80 p-2.5 sm:p-3 rounded-lg border border-bordercol/60">
             <div class="text-slate-400">RSI (14)</div>
-            <div class="text-base font-bold mt-0.5" id="an-rsi">--</div>
-            <div class="text-[10px] text-slate-400 mt-1" id="an-rsi-status">Neutral</div>
+            <div class="text-sm sm:text-base font-bold mt-0.5 truncate" id="an-rsi">--</div>
+            <div class="text-[10px] text-slate-400 mt-1 truncate" id="an-rsi-status">Neutral</div>
           </div>
 
-          <div class="bg-slate-900/80 p-3 rounded-lg border border-bordercol/60">
+          <div class="bg-slate-900/80 p-2.5 sm:p-3 rounded-lg border border-bordercol/60">
             <div class="text-slate-400">ADX Trend Strength</div>
-            <div class="text-base font-bold mt-0.5" id="an-adx">--</div>
-            <div class="text-[10px] text-slate-400 mt-1" id="an-adx-status">Thresh: 20</div>
+            <div class="text-sm sm:text-base font-bold mt-0.5 truncate" id="an-adx">--</div>
+            <div class="text-[10px] text-slate-400 mt-1 truncate" id="an-adx-status">Thresh: 20</div>
           </div>
         </div>
 
         <!-- Automatic Fibonacci Zone Breakdown -->
-        <div class="bg-slate-900/80 p-3.5 rounded-lg border border-bordercol/60">
-          <div class="flex items-center justify-between text-xs mb-2">
+        <div class="bg-slate-900/80 p-3 sm:p-3.5 rounded-lg border border-bordercol/60">
+          <div class="flex flex-wrap items-center justify-between text-xs mb-2 gap-1.5">
             <span class="font-semibold text-slate-300 flex items-center gap-1.5">
               <i class="fa-solid fa-layer-group text-blue-400"></i> Rolling Fibonacci Retracement Support Zone (50 bars)
             </span>
-            <span id="an-fib-confluence" class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400">CHECKING</span>
+            <span id="an-fib-confluence" class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400 shrink-0">CHECKING</span>
           </div>
-          <div class="grid grid-cols-3 md:grid-cols-5 gap-2 text-center text-xs">
+          <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 text-center text-xs">
             <div class="bg-slate-800/60 p-2 rounded">
               <div class="text-[10px] text-slate-400">Swing High</div>
-              <div class="font-semibold text-slate-200 mt-0.5" id="fib-high">--</div>
+              <div class="font-semibold text-slate-200 mt-0.5 truncate" id="fib-high">--</div>
             </div>
             <div class="bg-slate-800/60 p-2 rounded">
               <div class="text-[10px] text-slate-400">38.2% Level</div>
-              <div class="font-semibold text-blue-300 mt-0.5" id="fib-382">--</div>
+              <div class="font-semibold text-blue-300 mt-0.5 truncate" id="fib-382">--</div>
             </div>
             <div class="bg-slate-800/60 p-2 rounded">
               <div class="text-[10px] text-slate-400">50.0% Level</div>
-              <div class="font-semibold text-purple-300 mt-0.5" id="fib-500">--</div>
+              <div class="font-semibold text-purple-300 mt-0.5 truncate" id="fib-500">--</div>
             </div>
             <div class="bg-slate-800/60 p-2 rounded">
               <div class="text-[10px] text-slate-400">61.8% Level</div>
-              <div class="font-semibold text-amber-300 mt-0.5" id="fib-618">--</div>
+              <div class="font-semibold text-amber-300 mt-0.5 truncate" id="fib-618">--</div>
             </div>
-            <div class="bg-slate-800/60 p-2 rounded">
+            <div class="bg-slate-800/60 p-2 rounded col-span-2 sm:col-span-1">
               <div class="text-[10px] text-slate-400">Swing Low</div>
-              <div class="font-semibold text-slate-200 mt-0.5" id="fib-low">--</div>
+              <div class="font-semibold text-slate-200 mt-0.5 truncate" id="fib-low">--</div>
             </div>
           </div>
         </div>
@@ -1725,7 +1855,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <label for="bt-use-fib" class="text-slate-300">Enable Fibonacci Zone Filter</label>
           </div>
 
-          <button type="submit" id="btn-run-bt" class="w-full py-2 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2">
+          <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
             <i class="fa-solid fa-play"></i> Run Historical Backtest
           </button>
         </form>
@@ -1765,11 +1895,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </main>
 
+  <!-- Sticky Mobile Bottom Quick-Action Bar -->
+  <nav id="mobile-bottom-nav" class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-cardbg/95 backdrop-blur-md border-t border-bordercol py-1.5 px-2 flex items-center justify-around text-center shadow-2xl safe-area-bottom">
+    <!-- 1. Bot Start/Stop Quick Action -->
+    <button id="bottom-btn-toggle" onclick="toggleBot()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1">
+      <i id="bottom-btn-toggle-icon" class="fa-solid fa-play text-emerald-400 text-base"></i>
+      <span id="bottom-btn-toggle-text" class="text-[10px] font-semibold mt-0.5">Start</span>
+    </button>
+
+    <!-- 2. Emergency Kill Switch -->
+    <button onclick="triggerKillSwitch()" class="flex flex-col items-center justify-center py-1 px-1.5 text-rose-400 hover:text-rose-300 active:scale-95 transition flex-1">
+      <i class="fa-solid fa-skull-crossbones text-base"></i>
+      <span class="text-[10px] font-semibold mt-0.5">Kill</span>
+    </button>
+
+    <!-- 3. Bot Settings -->
+    <button onclick="openSettingsModal()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1">
+      <i class="fa-solid fa-gear text-amber-400 text-base"></i>
+      <span class="text-[10px] font-semibold mt-0.5">Settings</span>
+    </button>
+
+    <!-- 4. Email & Verification Settings -->
+    <button onclick="openEmailSettingsModal()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1 relative">
+      <span id="email-status-dot-bottom" class="w-2 h-2 rounded-full bg-slate-500 absolute top-1 right-1/4"></span>
+      <i class="fa-solid fa-envelope text-sky-400 text-base"></i>
+      <span class="text-[10px] font-semibold mt-0.5">Email</span>
+    </button>
+
+    <!-- 5. User Account -->
+    <button id="bottom-btn-account" onclick="handleMobileAccountClick()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1">
+      <i class="fa-solid fa-circle-user text-emerald-400 text-base"></i>
+      <span id="bottom-account-text" class="text-[10px] font-semibold mt-0.5 truncate max-w-[60px]">Account</span>
+    </button>
+  </nav>
+
   <!-- ========================================================================= -->
   <!-- AUTH MODALS (LOGIN / REGISTER / FORGOT PASSWORD / ACTIVATION NOTICE)       -->
   <!-- ========================================================================= -->
-  <div id="auth-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 relative">
+  <div id="auth-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl space-y-4 relative my-auto max-h-[92vh] overflow-y-auto">
       <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
 
       <!-- Modal Title -->
@@ -1868,11 +2032,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- EMAIL & SMTP SETTINGS MODAL -->
-  <div id="email-settings-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+  <div id="email-settings-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-lg w-full p-4 sm:p-6 shadow-2xl space-y-4 my-auto max-h-[92vh] overflow-y-auto">
       <div class="flex items-center justify-between border-b border-bordercol pb-3">
         <div class="flex items-center gap-2">
-          <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center font-bold">
+          <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center font-bold shrink-0">
             <i class="fa-solid fa-envelope"></i>
           </div>
           <div>
@@ -1880,22 +2044,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <p class="text-[11px] text-slate-400">Configure email delivery for account verifications & password resets</p>
           </div>
         </div>
-        <button onclick="closeEmailSettingsModal()" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
+        <button onclick="closeEmailSettingsModal()" class="text-slate-400 hover:text-white text-lg p-1 -mr-1 -mt-1"><i class="fa-solid fa-xmark"></i></button>
       </div>
 
       <!-- Current Status Badge -->
-      <div id="smtp-current-status-banner" class="p-3 rounded-lg border border-bordercol bg-slate-900/80 text-xs flex items-center justify-between">
+      <div id="smtp-current-status-banner" class="p-3 rounded-lg border border-bordercol bg-slate-900/80 text-xs flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-2">
-          <span id="smtp-status-indicator" class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+          <span id="smtp-status-indicator" class="w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0"></span>
           <span id="smtp-status-text" class="font-medium text-slate-200">Checking email service...</span>
         </div>
-        <span id="smtp-provider-tag" class="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-slate-800 text-slate-400">NONE</span>
+        <span id="smtp-provider-tag" class="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-slate-800 text-slate-400 shrink-0">NONE</span>
       </div>
 
       <!-- Provider Selection Tabs -->
       <div>
         <label class="block text-slate-400 text-xs mb-1.5 font-medium">Select Email Provider</label>
-        <div class="grid grid-cols-2 sm:grid-cols-5 gap-1.5 text-xs">
+        <div class="grid grid-cols-3 sm:grid-cols-5 gap-1.5 text-xs">
           <button type="button" onclick="selectEmailProvider('gmail')" id="tab-prov-gmail" class="py-2 px-1.5 rounded-lg border font-semibold text-center transition flex flex-col items-center gap-1 bg-emerald-600/20 border-emerald-500 text-emerald-300">
             <i class="fa-brands fa-google text-sm"></i>
             <span class="text-[11px]">Gmail SMTP</span>
@@ -2049,9 +2213,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h4 class="text-xs font-bold text-white flex items-center gap-1.5">
           <i class="fa-solid fa-paper-plane text-sky-400"></i> Send Test Verification Email
         </h4>
-        <div class="flex gap-2 text-xs">
+        <div class="flex flex-col sm:flex-row gap-2 text-xs">
           <input type="email" id="test-email-dest" placeholder="Enter recipient email (e.g. your email)" class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
-          <button type="button" id="btn-run-test-email" onclick="runTestEmail()" class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+          <button type="button" id="btn-run-test-email" onclick="runTestEmail()" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-sky-600 hover:bg-sky-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
             <i class="fa-solid fa-paper-plane"></i> Send Test
           </button>
         </div>
@@ -2063,11 +2227,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- ========================================================================= -->
   <!-- TRADING BOT SETTINGS MODAL                                                -->
   <!-- ========================================================================= -->
-  <div id="settings-modal" class="hidden fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-xl w-full p-6 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
+  <div id="settings-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+    <div class="bg-cardbg border border-bordercol rounded-2xl max-w-xl w-full p-4 sm:p-6 shadow-2xl space-y-4 my-auto max-h-[92vh] overflow-y-auto">
       <div class="flex items-center justify-between border-b border-bordercol pb-3">
         <div class="flex items-center gap-2.5">
-          <div class="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center font-bold">
+          <div class="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center font-bold shrink-0">
             <i class="fa-solid fa-gear text-base"></i>
           </div>
           <div>
@@ -2193,11 +2357,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="settings-result-msg" class="hidden p-3 rounded-lg border text-xs"></div>
 
         <!-- Action Buttons -->
-        <div class="flex items-center justify-end gap-2 pt-2 border-t border-bordercol">
-          <button type="button" onclick="closeSettingsModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg transition">
+        <div class="flex flex-col-reverse sm:flex-row items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-bordercol">
+          <button type="button" onclick="closeSettingsModal()" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg transition text-center">
             Cancel
           </button>
-          <button type="submit" id="btn-save-settings" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg shadow transition flex items-center gap-1.5">
+          <button type="submit" id="btn-save-settings" class="w-full sm:w-auto px-5 py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg shadow transition flex items-center justify-center gap-1.5">
             <i class="fa-solid fa-floppy-disk"></i> Save & Apply Settings
           </button>
         </div>
@@ -2651,18 +2815,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function toggleMobileMenu() {
+      const panel = document.getElementById('mobile-menu-panel');
+      const icon = document.getElementById('mobile-menu-icon');
+      if (!panel) return;
+      const isHidden = panel.classList.toggle('hidden');
+      if (icon) {
+        icon.className = isHidden ? 'fa-solid fa-bars' : 'fa-solid fa-xmark';
+      }
+    }
+
+    function handleMobileAccountClick() {
+      if (currentUser) {
+        const panel = document.getElementById('mobile-menu-panel');
+        if (panel && panel.classList.contains('hidden')) {
+          toggleMobileMenu();
+        }
+      } else {
+        openAuthModal('login');
+      }
+    }
+
+    async function confirmDeleteAccount() {
+      if (!confirm('⚠️ Permanently delete your registered account, active sessions, and saved exchange keys?\n\nThis cannot be undone. Click OK to delete.')) return;
+      const token = localStorage.getItem('bot_auth_token');
+      if (!token) return;
+      try {
+        const res = await fetch('/api/auth/account', {
+          method: 'DELETE',
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert('Account deleted successfully.');
+          logout();
+        } else {
+          alert('Failed to delete account: ' + (data.detail || data.message));
+        }
+      } catch (err) {
+        alert('Error deleting account: ' + err);
+      }
+    }
+
     async function checkAuth() {
       const token = localStorage.getItem('bot_auth_token');
       const authButtons = document.getElementById('auth-buttons');
       const userBadge = document.getElementById('user-badge');
+      const authButtonsMob = document.getElementById('auth-buttons-mobile');
+      const userBadgeMob = document.getElementById('user-badge-mobile');
       const lockedDiv = document.getElementById('api-keys-locked');
       const unlockedDiv = document.getElementById('api-keys-unlocked');
+      const bottomAccountText = document.getElementById('bottom-account-text');
 
       if (!token) {
         if (authButtons) authButtons.classList.remove('hidden');
         if (userBadge) userBadge.classList.add('hidden');
+        if (authButtonsMob) authButtonsMob.classList.remove('hidden');
+        if (userBadgeMob) userBadgeMob.classList.add('hidden');
         if (lockedDiv) lockedDiv.classList.remove('hidden');
         if (unlockedDiv) unlockedDiv.classList.add('hidden');
+        if (bottomAccountText) bottomAccountText.innerText = 'Account';
         return;
       }
 
@@ -2675,9 +2887,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           currentUser = data.user;
           if (authButtons) authButtons.classList.add('hidden');
           if (userBadge) userBadge.classList.remove('hidden');
+          if (authButtonsMob) authButtonsMob.classList.add('hidden');
+          if (userBadgeMob) userBadgeMob.classList.remove('hidden');
+
           if (document.getElementById('user-name-display')) {
             document.getElementById('user-name-display').innerText = currentUser.username;
           }
+          if (document.getElementById('user-name-display-mobile')) {
+            document.getElementById('user-name-display-mobile').innerText = currentUser.username;
+          }
+          if (bottomAccountText) {
+            bottomAccountText.innerText = currentUser.username.length > 7 ? currentUser.username.slice(0, 6) + '…' : currentUser.username;
+          }
+
           if (lockedDiv) lockedDiv.classList.add('hidden');
           if (unlockedDiv) unlockedDiv.classList.remove('hidden');
 
@@ -2687,14 +2909,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             list.innerHTML = '';
             data.saved_exchanges.forEach(k => {
               const div = document.createElement('div');
-              div.className = 'flex items-center justify-between p-2 bg-slate-900/80 rounded border border-bordercol/80';
+              div.className = 'flex flex-wrap items-center justify-between p-2.5 bg-slate-900/80 rounded border border-bordercol/80 gap-2';
               div.innerHTML = `
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 min-w-0">
                   <span class="font-bold text-white uppercase">${k.exchange_id}</span>
-                  <span class="text-[10px] px-1.5 py-0.5 rounded ${k.testnet ? 'bg-blue-500/20 text-blue-300' : 'bg-emerald-500/20 text-emerald-300'}">${k.testnet ? 'TESTNET' : 'LIVE'}</span>
-                  <span class="font-mono text-slate-400 text-[11px]">${k.api_key_masked}</span>
+                  <span class="text-[10px] px-1.5 py-0.5 rounded ${k.testnet ? 'bg-blue-500/20 text-blue-300' : 'bg-emerald-500/20 text-emerald-300'} shrink-0">${k.testnet ? 'TESTNET' : 'LIVE'}</span>
+                  <span class="font-mono text-slate-400 text-[11px] truncate">${k.api_key_masked}</span>
                 </div>
-                <span class="text-[10px] text-slate-500">Configured</span>
+                <span class="text-[10px] text-slate-500 shrink-0">Configured</span>
               `;
               list.appendChild(div);
             });
@@ -2704,8 +2926,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           currentUser = null;
           if (authButtons) authButtons.classList.remove('hidden');
           if (userBadge) userBadge.classList.add('hidden');
+          if (authButtonsMob) authButtonsMob.classList.remove('hidden');
+          if (userBadgeMob) userBadgeMob.classList.add('hidden');
           if (lockedDiv) lockedDiv.classList.remove('hidden');
           if (unlockedDiv) unlockedDiv.classList.add('hidden');
+          if (bottomAccountText) bottomAccountText.innerText = 'Account';
         }
       } catch (e) {
         console.error('Check auth error:', e);
@@ -3053,24 +3278,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
+        const dotMob = document.getElementById('status-dot-mobile');
+        const textMob = document.getElementById('status-text-mobile');
+
+        const btnToggle = document.getElementById('btn-toggle');
         const btnToggleText = document.getElementById('btn-toggle-text');
         const btnToggleIcon = document.getElementById('btn-toggle-icon');
-        const btnToggle = document.getElementById('btn-toggle');
+
+        const btnToggleMob = document.getElementById('btn-toggle-mobile');
+        const btnToggleTextMob = document.getElementById('btn-toggle-text-mobile');
+        const btnToggleIconMob = document.getElementById('btn-toggle-icon-mobile');
+
+        const bottomBtnText = document.getElementById('bottom-btn-toggle-text');
+        const bottomBtnIcon = document.getElementById('bottom-btn-toggle-icon');
 
         if (data.running) {
-          dot.className = 'inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
-          text.innerText = 'RUNNING (' + data.mode.toUpperCase() + ')';
-          text.className = 'font-semibold text-emerald-400';
-          btnToggleText.innerText = 'Stop Bot';
-          btnToggleIcon.className = 'fa-solid fa-stop';
-          btnToggle.className = 'px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5';
+          if (dot) dot.className = 'inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+          if (text) {
+            text.innerText = 'RUNNING (' + data.mode.toUpperCase() + ')';
+            text.className = 'font-semibold text-emerald-400';
+          }
+          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+          if (textMob) {
+            textMob.innerText = 'RUNNING';
+            textMob.className = 'font-semibold text-emerald-400';
+          }
+
+          if (btnToggleText) btnToggleText.innerText = 'Stop Bot';
+          if (btnToggleIcon) btnToggleIcon.className = 'fa-solid fa-stop';
+          if (btnToggle) btnToggle.className = 'px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5';
+
+          if (btnToggleTextMob) btnToggleTextMob.innerText = 'Stop';
+          if (btnToggleIconMob) btnToggleIconMob.className = 'fa-solid fa-stop text-[10px]';
+          if (btnToggleMob) btnToggleMob.className = 'px-2.5 py-1.5 bg-amber-600 active:bg-amber-700 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1';
+
+          if (bottomBtnText) { bottomBtnText.innerText = 'Stop'; bottomBtnText.className = 'text-[10px] font-semibold mt-0.5 text-amber-400'; }
+          if (bottomBtnIcon) { bottomBtnIcon.className = 'fa-solid fa-stop text-amber-400 text-base'; }
         } else {
-          dot.className = 'inline-block w-2 h-2 rounded-full bg-slate-500';
-          text.innerText = data.kill_file_exists ? 'HALTED (KILL SWITCH)' : 'IDLE';
-          text.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
-          btnToggleText.innerText = 'Start Bot';
-          btnToggleIcon.className = 'fa-solid fa-play';
-          btnToggle.className = 'px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5';
+          if (dot) dot.className = 'inline-block w-2 h-2 rounded-full bg-slate-500';
+          if (text) {
+            text.innerText = data.kill_file_exists ? 'HALTED (KILL SWITCH)' : 'IDLE';
+            text.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+          }
+          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full ' + (data.kill_file_exists ? 'bg-red-500' : 'bg-slate-500');
+          if (textMob) {
+            textMob.innerText = data.kill_file_exists ? 'HALTED' : 'IDLE';
+            textMob.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+          }
+
+          if (btnToggleText) btnToggleText.innerText = 'Start Bot';
+          if (btnToggleIcon) btnToggleIcon.className = 'fa-solid fa-play';
+          if (btnToggle) btnToggle.className = 'px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center gap-1.5';
+
+          if (btnToggleTextMob) btnToggleTextMob.innerText = 'Start';
+          if (btnToggleIconMob) btnToggleIconMob.className = 'fa-solid fa-play text-[10px]';
+          if (btnToggleMob) btnToggleMob.className = 'px-2.5 py-1.5 bg-emerald-600 active:bg-emerald-700 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1';
+
+          if (bottomBtnText) { bottomBtnText.innerText = 'Start'; bottomBtnText.className = 'text-[10px] font-semibold mt-0.5 text-slate-300'; }
+          if (bottomBtnIcon) { bottomBtnIcon.className = 'fa-solid fa-play text-emerald-400 text-base'; }
         }
 
         document.getElementById('val-equity').innerText = '$' + data.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
@@ -3296,18 +3561,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/api/auth/email-settings');
         const data = await res.json();
-        const dot = document.getElementById('email-status-dot');
-        if (dot) {
-          if (data.is_configured) {
-            if (data.can_send_to_all_users) {
-              dot.className = 'w-2 h-2 rounded-full bg-emerald-400 inline-block';
-            } else {
-              dot.className = 'w-2 h-2 rounded-full bg-amber-400 inline-block animate-pulse';
-            }
-          } else {
-            dot.className = 'w-2 h-2 rounded-full bg-rose-500 inline-block animate-pulse';
-          }
+        let cls = 'w-2 h-2 rounded-full bg-rose-500 inline-block animate-pulse';
+        if (data.is_configured) {
+          cls = data.can_send_to_all_users
+            ? 'w-2 h-2 rounded-full bg-emerald-400 inline-block'
+            : 'w-2 h-2 rounded-full bg-amber-400 inline-block animate-pulse';
         }
+        ['email-status-dot', 'email-status-dot-mobile', 'email-status-dot-bottom'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.className = cls;
+        });
       } catch (e) {
         console.error('Error checking email status:', e);
       }
