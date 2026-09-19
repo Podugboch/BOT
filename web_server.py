@@ -2864,7 +2864,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     async function confirmDeleteAccount() {
-      if (!confirm('⚠️ Permanently delete your registered account, active sessions, and saved exchange keys?\n\nThis cannot be undone. Click OK to delete.')) return;
+      if (!confirm('⚠️ Permanently delete your registered account, active sessions, and saved exchange keys?\\\\n\\\\nThis cannot be undone. Click OK to delete.')) return;
       const token = localStorage.getItem('bot_auth_token');
       if (!token) return;
       try {
