@@ -946,7 +946,7 @@ class AuthService:
         temp_token = secrets.token_urlsafe(32)
 
         if auto_activate is None:
-            auto_activate = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("AUTO_ACTIVATE", "").lower() == "true")
+            auto_activate = bool(os.getenv("AUTO_ACTIVATE", "").lower() == "true")
 
         initial_active = 1 if auto_activate else 0
 

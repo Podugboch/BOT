@@ -1194,7 +1194,12 @@ def activate_page(token: str = Query(...)):
         <script>
           try {{
             localStorage.setItem('bot_auth_token', '{session_token}');
-            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=604800; SameSite=Lax; Secure";
+            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+            localStorage.setItem('bot_saved_account', JSON.stringify({{
+              username: '{res.get("username", "")}',
+              email: '{res.get("email", "")}',
+              token: '{session_token}'
+            }}));
           }} catch (e) {{}}
 
           let count = 3;
@@ -1491,19 +1496,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <i class="fa-solid fa-skull-crossbones"></i>
           </button>
 
-          <!-- Bot Settings Button -->
-          <button type="button" onclick="openSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
-            <i class="fa-solid fa-gear text-amber-400"></i>
-            <span>Settings</span>
-          </button>
-
-          <!-- Email Settings Button -->
-          <button type="button" onclick="openEmailSettingsModal()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-bordercol font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Email & Verification Credentials">
-            <span id="email-status-dot" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
-            <i class="fa-solid fa-envelope text-sky-400"></i>
-            <span>Email</span>
-          </button>
-
           <!-- Auth User Menu Button -->
           <div id="auth-buttons" class="flex items-center gap-2">
             <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
@@ -1549,19 +1541,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button onclick="triggerKillSwitch()" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center justify-center gap-2">
             <i class="fa-solid fa-skull-crossbones"></i>
             <span>Emergency Kill Switch</span>
-          </button>
-        </div>
-
-        <!-- Settings & Email Shortcut Buttons -->
-        <div class="grid grid-cols-2 gap-2">
-          <button type="button" onclick="openSettingsModal(); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
-            <i class="fa-solid fa-gear text-amber-400"></i>
-            <span>Bot Settings</span>
-          </button>
-          <button type="button" onclick="openEmailSettingsModal(); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
-            <span id="email-status-dot-mobile" class="w-2 h-2 rounded-full bg-slate-500 inline-block"></span>
-            <i class="fa-solid fa-envelope text-sky-400"></i>
-            <span>Email & SMTP</span>
           </button>
         </div>
 
