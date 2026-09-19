@@ -532,6 +532,52 @@ class TestAuthRegistrationFlow:
         assert remote_delete_account(10, "remote_user", "remote@test.com")
         assert remote_get_user("remote_user") is None
 
+    def test_storage_adapter_mock_blob(self, monkeypatch):
+        from storage_adapter import (
+            remote_save_user,
+            remote_get_user,
+            remote_save_exchange_key,
+            remote_get_exchange_keys,
+            remote_delete_account,
+            remote_delete_all_accounts,
+            get_remote_storage_type
+        )
+        fake_blob = {}
+
+        def mock_blob_put(pathname, data_bytes, content_type="application/json"):
+            fake_blob[pathname] = data_bytes
+            return True
+
+        def mock_blob_get(pathname):
+            return fake_blob.get(pathname)
+
+        def mock_blob_del(pathname):
+            fake_blob.pop(pathname, None)
+            return True
+
+        monkeypatch.setattr("storage_adapter.KV_URL", "")
+        monkeypatch.setattr("storage_adapter.KV_TOKEN", "")
+        monkeypatch.setattr("storage_adapter.BLOB_TOKEN", "mock_blob_token_123")
+        monkeypatch.setattr("storage_adapter.BLOB_STORE_ID", "store_mock123")
+        monkeypatch.setattr("storage_adapter._blob_put", mock_blob_put)
+        monkeypatch.setattr("storage_adapter._blob_get", mock_blob_get)
+        monkeypatch.setattr("storage_adapter._blob_del", mock_blob_del)
+
+        assert get_remote_storage_type() == "blob"
+        assert remote_save_user(55, "blobby", "blobby@test.com", "h456", "s456", is_active=1)
+        u = remote_get_user("blobby")
+        assert u is not None
+        assert u["email"] == "blobby@test.com"
+        assert remote_get_user("blobby@test.com")["username"] == "blobby"
+
+        assert remote_save_exchange_key(55, "bybit", "enc_k", "enc_s")
+        keys = remote_get_exchange_keys(55)
+        assert len(keys) == 1
+        assert keys[0]["exchange_id"] == "bybit"
+
+        assert remote_delete_account(55, "blobby", "blobby@test.com")
+        assert remote_get_user("blobby") is None
+
 
 class TestSecretEncryptionAndVault:
     def test_fernet_encrypt_decrypt(self):

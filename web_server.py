@@ -2680,8 +2680,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('form-login').classList.remove('hidden');
       } else if (mode === 'register') {
         document.getElementById('modal-title').innerText = 'Create Account';
-        document.getElementById('modal-subtitle').innerText = 'Register an account. An email verification link will be sent.';
+        document.getElementById('modal-subtitle').innerText = 'Register for instant, persistent access across all devices.';
         document.getElementById('form-register').classList.remove('hidden');
+        const lUser = document.getElementById('login-user') ? document.getElementById('login-user').value.trim() : '';
+        if (lUser) {
+          if (lUser.includes('@')) {
+            const regEmail = document.getElementById('reg-email');
+            if (regEmail && !regEmail.value) regEmail.value = lUser;
+          } else {
+            const regUser = document.getElementById('reg-user');
+            if (regUser && !regUser.value) regUser.value = lUser;
+          }
+        }
       } else if (mode === 'forgot') {
         document.getElementById('modal-title').innerText = 'Reset Password';
         document.getElementById('modal-subtitle').innerText = 'Enter your email to receive a password reset message.';
@@ -2690,6 +2700,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('modal-title').innerText = 'Resend Verification Link';
         document.getElementById('modal-subtitle').innerText = 'Enter your registered email address to receive a new verification link.';
         if (fResend) fResend.classList.remove('hidden');
+      }
+    }
+
+    function switchToRegister(prefillUser) {
+      openAuthModal('register');
+      if (prefillUser) {
+        if (prefillUser.includes('@')) {
+          const regEmail = document.getElementById('reg-email');
+          if (regEmail) regEmail.value = prefillUser;
+        } else {
+          const regUser = document.getElementById('reg-user');
+          if (regUser) regUser.value = prefillUser;
+        }
       }
     }
 
@@ -2833,14 +2856,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             notice.innerHTML = `
               <div class="flex items-center gap-2 font-bold text-amber-400">
                 <i class="fa-solid fa-triangle-exclamation text-base"></i>
-                <span>Account Not Recognized On This Server</span>
+                <span>Account Not Found</span>
               </div>
               <p class="text-slate-300 leading-relaxed mt-1">
-                Unable to locate credentials for <strong>${user}</strong>. You can sign in immediately using a 1-Click Instant Login Link sent to your email:
+                Unable to locate credentials for <strong>${user}</strong>. If you haven't registered on this deployment yet, create your account in seconds:
               </p>
               <div class="pt-2 flex flex-col gap-2">
-                <button type="button" id="btn-magic-notfound" onclick="handleSendMagicLink('${data.email || user}', 'btn-magic-notfound')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
-                  <i class="fa-solid fa-wand-magic-sparkles text-xs"></i> Email 1-Click Instant Sign-In Link
+                <button type="button" onclick="switchToRegister('${user.replace(/'/g, "\\'")}')" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-user-plus text-xs"></i> Register "${user}" Now (Instant Access)
+                </button>
+                <div class="flex items-center gap-2 my-0.5">
+                  <div class="h-px flex-1 bg-slate-700"></div>
+                  <span class="text-[10px] text-slate-400">OR SIGN IN VIA EMAIL</span>
+                  <div class="h-px flex-1 bg-slate-700"></div>
+                </div>
+                <button type="button" id="btn-magic-notfound" onclick="handleSendMagicLink('${data.email || (user.includes('@') ? user : '')}', 'btn-magic-notfound')" class="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-wand-magic-sparkles text-amber-400 text-xs"></i> Email 1-Click Instant Sign-In Link
                 </button>
               </div>
             `;
@@ -2864,7 +2895,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
       if (!email || !email.includes('@')) {
-        alert('A valid email address is required to send a sign-in link.');
         return;
       }
 

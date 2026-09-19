@@ -13,3 +13,4 @@ BOT.zip
 .vercel
 .secret_key
 *.key
+.env*
