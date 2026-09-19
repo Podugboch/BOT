@@ -48,6 +48,16 @@ def get_remote_storage_type() -> str:
 # Vercel Blob Client Helpers
 # ---------------------------------------------------------------------------
 def _get_blob_store_id() -> str:
+    """
+    Derives the Vercel Blob store id from BLOB_STORE_ID, or parses it out of
+    BLOB_READ_WRITE_TOKEN (format: vercel_blob_rw_<storeid>_<random>).
+
+    No hardcoded fallback id here on purpose: guessing a store id wrong means
+    either silently failing against a store that isn't yours, or -- worse --
+    silently succeeding against one that is, but isn't the one you meant to
+    use. Fail loudly instead so a misconfiguration is obvious immediately,
+    not discovered later as "why is my data missing".
+    """
     global BLOB_STORE_ID
     if BLOB_STORE_ID:
         return BLOB_STORE_ID.replace("store_", "").lower()
@@ -55,7 +65,11 @@ def _get_blob_store_id() -> str:
         parts = BLOB_TOKEN.split("_")
         if len(parts) >= 4:
             return parts[3].lower()
-    return "cb633j7qmvxtvyhr"
+    raise RuntimeError(
+        "Could not determine the Vercel Blob store id. Set BLOB_STORE_ID "
+        "explicitly, or check that BLOB_READ_WRITE_TOKEN is the token Vercel "
+        "gives you (format: vercel_blob_rw_<storeid>_<random>)."
+    )
 
 
 def _blob_put(pathname: str, data_bytes: bytes, content_type: str = "application/json") -> bool:
@@ -88,6 +102,10 @@ def _blob_get(pathname: str) -> Optional[bytes]:
         return None
     try:
         store_id = _get_blob_store_id()
+    except RuntimeError as e:
+        print(f"[BLOB GET WARNING] {e}")
+        return None
+    try:
         url = f"https://{store_id}.private.blob.vercel-storage.com/{pathname}?cache=0"
         req = urllib.request.Request(
             url,
@@ -115,6 +133,10 @@ def _blob_del(pathname: str) -> bool:
         return False
     try:
         store_id = _get_blob_store_id()
+    except RuntimeError as e:
+        print(f"[BLOB DEL WARNING] {e}")
+        return False
+    try:
         blob_url = f"https://{store_id}.private.blob.vercel-storage.com/{pathname}"
         del_url = "https://blob.vercel-storage.com/delete"
         del_data = json.dumps({"urls": [blob_url]}).encode("utf-8")
@@ -211,7 +233,6 @@ def remote_save_user(
         _blob_put(f"users/by_email/{e_clean}.json", rec_bytes)
         _blob_put(f"users/by_id/{user_id}.json", rec_bytes)
 
-        # Update index
         try:
             index_raw = _blob_get("users/index.json")
             index = json.loads(index_raw.decode("utf-8")) if index_raw else {"usernames": [], "emails": [], "ids": []}
@@ -236,7 +257,6 @@ def remote_get_user(val: str) -> Optional[Dict[str, Any]]:
 
     val_str = str(val).strip().lower()
 
-    # 1. KV / Upstash
     if KV_URL and KV_TOKEN:
         if "@" in val_str:
             raw = _kv_command("GET", f"user:by_email:{val_str}")
@@ -258,7 +278,6 @@ def remote_get_user(val: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
 
-    # 2. Vercel Blob
     if BLOB_TOKEN:
         raw_bytes = None
         if "@" in val_str:
