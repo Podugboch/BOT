@@ -26,90 +26,79 @@ SENSITIVE_ENV_KEYS: Set[str] = {
 }
 
 
-def is_production() -> bool:
-    """Checks whether the application is configured to run in production / live mode."""
-    env_name = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or os.getenv("BOT_ENV") or "").strip().lower()
-    mode = (os.getenv("MODE") or "").strip().lower()
-    return env_name in {"production", "prod"} or mode == "live"
+def _is_serverless() -> bool:
+    return bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 
 
 def get_master_key() -> bytes:
     """
-    Retrieves or generates the master symmetric encryption key.
-    Checks environment variable BOT_SECRET_KEY / SECRET_KEY / APP_SECRET_KEY first.
-    In production/live mode, fails fast if an externally managed key is not provided.
-    In non-production environments, securely loads or generates a key file with 0600 permissions.
+    Retrieves the master symmetric encryption key. There is NO safe default for
+    this value — every fallback here either reads an explicit secret the
+    operator configured, or raises. A silent, guessable, or code-embedded
+    fallback would let anyone who can read this source code (e.g. on a public
+    repo) decrypt every stored exchange API credential.
+
+    Resolution order:
+      1. BOT_SECRET_KEY / SECRET_KEY / APP_SECRET_KEY env var (any of these —
+         a real Fernet key, or any passphrase, which gets deterministically
+         stretched into one).
+      2. A local key file with 0600 permissions (non-serverless only — the
+         serverless filesystem doesn't persist, so a generated-and-forgotten
+         file there would silently rotate the key on every cold start and
+         make old ciphertext permanently undecryptable).
+      3. Nothing configured -> raise. This is correct in every environment,
+         not just a "production" flag someone forgot to set (Vercel doesn't
+         set ENVIRONMENT/ENV/BOT_ENV/MODE by default, so a flag-gated check
+         here would silently never fire on a real Vercel deploy).
     """
-    # 1. Check environment variable
+    # 1. Explicit operator-supplied key/passphrase.
     env_key = os.getenv("BOT_SECRET_KEY") or os.getenv("SECRET_KEY") or os.getenv("APP_SECRET_KEY")
     if env_key:
         raw = env_key.strip().encode("utf-8")
         try:
-            Fernet(raw)
+            Fernet(raw)  # already a valid Fernet key
             return raw
         except Exception:
-            # Derive deterministic 32-byte urlsafe base64 key from arbitrary passphrase
+            # Not a valid Fernet key as-is — deterministically stretch whatever
+            # passphrase was given into one, so any reasonably long random
+            # value works, not just output from Fernet.generate_key().
             import base64
             import hashlib
             return base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
 
-    # 2. Production fail-fast requirement
-    if is_production():
-        raise RuntimeError(
-            "Production / Live mode requires an externally managed master encryption key. "
-            "Please set the BOT_SECRET_KEY or SECRET_KEY environment variable."
-        )
+    # 2. Local key file — never on serverless, where it can't persist anyway.
+    if not _is_serverless():
+        key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
+        if key_path.exists():
+            try:
+                key_data = key_path.read_bytes().strip()
+                Fernet(key_data)
+                return key_data
+            except Exception:
+                pass  # corrupt/invalid file — fall through to generation below
 
-    # 3. Check local key file (if not serverless)
-    is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
-    key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
-    if not is_serverless and key_path.exists():
+        new_key = Fernet.generate_key()
         try:
-            key_data = key_path.read_bytes().strip()
-            Fernet(key_data)
-            return key_data
-        except Exception:
-            pass
-
-    # 4. In serverless or container environments, derive deterministically from platform secret or stable fallback
-    # so that all serverless containers share the exact same encryption & signing key
-    if is_serverless:
-        platform_secret = (
-            os.getenv("BOT_SECRET_KEY") or
-            os.getenv("SECRET_KEY") or
-            os.getenv("RESEND_API_KEY") or
-            os.getenv("BREVO_API_KEY") or
-            os.getenv("SENDGRID_API_KEY") or
-            os.getenv("SMTP_PASS") or
-            os.getenv("KV_REST_API_TOKEN") or
-            os.getenv("TURSO_AUTH_TOKEN") or
-            "traderqueen_production_vault_stable_key_salt_2026_deterministic"
-        ).strip()
-        import base64
-        import hashlib
-        import hmac
-        derived = hmac.new(b"crypto_trading_bot_master_salt_v1", platform_secret.encode("utf-8"), hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(derived)
-
-    # 5. Generate new key and save with restricted 0600 permissions (for local persistent servers)
-    new_key = Fernet.generate_key()
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        mode = stat.S_IRUSR | stat.S_IWUSR  # 0600 (read/write only by owner)
-        fd = os.open(str(key_path), flags, mode)
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_key)
-    except Exception:
-        # Fallback for serverless or read-only filesystem environments
-        tmp_key = Path("/tmp/.bot_secret_key")
-        try:
-            if not tmp_key.exists():
-                tmp_key.write_bytes(new_key)
-            return tmp_key.read_bytes().strip()
-        except Exception:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            mode = stat.S_IRUSR | stat.S_IWUSR  # 0600 — owner read/write only
+            fd = os.open(str(key_path), flags, mode)
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_key)
             return new_key
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not create or read a local encryption key at {key_path}: {e}. "
+                "Set BOT_SECRET_KEY explicitly instead."
+            ) from e
 
-    return new_key
+    # 3. Serverless with nothing configured: no safe default exists. Fail loudly.
+    raise RuntimeError(
+        "No master encryption key configured. Set the BOT_SECRET_KEY environment "
+        "variable (generate one with `python generate_keys.py`) before starting "
+        "the app. There is no safe fallback for this value — silently deriving "
+        "one from another secret, or from a constant, would let anyone who can "
+        "read this source decrypt every stored exchange API credential."
+    )
 
 
 _FERNET_INSTANCE: Optional[Fernet] = None
@@ -195,7 +184,6 @@ def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = Fals
         values = dotenv_values(str(target))
         for k, v in values.items():
             if not k or k in SENSITIVE_ENV_KEYS:
-                # NEVER load sensitive keys from .env into os.environ
                 continue
             if v is not None:
                 if override or k not in os.environ:
@@ -214,8 +202,7 @@ def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = Fals
         except Exception:
             pass
 
-    # Ensure sensitive credentials loaded from .env are never in os.environ
-    if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
+    if not _is_serverless():
         for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
             os.environ.pop(k, None)
 
@@ -234,7 +221,7 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
       - Writes the sanitized .env through an atomic temporary file and rename.
     """
     target = env_file_path or Path(".env")
-    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+    if _is_serverless():
         return False
 
     if not target.exists() or not target.is_file():
@@ -263,13 +250,11 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
 
     from auth import AuthService, set_system_setting, get_db_connection
 
-    # Single database transaction with rollback on failure
     conn = get_db_connection()
     try:
         conn.execute("BEGIN TRANSACTION")
         cur = conn.cursor()
 
-        # 1. Exchange keys migration
         ex_key = env_vars.get("EXCHANGE_API_KEY")
         ex_sec = env_vars.get("EXCHANGE_API_SECRET")
         ex_pass = env_vars.get("EXCHANGE_API_PASSPHRASE", "")
@@ -284,13 +269,11 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
                 testnet_val = os.getenv("TESTNET", "true").lower() == "true"
                 AuthService.save_exchange_key(user_id, ex_id, ex_key, ex_sec, ex_pass, testnet_val, conn=conn)
 
-        # 2. Sensitive email settings migration
         email_keys = ["SMTP_PASS", "RESEND_API_KEY", "BREVO_API_KEY", "SENDGRID_API_KEY"]
         for ek in email_keys:
             if ek in env_vars:
                 set_system_setting(ek, env_vars[ek], conn=conn)
 
-        # 3. VERIFY DIRECTLY FROM DATABASE (NOT VIA os.environ fallback!)
         if ex_key and ex_sec:
             cur.execute("SELECT api_key, api_secret, api_passphrase FROM exchange_keys ORDER BY id DESC LIMIT 1")
             ex_row = cur.fetchone()
@@ -311,16 +294,13 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
                 if dec_val != env_vars[ek]:
                     raise RuntimeError(f"Verification failed: decrypted setting {ek} does not match source value")
 
-        # Everything is written and verified in the database! Commit the transaction!
         conn.commit()
     except Exception as e:
-        # Roll back all database changes on ANY failure
         try:
             conn.rollback()
         except Exception:
             pass
         print(f"[SECURITY ERROR] Atomic migration failed, database rolled back, .env left intact: {e}")
-        # Leave .env COMPLETELY INTACT!
         return False
     finally:
         try:
@@ -328,7 +308,6 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
         except Exception:
             pass
 
-    # 4. Write sanitized .env through atomic temporary file + rename
     try:
         new_lines = []
         for line in lines:
@@ -345,7 +324,7 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
         temp_file = target.with_name(f".{target.name}.tmp.{os.getpid()}")
         try:
             temp_file.write_text("".join(new_lines))
-            temp_file.replace(target)  # Atomic rename on POSIX
+            temp_file.replace(target)
         except Exception as write_err:
             if temp_file.exists():
                 try:
@@ -357,12 +336,10 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
         print(f"[SECURITY ERROR] Failed to write sanitized .env atomically: {e}")
         return False
 
-    # 5. Remove sensitive credentials from runtime process memory (os.environ)
     for k in SENSITIVE_ENV_KEYS:
         os.environ.pop(k, None)
 
     return True
 
 
-# Backwards-compatible alias
 sanitize_env_file = migrate_and_sanitize_env_file
