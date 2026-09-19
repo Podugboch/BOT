@@ -46,18 +46,16 @@ from storage_adapter import (
 safe_load_dotenv()
 
 
-def generate_activation_token(user_id: int, username: str, email: str, password_hash: str, salt: str, expires_hours: int = 24) -> str:
-    """Generates a tamper-proof cryptographically signed activation token containing user state."""
+def generate_activation_token(user_id: int, username: str, email: str, *args, expires_hours: int = 24, **kwargs) -> str:
+    """Generates a tamper-proof cryptographically signed activation token."""
     exp = int((datetime.now(timezone.utc) + timedelta(hours=expires_hours)).timestamp())
     payload = {
         "act": "activate",
         "uid": user_id,
         "u": username,
         "e": email,
-        "h": password_hash,
-        "s": salt,
         "exp": exp,
-        "nonce": secrets.token_hex(8)
+        "nonce": secrets.token_hex(16)
     }
     raw = json.dumps(payload).encode("utf-8")
     f = Fernet(get_master_key())
@@ -76,7 +74,7 @@ def verify_activation_token(token: str) -> Optional[Dict[str, Any]]:
             pass
     try:
         f = Fernet(get_master_key())
-        raw = f.decrypt(token.encode("utf-8"), ttl=86400 * 30)
+        raw = f.decrypt(token.encode("utf-8"), ttl=86400)
         data = json.loads(raw.decode("utf-8"))
         if data.get("act") != "activate":
             return None
@@ -89,7 +87,7 @@ def verify_activation_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def create_stateless_session_token(user_id: int, username: str, email: str, password_hash: str = "", salt: str = "", expires_days: int = 30) -> str:
+def create_stateless_session_token(user_id: int, username: str, email: str, *args, expires_days: int = 30, **kwargs) -> str:
     """Generates a tamper-proof cryptographically signed session token for cross-container authentication."""
     exp = int((datetime.now(timezone.utc) + timedelta(days=expires_days)).timestamp())
     payload = {
@@ -97,10 +95,8 @@ def create_stateless_session_token(user_id: int, username: str, email: str, pass
         "uid": user_id,
         "u": username,
         "e": email,
-        "h": password_hash,
-        "s": salt,
         "exp": exp,
-        "nonce": secrets.token_hex(8)
+        "nonce": secrets.token_hex(16)
     }
     raw = json.dumps(payload).encode("utf-8")
     f = Fernet(get_master_key())
@@ -220,8 +216,10 @@ else:
 
 
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -924,8 +922,8 @@ class AuthService:
             return {"success": False, "message": "Username must be at least 3 characters long"}
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             return {"success": False, "message": "Invalid email address format"}
-        if len(password) < 6:
-            return {"success": False, "message": "Password must be at least 6 characters long"}
+        if len(password) < 10:
+            return {"success": False, "message": "Password must be at least 10 characters long"}
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -957,12 +955,12 @@ class AuthService:
         user_id = cur.lastrowid
 
         # Generate cryptographically signed self-sovereign token containing user state
-        activation_token = generate_activation_token(user_id, username, email, password_hash, salt, expires_hours=24)
+        activation_token = generate_activation_token(user_id, username, email, expires_hours=24)
         cur.execute("UPDATE users SET activation_token = ? WHERE id = ?", (activation_token, user_id))
         conn.commit()
         conn.close()
 
-        session_token = create_stateless_session_token(user_id, username, email, password_hash, salt)
+        session_token = create_stateless_session_token(user_id, username, email)
 
         # Persist user in remote store if available
         remote_save_user(user_id, username, email, password_hash, salt, is_active=initial_active, created_at=created_at)
@@ -1024,7 +1022,7 @@ class AuthService:
         user = cur.fetchone()
 
         if user:
-            session_token = create_stateless_session_token(user["id"], user["username"], user["email"], user["password_hash"], user["salt"])
+            session_token = create_stateless_session_token(user["id"], user["username"], user["email"])
             if user["is_active"] == 1:
                 conn.close()
                 return {
@@ -1069,30 +1067,24 @@ class AuthService:
             data = token_info["data"]
             username = data["u"]
             email = data["e"]
-            pwd_hash = data["h"]
-            salt = data["s"]
             uid = data.get("uid", 1)
 
-            cur.execute("SELECT id, username, email, is_active FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?",
-                        (username.lower(), email.lower()))
-            existing = cur.fetchone()
-            if existing:
-                user_id = existing["id"]
-                cur.execute("UPDATE users SET is_active = 1, password_hash = ?, salt = ?, activation_token = NULL WHERE id = ?", (pwd_hash, salt, user_id))
-            else:
-                created_at = datetime.now(timezone.utc).isoformat()
+            cur.execute("UPDATE users SET is_active = 1, activation_token = NULL, activation_expires_at = NULL WHERE id = ? OR LOWER(email) = ?",
+                        (uid, email.lower()))
+            if cur.rowcount == 0:
+                remote_u = remote_get_user(username) or remote_get_user(email)
+                pw_hash = remote_u.get("password_hash", "") if remote_u else ""
+                salt = remote_u.get("salt", "") if remote_u else ""
+                created_at = remote_u.get("created_at", datetime.now(timezone.utc).isoformat()) if remote_u else datetime.now(timezone.utc).isoformat()
                 cur.execute("""
-                    INSERT INTO users (id, username, email, password_hash, salt, is_active, activation_token, activation_expires_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, 1, NULL, NULL, ?)
-                    ON CONFLICT(id) DO UPDATE SET is_active = 1, password_hash = excluded.password_hash, salt = excluded.salt, activation_token = NULL
-                """, (uid, username, email, pwd_hash, salt, created_at))
-                user_id = uid
-
+                    INSERT OR REPLACE INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?)
+                """, (uid, username, email, pw_hash, salt, created_at))
             conn.commit()
             conn.close()
 
-            session_token = create_stateless_session_token(user_id, username, email, pwd_hash, salt)
-            remote_save_user(user_id, username, email, pwd_hash, salt, is_active=1)
+            session_token = create_stateless_session_token(uid, username, email)
+            remote_save_user(uid, username, email, "", "", is_active=1)
 
             return {
                 "success": True,
@@ -1148,7 +1140,7 @@ class AuthService:
             conn.close()
             return {"success": False, "already_active": True, "message": "Account is already activated. Please sign in."}
 
-        activation_token = generate_activation_token(user["id"], user["username"], user["email"], user["password_hash"], user["salt"], expires_hours=24)
+        activation_token = generate_activation_token(user["id"], user["username"], user["email"], expires_hours=24)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
 
         cur.execute("UPDATE users SET activation_token = ?, activation_expires_at = ? WHERE id = ?",
@@ -1216,29 +1208,6 @@ class AuthService:
                 except Exception as e:
                     print(f"[AUTH WARNING] Failed caching remote user into local DB: {e}")
 
-        # If user not found in local DB, attempt client-token rehydration
-        if not user and client_token:
-            token_data = verify_stateless_session_token(client_token)
-            if token_data:
-                t_u = token_data.get("u", "")
-                t_e = token_data.get("e", "")
-                t_h = token_data.get("h", "")
-                t_s = token_data.get("s", "")
-                if (t_u.lower() == val or t_e.lower() == val) and t_h and t_s:
-                    if verify_password(password, t_h, t_s):
-                        uid = token_data.get("uid", 1)
-                        try:
-                            cur.execute("""
-                                INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
-                                VALUES (?, ?, ?, ?, ?, 1, ?)
-                                ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash, salt = excluded.salt, is_active = 1
-                            """, (uid, t_u, t_e, t_h, t_s, datetime.now(timezone.utc).isoformat()))
-                            conn.commit()
-                            cur.execute("SELECT * FROM users WHERE id = ?", (uid,))
-                            user = cur.fetchone()
-                        except Exception as e:
-                            print(f"[AUTH WARNING] Client-token rehydration failed: {e}")
-
         if not user:
             conn.close()
             return {
@@ -1261,7 +1230,7 @@ class AuthService:
                 "message": "Your account is not activated yet. Please check your email for the activation link."
             }
 
-        session_token = create_stateless_session_token(user["id"], user["username"], user["email"], user["password_hash"], user["salt"])
+        session_token = create_stateless_session_token(user["id"], user["username"], user["email"])
         created_at = datetime.now(timezone.utc).isoformat()
         expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
@@ -1289,18 +1258,17 @@ class AuthService:
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             return {"success": False, "message": "Invalid email address format"}
 
-        # Look up username if account exists
-        username = email.split("@")[0]
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT username FROM users WHERE LOWER(email) = ?", (email,))
-            row = cur.fetchone()
-            if row:
-                username = row["username"]
-            conn.close()
-        except Exception:
-            pass
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, username FROM users WHERE LOWER(email) = ?", (email,))
+        user = cur.fetchone()
+        conn.close()
+
+        # Do not generate login tokens for non-existent users
+        if not user:
+            return {"success": True, "message": "If an account with that email exists, a sign-in link has been sent."}
+
+        username = user["username"]
 
         magic_token = generate_magic_login_token(email, username=username, expires_hours=2)
         magic_link = f"{base_url}/magic-login?token={urllib.parse.quote(magic_token)}"
@@ -1347,31 +1315,20 @@ class AuthService:
 
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, username, email, password_hash, salt FROM users WHERE LOWER(email) = ?", (email.lower(),))
+        cur.execute("SELECT id, username, email FROM users WHERE LOWER(email) = ?", (email.lower(),))
         user = cur.fetchone()
 
-        if user:
-            user_id = user["id"]
-            username = user["username"]
-            pwd_hash = user["password_hash"]
-            salt = user["salt"]
-            cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (user_id,))
-            conn.commit()
-        else:
-            pwd_hash, salt = hash_password(secrets.token_hex(16))
-            created_at = datetime.now(timezone.utc).isoformat()
-            cur.execute("""
-                INSERT INTO users (username, email, password_hash, salt, is_active, created_at)
-                VALUES (?, ?, ?, ?, 1, ?)
-            """, (username, email, pwd_hash, salt, created_at))
-            user_id = cur.lastrowid
-            conn.commit()
+        if not user:
+            conn.close()
+            return {"success": False, "message": "No account found for this email address. Please register first."}
 
+        user_id = user["id"]
+        username = user["username"]
+        cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (user_id,))
+        conn.commit()
         conn.close()
 
-        session_token = create_stateless_session_token(user_id, username, email, pwd_hash, salt)
-        remote_save_user(user_id, username, email, pwd_hash, salt, is_active=1)
-
+        session_token = create_stateless_session_token(user_id, username, email)
         return {
             "success": True,
             "message": f"Successfully signed in as {username}!",
@@ -1519,42 +1476,10 @@ class AuthService:
         # 2. Cryptographic stateless token verification (cross-container support)
         data = verify_stateless_session_token(session_token)
         if data:
-            uid = data.get("uid", 1)
-            username = data.get("u")
-            email = data.get("e")
-            h = data.get("h") or "stateless_placeholder"
-            s = data.get("s") or "stateless_salt"
-
-            # Ensure user exists in local SQLite for foreign key references and warm cache
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("SELECT id, password_hash FROM users WHERE id = ? OR LOWER(username) = ? OR LOWER(email) = ?",
-                            (uid, username.lower(), email.lower()))
-                u_row = cur.fetchone()
-                if not u_row:
-                    cur.execute("""
-                        INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
-                        VALUES (?, ?, ?, ?, ?, 1, ?)
-                        ON CONFLICT(id) DO UPDATE SET
-                            username = excluded.username,
-                            email = excluded.email,
-                            password_hash = CASE WHEN excluded.password_hash != 'stateless_placeholder' THEN excluded.password_hash ELSE users.password_hash END,
-                            salt = CASE WHEN excluded.salt != 'stateless_salt' THEN excluded.salt ELSE users.salt END,
-                            is_active = 1
-                    """, (uid, username, email, h, s, datetime.now(timezone.utc).isoformat()))
-                    conn.commit()
-                elif u_row and h != "stateless_placeholder" and u_row["password_hash"] == "stateless_placeholder":
-                    cur.execute("UPDATE users SET password_hash = ?, salt = ?, is_active = 1 WHERE id = ?", (h, s, u_row["id"]))
-                    conn.commit()
-                conn.close()
-            except Exception:
-                pass
-
             return {
-                "id": uid,
-                "username": username,
-                "email": email
+                "id": data.get("uid"),
+                "username": data.get("u"),
+                "email": data.get("e")
             }
 
         return None
@@ -1639,7 +1564,7 @@ class AuthService:
         result = []
         for r in rows:
             raw_key = decrypt_secret(r["api_key"])
-            key_preview = raw_key[:4] + "***" + raw_key[-4:] if len(raw_key) > 8 else "***"
+            key_preview = f"••••{raw_key[-4:]}" if len(raw_key) >= 4 else "••••"
             has_pass = bool(decrypt_secret(r["api_passphrase"])) if r["api_passphrase"] else False
             result.append({
                 "exchange_id": r["exchange_id"],

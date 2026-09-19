@@ -370,23 +370,27 @@ class TestAuthRegistrationFlow:
     def test_client_token_rehydration_on_cold_container(self, tmp_path, monkeypatch):
         """
         Tests that when a cold container with an empty SQLite database receives a login
-        request with a client_token, it verifies credentials, hydrates the user into SQLite,
+        request, it checks remote storage, verifies credentials, hydrates the user into SQLite,
         and returns a valid session token.
         """
-        from auth import create_stateless_session_token, hash_password
+        from auth import hash_password
         db_cold = tmp_path / "container_login_cold.db"
         monkeypatch.setattr("auth.DB_PATH", db_cold)
         init_auth_db()
 
-        # Generate a valid token with real hash and salt
+        # Generate credentials and mock remote storage
         pwd_hash, salt = hash_password("MySuperPassword123!")
-        client_tok = create_stateless_session_token(
-            user_id=88,
-            username="rehydrate_user",
-            email="rehydrate@market.io",
-            password_hash=pwd_hash,
-            salt=salt
-        )
+        remote_db = {
+            "rehydrate_user": {
+                "id": 88,
+                "username": "rehydrate_user",
+                "email": "rehydrate@market.io",
+                "password_hash": pwd_hash,
+                "salt": salt,
+                "is_active": 1,
+            }
+        }
+        monkeypatch.setattr("auth.remote_get_user", lambda k: remote_db.get(k.lower()) if isinstance(k, str) else None)
 
         # Container has 0 users initially
         conn = sqlite3.connect(str(db_cold))
@@ -394,11 +398,11 @@ class TestAuthRegistrationFlow:
         conn.close()
 
         # Login with wrong password fails
-        fail_res = AuthService.login("rehydrate_user", "WrongPassword!", client_token=client_tok)
+        fail_res = AuthService.login("rehydrate_user", "WrongPassword!")
         assert fail_res["success"] is False
 
         # Login with correct password succeeds and rehydrates
-        succ_res = AuthService.login("rehydrate_user", "MySuperPassword123!", client_token=client_tok)
+        succ_res = AuthService.login("rehydrate_user", "MySuperPassword123!")
         assert succ_res["success"] is True
         assert succ_res["user"]["username"] == "rehydrate_user"
         assert "token" in succ_res
@@ -420,6 +424,15 @@ class TestAuthRegistrationFlow:
         monkeypatch.setattr("auth.DB_PATH", db)
         init_auth_db()
 
+        # Magic login on unregistered user fails
+        from auth import generate_magic_login_token
+        unregistered_tok = generate_magic_login_token("nonexistent@trader.io", username="ghost")
+        assert AuthService.magic_login(unregistered_tok)["success"] is False
+
+        # Register user first
+        reg_res = AuthService.register("magic_user", "magic_user@trader.io", "Pass12345678")
+        assert reg_res["success"] is True
+
         # Request magic login link
         res = AuthService.send_magic_login_link("magic_user@trader.io")
         assert res["success"] is True
@@ -427,10 +440,9 @@ class TestAuthRegistrationFlow:
         # Extract token from dev link if email was mock/unconfigured
         magic_tok = res.get("dev_magic_link", "").split("token=")[-1]
         if not magic_tok:
-            from auth import generate_magic_login_token
             magic_tok = generate_magic_login_token("magic_user@trader.io", username="magic_user")
 
-        # Magic login on empty container
+        # Magic login succeeds
         login_res = AuthService.magic_login(magic_tok)
         assert login_res["success"] is True
         assert login_res["email"] == "magic_user@trader.io"
@@ -631,7 +643,7 @@ class TestSecretEncryptionAndVault:
         assert len(masked_list) == 1
         assert raw_api_key not in masked_list[0]["api_key_masked"]
         assert raw_api_secret not in str(masked_list[0])
-        assert "***" in masked_list[0]["api_key_masked"]
+        assert "••••" in masked_list[0]["api_key_masked"] or "***" in masked_list[0]["api_key_masked"]
 
     def test_email_credentials_encrypted_in_system_settings(self):
         raw_pass = "smtp_super_secret_password_456"

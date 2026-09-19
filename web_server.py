@@ -2078,9 +2078,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <input type="email" id="reg-email" required placeholder="trader@example.com" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-emerald-500">
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Password (min 6 chars)</label>
+          <label class="block text-slate-400 mb-1">Password (min 10 chars)</label>
           <div class="relative">
-            <input type="password" id="reg-pass" required minlength="6" placeholder="Create a strong password" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-emerald-500">
+            <input type="password" id="reg-pass" required minlength="10" placeholder="Create a strong password" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-emerald-500">
             <button type="button" onclick="togglePasswordVisibility('reg-pass', 'reg-pass-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 focus:outline-none cursor-pointer" title="Toggle password visibility" tabindex="-1">
               <i class="fa-solid fa-eye text-xs" id="reg-pass-eye"></i>
             </button>
