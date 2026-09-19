@@ -16,6 +16,9 @@ else:
 ENC_PREFIX = "enc:"
 
 SENSITIVE_ENV_KEYS: Set[str] = {
+    "BOT_SECRET_KEY",
+    "SECRET_KEY",
+    "APP_SECRET_KEY",
     "EXCHANGE_API_KEY",
     "EXCHANGE_API_SECRET",
     "EXCHANGE_API_PASSPHRASE",
@@ -23,6 +26,9 @@ SENSITIVE_ENV_KEYS: Set[str] = {
     "RESEND_API_KEY",
     "BREVO_API_KEY",
     "SENDGRID_API_KEY",
+    "BOT_AUTH_TOKEN",
+    "JWT_SECRET",
+    "COOKIE_SECRET",
 }
 
 
@@ -210,9 +216,9 @@ def safe_load_dotenv(env_file_path: Optional[Path] = None, override: bool = Fals
         except Exception:
             pass
 
-    if not _is_serverless():
-        for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
-            os.environ.pop(k, None)
+    # Sensitive values must never survive in the process environment, regardless of deployment host.
+    for k in SENSITIVE_ENV_KEYS:
+        os.environ.pop(k, None)
 
 
 def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
