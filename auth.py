@@ -1,5 +1,5 @@
 """
-Authentication and User Account Management module for Crypto Trading Bot.
+Authentication and User Account Management module for Trader Queen.
 Provides:
 - SQLite persistence (file or /tmp for serverless Vercel)
 - Secure password hashing with PBKDF2-HMAC-SHA256 and unique salt
@@ -437,7 +437,7 @@ def get_resend_verified_domains(resend_key: str) -> list:
             "https://api.resend.com/domains",
             headers={
                 "Authorization": f"Bearer {resend_key}",
-                "User-Agent": "CryptoTradingBot/2.0"
+                "User-Agent": "TraderQueen/2.0"
             }
         )
         with urllib.request.urlopen(req, timeout=6) as resp:
@@ -484,7 +484,7 @@ def get_email_settings() -> Dict[str, Any]:
         resend_domains = get_resend_verified_domains(resend_key)
         # If user has a verified custom domain on Resend but from_email is unset or still on sandbox, auto-upgrade
         if resend_domains and ("onboarding@resend.dev" in from_email.lower() or not from_email):
-            auto_from = f"Crypto Trading Bot <noreply@{resend_domains[0]}>"
+            auto_from = f"Trader Queen <noreply@{resend_domains[0]}>"
             from_email = auto_from
             set_system_setting("FROM_EMAIL", auto_from)
 
@@ -586,10 +586,10 @@ def _send_via_resend(to_email: str, subject: str, body: str, resend_key: str, fr
     if not sender or "onboarding@resend.dev" in sender.lower():
         verified = get_resend_verified_domains(resend_key)
         if verified:
-            sender = f"Crypto Trading Bot <noreply@{verified[0]}>"
+            sender = f"Trader Queen <noreply@{verified[0]}>"
             set_system_setting("FROM_EMAIL", sender)
         else:
-            sender = "Crypto Trading Bot <onboarding@resend.dev>"
+            sender = "Trader Queen <onboarding@resend.dev>"
 
     try:
         req = urllib.request.Request(
@@ -603,7 +603,7 @@ def _send_via_resend(to_email: str, subject: str, body: str, resend_key: str, fr
             headers={
                 "Authorization": f"Bearer {resend_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "CryptoTradingBot/2.0"
+                "User-Agent": "TraderQueen/2.0"
             }
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -624,7 +624,7 @@ def _send_via_resend(to_email: str, subject: str, body: str, resend_key: str, fr
             err_msg = (
                 "Resend Sandbox Restriction (403): onboarding@resend.dev can only deliver to the Resend account owner. "
                 "To send verification emails to all registering users, please add & verify your custom domain at https://resend.com/domains "
-                "and set FROM_EMAIL to an address on that domain (e.g. Crypto Bot <noreply@yourdomain.com>), or switch to Brevo API or Gmail SMTP."
+                "and set FROM_EMAIL to an address on that domain (e.g. Trader Queen <noreply@yourdomain.com>), or switch to Brevo API or Gmail SMTP."
             )
         else:
             err_msg = f"Resend API error ({e.code}): {detail}"
@@ -640,8 +640,8 @@ def _send_via_brevo(to_email: str, subject: str, body: str, brevo_key: str, from
     if not brevo_key:
         return False, "Brevo API key not configured"
 
-    sender_name = "Crypto Trading Bot"
-    sender_email = from_email or "noreply@cryptobot.local"
+    sender_name = "Trader Queen"
+    sender_email = from_email or "noreply@traderqueen.name.ng"
     if "<" in sender_email and ">" in sender_email:
         sender_name = sender_email.split("<")[0].strip() or sender_name
         sender_email = sender_email.split("<")[1].split(">")[0].strip()
@@ -659,7 +659,7 @@ def _send_via_brevo(to_email: str, subject: str, body: str, brevo_key: str, from
             headers={
                 "api-key": brevo_key,
                 "Content-Type": "application/json",
-                "User-Agent": "CryptoTradingBot/2.0"
+                "User-Agent": "TraderQueen/2.0"
             }
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -688,8 +688,8 @@ def _send_via_sendgrid(to_email: str, subject: str, body: str, sendgrid_key: str
     if not sendgrid_key:
         return False, "SendGrid API key not configured"
 
-    sender_name = "Crypto Trading Bot"
-    sender_email = from_email or "noreply@cryptobot.local"
+    sender_name = "Trader Queen"
+    sender_email = from_email or "noreply@traderqueen.name.ng"
     if "<" in sender_email and ">" in sender_email:
         sender_name = sender_email.split("<")[0].strip() or sender_name
         sender_email = sender_email.split("<")[1].split(">")[0].strip()
@@ -707,7 +707,7 @@ def _send_via_sendgrid(to_email: str, subject: str, body: str, sendgrid_key: str
             headers={
                 "Authorization": f"Bearer {sendgrid_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "CryptoTradingBot/2.0"
+                "User-Agent": "TraderQueen/2.0"
             }
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -821,19 +821,19 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
     candidates = []
 
     def run_brevo():
-        sender = from_email or "Crypto Trading Bot <noreply@cryptobot.local>"
+        sender = from_email or "Trader Queen <noreply@traderqueen.name.ng>"
         return _send_via_brevo(to_email, subject, body, brevo_key, sender, email_type)
 
     def run_sendgrid():
-        sender = from_email or "Crypto Trading Bot <noreply@cryptobot.local>"
+        sender = from_email or "Trader Queen <noreply@traderqueen.name.ng>"
         return _send_via_sendgrid(to_email, subject, body, sendgrid_key, sender, email_type)
 
     def run_resend():
-        sender = from_email or "Crypto Trading Bot <onboarding@resend.dev>"
+        sender = from_email or "Trader Queen <onboarding@resend.dev>"
         return _send_via_resend(to_email, subject, body, resend_key, sender, email_type)
 
     def run_smtp():
-        s_from = from_email or smtp_user or "noreply@cryptobot.local"
+        s_from = from_email or smtp_user or "noreply@traderqueen.name.ng"
         return _send_via_smtp(to_email, subject, body, smtp_host, smtp_port, smtp_user, smtp_pass, s_from, email_type)
 
     # 1. Prioritize active provider
@@ -892,18 +892,18 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
     <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
       <h2 style="color: #22c55e; margin-top: 0;">✓ Email Dispatch Test Successful!</h2>
       <p>Hello,</p>
-      <p>This is a confirmation test email sent from your <strong>Crypto Trading Bot</strong> platform.</p>
+      <p>This is a confirmation test email sent from your <strong>Trader Queen</strong> platform.</p>
       <p>Your email service (<strong>{settings['provider'].upper()}</strong>) is configured and working properly!</p>
       <div style="background: #1e293b; padding: 12px 16px; border-radius: 8px; margin: 20px 0; font-family: monospace; font-size: 12px;">
         Provider: {settings['provider'].upper()}<br>
         Recipient: {to_email}<br>
         Dispatched at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
       </div>
-      <p style="font-size: 12px; color: #64748b; border-top: 1px solid #334155; padding-top: 15px;">Crypto Trading Bot Verification Engine</p>
+      <p style="font-size: 12px; color: #64748b; border-top: 1px solid #334155; padding-top: 15px;">Trader Queen Verification Engine</p>
     </div>
     """
 
-    success, status = send_email_message(to_email, "✓ Crypto Trading Bot - Email Test Confirmation", test_body, test_token, "test")
+    success, status = send_email_message(to_email, "✓ Trader Queen - Email Test Confirmation", test_body, test_token, "test")
     return {
         "success": success,
         "message": status,
@@ -971,9 +971,9 @@ class AuthService:
         activation_link = f"{base_url}/activate?token={urllib.parse.quote(activation_token)}"
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
-          <h2 style="color: #22c55e; margin-top: 0;">{"Welcome to Crypto Trading Bot" if auto_activate else "Activate Your Crypto Trading Bot Account"}</h2>
+          <h2 style="color: #22c55e; margin-top: 0;">{"Welcome to Trader Queen" if auto_activate else "Activate Your Trader Queen Account"}</h2>
           <p>Hello <strong>{username}</strong>,</p>
-          <p>{"Thank you for registering on the Crypto Trading Bot platform! Your account is active and ready to trade." if auto_activate else "Thank you for registering on the Crypto Trading Bot platform. Please click the button below to accept and activate your account:"}</p>
+          <p>{"Thank you for registering on the Trader Queen platform! Your account is active and ready to trade." if auto_activate else "Thank you for registering on the Trader Queen platform. Please click the button below to accept and activate your account:"}</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">{"Open Trading Dashboard" if auto_activate else "Activate Account"}</a>
           </div>
@@ -983,7 +983,7 @@ class AuthService:
         """
         email_sent, email_status = send_email_message(
             email,
-            "Welcome to Crypto Trading Bot (Account Created)" if auto_activate else "Activate Your Crypto Trading Bot Account",
+            "Welcome to Trader Queen (Account Created)" if auto_activate else "Activate Your Trader Queen Account",
             email_body,
             activation_token,
             "activation"
@@ -1161,7 +1161,7 @@ class AuthService:
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Your New Verification Link</h2>
           <p>Hello <strong>{user['username']}</strong>,</p>
-          <p>You requested a new verification link for your Crypto Trading Bot account. Please click the button below to accept and activate your account:</p>
+          <p>You requested a new verification link for your Trader Queen account. Please click the button below to accept and activate your account:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Activate Account</a>
           </div>
@@ -1169,7 +1169,7 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This verification link expires in 24 hours.</p>
         </div>
         """
-        email_sent, email_status = send_email_message(email, "Activate Your Crypto Trading Bot Account (New Verification Link)", email_body, activation_token, "activation")
+        email_sent, email_status = send_email_message(email, "Activate Your Trader Queen Account (New Verification Link)", email_body, activation_token, "activation")
 
         res = {
             "success": True,
@@ -1309,7 +1309,7 @@ class AuthService:
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Instant 1-Click Sign In</h2>
           <p>Hello <strong>{username}</strong>,</p>
-          <p>Click the button below to sign in instantly to your Crypto Trading Bot account on this device:</p>
+          <p>Click the button below to sign in instantly to your Trader Queen account on this device:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{magic_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Sign In Instantly</a>
           </div>
@@ -1317,7 +1317,7 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This instant sign-in link expires in 2 hours.</p>
         </div>
         """
-        email_sent, email_status = send_email_message(email, "Instant 1-Click Sign In - Crypto Trading Bot", email_body, magic_token, "magic_login")
+        email_sent, email_status = send_email_message(email, "Instant 1-Click Sign In - Trader Queen", email_body, magic_token, "magic_login")
 
         res = {
             "success": True,
@@ -1414,7 +1414,7 @@ class AuthService:
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #f59e0b; margin-top: 0;">Reset Your Password</h2>
           <p>Hello <strong>{user['username']}</strong>,</p>
-          <p>We received a request to reset your password for your Crypto Trading Bot account. Click below to set a new password:</p>
+          <p>We received a request to reset your password for your Trader Queen account. Click below to set a new password:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{reset_link}" style="background-color: #d97706; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Reset Password</a>
           </div>
@@ -1422,7 +1422,7 @@ class AuthService:
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">If you did not request this, please ignore this email. This link expires in 2 hours.</p>
         </div>
         """
-        email_sent, email_status = send_email_message(email, "Reset Your Crypto Trading Bot Password", email_body, reset_token, "reset")
+        email_sent, email_status = send_email_message(email, "Reset Your Trader Queen Password", email_body, reset_token, "reset")
 
         res = {
             "success": True,

@@ -1,5 +1,5 @@
 """
-Web Server, Dashboard, and Authentication API for Crypto Trading Bot.
+Web Server, Dashboard, and Authentication API for Trader Queen.
 Features:
 - Full CCXT Exchange API Key management with exchange selector & connectivity tester
 - User registration, login, PBKDF2-HMAC-SHA256 password hashing, sessions
@@ -63,7 +63,7 @@ if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
     for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
         os.environ.pop(k, None)
 
-app = FastAPI(title="Crypto Trading Bot Dashboard & Auth", version="2.0.0")
+app = FastAPI(title="Trader Queen Dashboard & Auth", version="2.0.0")
 
 # Supported popular exchanges with metadata
 EXCHANGES_META = [
@@ -1400,7 +1400,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Crypto Trading Bot - Dashboard & Exchange Keys</title>
+  <title>Trader Queen - Dashboard & Exchange Keys</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <script>
@@ -1466,11 +1466,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Brand & Title -->
         <div class="flex items-center space-x-2.5 sm:space-x-3 min-w-0">
           <div class="h-8 w-8 sm:h-9 sm:w-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold shrink-0">
-            <i class="fa-solid fa-chart-line text-sm sm:text-base"></i>
+            <i class="fa-solid fa-crown text-sm sm:text-base text-amber-400"></i>
           </div>
           <div class="min-w-0">
             <h1 class="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5 sm:gap-2 truncate">
-              <span class="truncate">Crypto Bot</span>
+              <span class="truncate">Trader Queen</span>
               <span id="badge-mode" class="text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">PAPER</span>
             </h1>
             <p class="text-[10px] sm:text-[11px] text-slate-400 truncate hidden xs:block sm:block">EMA Cross + RSI + ADX + Fib Retracement + Risk Layer</p>
@@ -2228,7 +2228,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             Resend's default <code class="bg-slate-800 px-1 py-0.5 rounded text-amber-300">onboarding@resend.dev</code> sender is restricted to <strong>only deliver to the account owner</strong>.
           </p>
           <p class="leading-relaxed">
-            To deliver verification emails to <strong>ALL users creating accounts</strong>, you must add & verify your custom domain at <a href="https://resend.com/domains" target="_blank" class="text-sky-400 underline font-semibold">resend.com/domains</a> and set your verified sender address below (e.g. <code class="bg-slate-800 px-1 py-0.5 rounded text-emerald-300">Crypto Bot &lt;noreply@yourdomain.com&gt;</code>).
+            To deliver verification emails to <strong>ALL users creating accounts</strong>, you must add & verify your custom domain at <a href="https://resend.com/domains" target="_blank" class="text-sky-400 underline font-semibold">resend.com/domains</a> and set your verified sender address below (e.g. <code class="bg-slate-800 px-1 py-0.5 rounded text-emerald-300">Trader Queen &lt;noreply@yourdomain.com&gt;</code>).
           </p>
           <p class="text-slate-400 text-[10px] italic">Don't have a custom domain? Select <strong>Gmail SMTP</strong> or <strong>Brevo API</strong> above to send to all users without domain verification.</p>
         </div>
@@ -2298,7 +2298,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <div>
           <label class="block text-slate-400 mb-1">Sender "From" Email Address</label>
-          <input type="text" id="smtp-input-from" placeholder="Crypto Trading Bot <noreply@yourdomain.com>" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
+          <input type="text" id="smtp-input-from" placeholder="Trader Queen <noreply@yourdomain.com>" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white">
         </div>
 
         <button type="submit" id="btn-save-email-settings" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition flex items-center justify-center gap-1.5">
@@ -3870,7 +3870,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const resendSenderCode = document.getElementById('resend-active-sender-code');
         if (data.verified_domain) {
           if (resendDomainBadge) resendDomainBadge.innerText = data.verified_domain;
-          if (resendSenderCode) resendSenderCode.innerText = data.from_email || `Crypto Trading Bot <noreply@${data.verified_domain}>`;
+          if (resendSenderCode) resendSenderCode.innerText = data.from_email || `Trader Queen <noreply@${data.verified_domain}>`;
         }
 
         // Populate fields
@@ -4096,6 +4096,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
     print(f"\n========================================================")
-    print(f" Crypto Trading Bot Dashboard running on http://localhost:{port}")
+    print(f" Trader Queen Dashboard running on http://localhost:{port}")
     print(f"========================================================\n")
     uvicorn.run("web_server:app", host=host, port=port, reload=False)

@@ -1,4 +1,4 @@
-# Crypto Trading Bot
+# Trader Queen
 
 EMA-crossover trend strategy, filtered by RSI, ADX, and an automatic
 Fibonacci retracement zone, with a full risk layer (position sizing, stops,

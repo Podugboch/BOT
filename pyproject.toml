@@ -1,7 +1,7 @@
 [project]
 name = "bot"
 version = "2.0.0"
-description = "Autonomous Crypto Trading Bot with Strategy, Risk Manager, Web Dashboard, and Exchange Authentication"
+description = "Trader Queen: Autonomous Trading Platform with Strategy, Risk Manager, Web Dashboard, and Exchange Authentication"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100.0",
