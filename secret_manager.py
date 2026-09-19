@@ -66,6 +66,14 @@ def get_master_key() -> bytes:
             import hashlib
             return base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
 
+    is_prod = (
+        os.getenv("ENVIRONMENT", "").lower() in ("production", "prod", "live") or
+        os.getenv("ENV", "").lower() in ("production", "prod", "live") or
+        os.getenv("BOT_ENV", "").lower() in ("production", "prod", "live")
+    )
+    if is_prod:
+        raise RuntimeError("Production / Live mode requires an externally managed master encryption key (BOT_SECRET_KEY, SECRET_KEY, or APP_SECRET_KEY) for persistent zero-loss security.")
+
     # 2. Local key file — never on serverless, where it can't persist anyway.
     if not _is_serverless():
         key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
@@ -264,7 +272,16 @@ def migrate_and_sanitize_env_file(env_file_path: Optional[Path] = None) -> bool:
             if not existing_row:
                 cur.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1")
                 user = cur.fetchone()
-                user_id = user["id"] if user else 1
+                if not user:
+                    from datetime import datetime, timezone
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    cur.execute("""
+                        INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                        VALUES (1, 'system_admin', 'admin@system.local', 'n/a', 'n/a', 1, ?)
+                    """, (now_iso,))
+                    user_id = 1
+                else:
+                    user_id = user["id"]
                 ex_id = os.getenv("EXCHANGE_ID", "mexc")
                 testnet_val = os.getenv("TESTNET", "true").lower() == "true"
                 AuthService.save_exchange_key(user_id, ex_id, ex_key, ex_sec, ex_pass, testnet_val, conn=conn)
