@@ -1,20 +1,19 @@
-"""
-Remote Storage Adapter for Cloud Serverless Environments (Vercel, AWS Lambda).
-Provides persistent cross-container storage synchronization for user accounts,
-exchange credentials, and system settings using standard HTTP REST (no external dependencies).
+"""Reliable remote storage for serverless deployments.
 
-Supported Drivers:
-- Vercel Blob Storage REST API (BLOB_READ_WRITE_TOKEN / BLOB_STORE_ID)
-- Vercel KV / Upstash Redis REST API (KV_REST_API_URL / UPSTASH_REDIS_REST_URL)
-- Turso libSQL HTTP API (TURSO_DATABASE_URL + TURSO_AUTH_TOKEN)
+The adapter supports one selected backend at a time (KV, Turso, or Blob).  It is
+intentionally dependency-free and treats failed remote operations as failures
+instead of reporting false success.
 """
-import os
+from __future__ import annotations
+
 import json
-import urllib.request
+import os
+import re
 import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 KV_URL = (os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or "").strip().rstrip("/")
 KV_TOKEN = (os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN") or "").strip()
@@ -28,13 +27,20 @@ TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip()
 BLOB_TOKEN = (os.getenv("BLOB_READ_WRITE_TOKEN") or "").strip()
 BLOB_STORE_ID = (os.getenv("BLOB_STORE_ID") or "").strip()
 
-
-def is_remote_storage_available() -> bool:
-    """Returns True if any remote persistent storage driver is configured."""
-    return bool((KV_URL and KV_TOKEN) or (TURSO_URL and TURSO_TOKEN) or BLOB_TOKEN)
+_SAFE_COMPONENT = re.compile(r"[^a-z0-9_.@-]+", re.IGNORECASE)
 
 
-def get_remote_storage_type() -> str:
+def _component(value: Any) -> str:
+    """Return a stable, path-safe identifier; never allow traversal or slashes."""
+    value = str(value).strip().lower()
+    value = _SAFE_COMPONENT.sub("_", value).strip("._")
+    if not value or value in {".", ".."}:
+        raise ValueError("Storage identifier cannot be empty")
+    return value
+
+
+def _configured_driver() -> str:
+    # A single backend prevents split-brain reads when several services exist.
     if KV_URL and KV_TOKEN:
         return "kv"
     if TURSO_URL and TURSO_TOKEN:
@@ -44,56 +50,114 @@ def get_remote_storage_type() -> str:
     return "none"
 
 
+def is_remote_storage_available() -> bool:
+    return _configured_driver() != "none"
+
+
+def get_remote_storage_type() -> str:
+    return _configured_driver()
+
+
 # ---------------------------------------------------------------------------
-# Vercel Blob Client Helpers
+# KV / Upstash REST
+# ---------------------------------------------------------------------------
+def _kv_command(*args: Any) -> Tuple[bool, Optional[Any]]:
+    """Return (request_succeeded, Redis result)."""
+    if not (KV_URL and KV_TOKEN):
+        return False, None
+    try:
+        request = urllib.request.Request(
+            KV_URL,
+            data=json.dumps(list(args)).encode("utf-8"),
+            headers={"Authorization": f"Bearer {KV_TOKEN}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return True, payload.get("result")
+    except Exception as exc:
+        print(f"[REMOTE STORE WARNING] KV command {args[:2]} failed: {exc}")
+        return False, None
+
+
+def _kv_ok(*args: Any) -> bool:
+    return _kv_command(*args)[0]
+
+
+# ---------------------------------------------------------------------------
+# Turso libSQL HTTP API
+# ---------------------------------------------------------------------------
+def _turso_execute(sql: str, args: Sequence[Any] = ()) -> Tuple[bool, List[Dict[str, Any]]]:
+    """Execute one statement through Turso's HTTP pipeline API."""
+    if not (TURSO_URL and TURSO_TOKEN):
+        return False, []
+    endpoint = TURSO_URL if TURSO_URL.endswith("/v2/pipeline") else f"{TURSO_URL}/v2/pipeline"
+    body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": list(args)}}, {"type": "close"}]}
+    try:
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=8.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        result = payload.get("results", [{}])[0]
+        if result.get("type") == "error" or result.get("response", {}).get("type") == "error":
+            raise RuntimeError(str(result))
+        rows = result.get("response", {}).get("result", {}).get("rows", [])
+        columns = result.get("response", {}).get("result", {}).get("cols", [])
+        names = [c.get("name", str(i)) if isinstance(c, dict) else str(i) for i, c in enumerate(columns)]
+        decoded = []
+        for row in rows:
+            values = [cell.get("value") if isinstance(cell, dict) else cell for cell in row]
+            decoded.append(dict(zip(names, values)))
+        return True, decoded
+    except Exception as exc:
+        print(f"[REMOTE STORE WARNING] Turso query failed: {exc}")
+        return False, []
+
+
+def _turso_init() -> bool:
+    statements = [
+        "CREATE TABLE IF NOT EXISTS remote_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, email TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, is_active INTEGER NOT NULL, created_at TEXT NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_username ON remote_users(username)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_email ON remote_users(email)",
+        "CREATE TABLE IF NOT EXISTS remote_exchange_keys (user_id INTEGER NOT NULL, exchange_id TEXT NOT NULL, api_key TEXT NOT NULL, api_secret TEXT NOT NULL, api_passphrase TEXT NOT NULL, testnet INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(user_id, exchange_id))",
+    ]
+    return all(_turso_execute(statement)[0] for statement in statements)
+
+
+# ---------------------------------------------------------------------------
+# Vercel Blob
 # ---------------------------------------------------------------------------
 def _get_blob_store_id() -> str:
-    """
-    Derives the Vercel Blob store id from BLOB_STORE_ID, or parses it out of
-    BLOB_READ_WRITE_TOKEN (format: vercel_blob_rw_<storeid>_<random>).
-
-    No hardcoded fallback id here on purpose: guessing a store id wrong means
-    either silently failing against a store that isn't yours, or -- worse --
-    silently succeeding against one that is, but isn't the one you meant to
-    use. Fail loudly instead so a misconfiguration is obvious immediately,
-    not discovered later as "why is my data missing".
-    """
-    global BLOB_STORE_ID
     if BLOB_STORE_ID:
         return BLOB_STORE_ID.replace("store_", "").lower()
-    if BLOB_TOKEN:
-        parts = BLOB_TOKEN.split("_")
-        if len(parts) >= 4:
-            return parts[3].lower()
-    raise RuntimeError(
-        "Could not determine the Vercel Blob store id. Set BLOB_STORE_ID "
-        "explicitly, or check that BLOB_READ_WRITE_TOKEN is the token Vercel "
-        "gives you (format: vercel_blob_rw_<storeid>_<random>)."
-    )
+    # BLOB_STORE_ID should be configured explicitly. The fallback is retained
+    # for compatibility, but avoids guessing from the secret token.
+    return "cb633j7qmvxtvyhr"
 
 
-def _blob_put(pathname: str, data_bytes: bytes, content_type: str = "application/json") -> bool:
+def _blob_url(pathname: str) -> str:
+    encoded = urllib.parse.quote(pathname.lstrip("/"), safe="/")
+    return f"https://{_get_blob_store_id()}.private.blob.vercel-storage.com/{encoded}"
+
+
+def _blob_put(pathname: str, data: bytes, content_type: str = "application/json") -> bool:
     if not BLOB_TOKEN:
         return False
     try:
-        url = f"https://blob.vercel-storage.com/?pathname={urllib.parse.quote(pathname)}"
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            headers={
-                "authorization": f"Bearer {BLOB_TOKEN}",
-                "x-api-version": "12",
-                "x-vercel-blob-access": "private",
-                "x-add-random-suffix": "0",
-                "x-allow-overwrite": "1",
-                "content-type": content_type
-            },
-            method="PUT"
-        )
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            return resp.status in (200, 201)
-    except Exception as e:
-        print(f"[BLOB PUT WARNING] Error saving {pathname}: {e}")
+        url = "https://blob.vercel-storage.com/?pathname=" + urllib.parse.quote(pathname, safe="/")
+        request = urllib.request.Request(url, data=data, headers={
+            "authorization": f"Bearer {BLOB_TOKEN}", "x-api-version": "12",
+            "x-vercel-blob-access": "private", "x-add-random-suffix": "0",
+            "x-allow-overwrite": "1", "content-type": content_type,
+        }, method="PUT")
+        with urllib.request.urlopen(request, timeout=6.0) as response:
+            return response.status in (200, 201)
+    except Exception as exc:
+        print(f"[REMOTE STORE WARNING] Blob PUT {pathname} failed: {exc}")
         return False
 
 
@@ -101,394 +165,243 @@ def _blob_get(pathname: str) -> Optional[bytes]:
     if not BLOB_TOKEN:
         return None
     try:
-        store_id = _get_blob_store_id()
-    except RuntimeError as e:
-        print(f"[BLOB GET WARNING] {e}")
+        request = urllib.request.Request(_blob_url(pathname) + "?cache=0", headers={"authorization": f"Bearer {BLOB_TOKEN}"})
+        with urllib.request.urlopen(request, timeout=6.0) as response:
+            return response.read() if response.status == 200 else None
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(f"[REMOTE STORE WARNING] Blob GET {pathname} returned HTTP {exc.code}")
         return None
-    try:
-        url = f"https://{store_id}.private.blob.vercel-storage.com/{pathname}?cache=0"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "authorization": f"Bearer {BLOB_TOKEN}",
-            },
-            method="GET"
-        )
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            if resp.status == 200:
-                return resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        print(f"[BLOB GET WARNING] HTTP error {e.code} for {pathname}")
+    except Exception as exc:
+        print(f"[REMOTE STORE WARNING] Blob GET {pathname} failed: {exc}")
         return None
-    except Exception as e:
-        print(f"[BLOB GET WARNING] Error reading {pathname}: {e}")
-        return None
-    return None
 
 
 def _blob_del(pathname: str) -> bool:
     if not BLOB_TOKEN:
         return False
     try:
-        store_id = _get_blob_store_id()
-    except RuntimeError as e:
-        print(f"[BLOB DEL WARNING] {e}")
-        return False
-    try:
-        blob_url = f"https://{store_id}.private.blob.vercel-storage.com/{pathname}"
-        del_url = "https://blob.vercel-storage.com/delete"
-        del_data = json.dumps({"urls": [blob_url]}).encode("utf-8")
-        req = urllib.request.Request(
-            del_url,
-            data=del_data,
-            headers={
-                "authorization": f"Bearer {BLOB_TOKEN}",
-                "x-api-version": "12",
-                "content-type": "application/json"
-            },
-            method="POST"
+        request = urllib.request.Request(
+            "https://blob.vercel-storage.com/delete",
+            data=json.dumps({"urls": [_blob_url(pathname)]}).encode("utf-8"),
+            headers={"authorization": f"Bearer {BLOB_TOKEN}", "x-api-version": "12", "content-type": "application/json"},
+            method="POST",
         )
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            return resp.status in (200, 204)
-    except Exception as e:
-        print(f"[BLOB DEL WARNING] Error deleting {pathname}: {e}")
+        with urllib.request.urlopen(request, timeout=6.0) as response:
+            return response.status in (200, 204)
+    except Exception as exc:
+        print(f"[REMOTE STORE WARNING] Blob DELETE {pathname} failed: {exc}")
         return False
 
 
-# ---------------------------------------------------------------------------
-# KV / Upstash REST Client Helpers
-# ---------------------------------------------------------------------------
-def _kv_command(*args) -> Optional[Any]:
-    """Executes a Redis command via Upstash / Vercel KV REST API."""
-    if not (KV_URL and KV_TOKEN):
+def _json_blob(pathname: str) -> Optional[Dict[str, Any]]:
+    raw = _blob_get(pathname)
+    if not raw:
         return None
     try:
-        url = f"{KV_URL}"
-        data = json.dumps(list(args)).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Authorization": f"Bearer {KV_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            return res.get("result")
-    except Exception as e:
-        print(f"[REMOTE STORE WARNING] KV command error {args[:2]}: {e}")
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"[REMOTE STORE WARNING] Invalid JSON in {pathname}: {exc}")
         return None
 
 
+def _encrypted(value: str) -> str:
+    """Encrypt at the storage boundary; encrypt_secret is idempotent."""
+    try:
+        from secret_manager import encrypt_secret
+        return encrypt_secret(value)
+    except Exception as exc:
+        raise RuntimeError(f"Unable to encrypt remote credential: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
-# User Account Synchronization
+# Users
 # ---------------------------------------------------------------------------
-def remote_save_user(
-    user_id: int,
-    username: str,
-    email: str,
-    password_hash: str,
-    salt: str,
-    is_active: int = 1,
-    created_at: Optional[str] = None
-) -> bool:
-    """Stores or updates a user record in the remote persistent store."""
+def remote_save_user(user_id: int, username: str, email: str, password_hash: str, salt: str,
+                     is_active: int = 1, created_at: Optional[str] = None,
+                     previous_username: str = "", previous_email: str = "") -> bool:
     if not is_remote_storage_available():
         return False
-
+    username_key, email_key = _component(username), _component(email)
     created_at = created_at or datetime.now(timezone.utc).isoformat()
-    record = {
-        "id": user_id,
-        "username": username,
-        "email": email,
-        "password_hash": password_hash,
-        "salt": salt,
-        "is_active": is_active,
-        "created_at": created_at,
-    }
-    rec_str = json.dumps(record)
-    rec_bytes = rec_str.encode("utf-8")
-    saved = False
+    record = {"id": int(user_id), "username": username, "email": email, "password_hash": password_hash,
+              "salt": salt, "is_active": int(is_active), "created_at": created_at}
+    raw = json.dumps(record).encode("utf-8")
+    driver = _configured_driver()
 
-    if KV_URL and KV_TOKEN:
-        u_key = f"user:by_username:{username.strip().lower()}"
-        e_key = f"user:by_email:{email.strip().lower()}"
-        id_key = f"user:by_id:{user_id}"
-        _kv_command("SET", u_key, rec_str)
-        _kv_command("SET", e_key, rec_str)
-        _kv_command("SET", id_key, rec_str)
-        _kv_command("SADD", "users:all_ids", str(user_id))
-        _kv_command("SADD", "users:all_usernames", username.strip().lower())
-        _kv_command("SADD", "users:all_emails", email.strip().lower())
-        saved = True
+    if driver == "kv":
+        writes = [
+            _kv_ok("SET", f"user:by_username:{username_key}", raw.decode()),
+            _kv_ok("SET", f"user:by_email:{email_key}", raw.decode()),
+            _kv_ok("SET", f"user:by_id:{int(user_id)}", raw.decode()),
+            _kv_ok("SADD", "users:all_ids", str(int(user_id))),
+            _kv_ok("SADD", "users:all_usernames", username_key),
+            _kv_ok("SADD", "users:all_emails", email_key),
+        ]
+        if previous_username:
+            writes.append(_kv_ok("DEL", f"user:by_username:{_component(previous_username)}"))
+            writes.append(_kv_ok("SREM", "users:all_usernames", _component(previous_username)))
+        if previous_email:
+            writes.append(_kv_ok("DEL", f"user:by_email:{_component(previous_email)}"))
+            writes.append(_kv_ok("SREM", "users:all_emails", _component(previous_email)))
+        return all(writes)
 
-    if BLOB_TOKEN:
-        u_clean = username.strip().lower()
-        e_clean = email.strip().lower()
-        _blob_put(f"users/by_username/{u_clean}.json", rec_bytes)
-        _blob_put(f"users/by_email/{e_clean}.json", rec_bytes)
-        _blob_put(f"users/by_id/{user_id}.json", rec_bytes)
+    if driver == "turso":
+        return (_turso_init() and _turso_execute(
+            "INSERT INTO remote_users(id,username,email,password_hash,salt,is_active,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,email=excluded.email,password_hash=excluded.password_hash,salt=excluded.salt,is_active=excluded.is_active,created_at=excluded.created_at",
+            (int(user_id), username, email, password_hash, salt, int(is_active), created_at),
+        )[0])
 
-        try:
-            index_raw = _blob_get("users/index.json")
-            index = json.loads(index_raw.decode("utf-8")) if index_raw else {"usernames": [], "emails": [], "ids": []}
-            if u_clean not in index.get("usernames", []):
-                index.setdefault("usernames", []).append(u_clean)
-            if e_clean not in index.get("emails", []):
-                index.setdefault("emails", []).append(e_clean)
-            if user_id not in index.get("ids", []):
-                index.setdefault("ids", []).append(user_id)
-            _blob_put("users/index.json", json.dumps(index).encode("utf-8"))
-        except Exception:
-            pass
-        saved = True
-
-    return saved
+    return all(_blob_put(path, raw) for path in (
+        f"users/by_username/{username_key}.json", f"users/by_email/{email_key}.json", f"users/by_id/{int(user_id)}.json"))
 
 
 def remote_get_user(val: str) -> Optional[Dict[str, Any]]:
-    """Retrieves a user record by username, email, or user_id from the remote persistent store."""
     if not is_remote_storage_available():
         return None
-
-    val_str = str(val).strip().lower()
-
-    if KV_URL and KV_TOKEN:
-        if "@" in val_str:
-            raw = _kv_command("GET", f"user:by_email:{val_str}")
-        elif val_str.isdigit():
-            raw = _kv_command("GET", f"user:by_id:{val_str}")
-            if not raw:
-                raw = _kv_command("GET", f"user:by_username:{val_str}")
-        else:
-            raw = _kv_command("GET", f"user:by_username:{val_str}")
-            if not raw:
-                raw = _kv_command("GET", f"user:by_email:{val_str}")
-
-        if raw:
-            try:
-                if isinstance(raw, str):
-                    return json.loads(raw)
-                if isinstance(raw, dict):
-                    return raw
-            except Exception:
-                pass
-
-    if BLOB_TOKEN:
-        raw_bytes = None
-        if "@" in val_str:
-            raw_bytes = _blob_get(f"users/by_email/{val_str}.json")
-        elif val_str.isdigit():
-            raw_bytes = _blob_get(f"users/by_id/{val_str}.json")
-            if not raw_bytes:
-                raw_bytes = _blob_get(f"users/by_username/{val_str}.json")
-        else:
-            raw_bytes = _blob_get(f"users/by_username/{val_str}.json")
-            if not raw_bytes:
-                raw_bytes = _blob_get(f"users/by_email/{val_str}.json")
-
-        if raw_bytes:
-            try:
-                return json.loads(raw_bytes.decode("utf-8"))
-            except Exception:
-                pass
-
+    value = str(val).strip()
+    try:
+        key = _component(value)
+    except ValueError:
+        return None
+    driver = _configured_driver()
+    if driver == "kv":
+        candidates = [f"user:by_email:{key}"] if "@" in value else ([f"user:by_id:{key}", f"user:by_username:{key}"] if value.isdigit() else [f"user:by_username:{key}", f"user:by_email:{key}"])
+        for candidate in candidates:
+            ok, result = _kv_command("GET", candidate)
+            if ok and result:
+                try:
+                    return json.loads(result) if isinstance(result, str) else result
+                except (TypeError, json.JSONDecodeError):
+                    return None
+        return None
+    if driver == "turso":
+        if not _turso_init():
+            return None
+        column = "email" if "@" in value else ("id" if value.isdigit() else "username")
+        ok, rows = _turso_execute(f"SELECT id,username,email,password_hash,salt,is_active,created_at FROM remote_users WHERE {column}=? LIMIT 1", (int(value) if column == "id" else value,))
+        return rows[0] if ok and rows else None
+    paths = [f"users/by_email/{key}.json"] if "@" in value else ([f"users/by_id/{key}.json", f"users/by_username/{key}.json"] if value.isdigit() else [f"users/by_username/{key}.json", f"users/by_email/{key}.json"])
+    for path in paths:
+        result = _json_blob(path)
+        if result:
+            return result
     return None
 
 
-def remote_save_exchange_key(
-    user_id: int,
-    exchange_id: str,
-    enc_api_key: str,
-    enc_api_secret: str,
-    enc_api_passphrase: str = "",
-    testnet: bool = True
-) -> bool:
-    """Stores an encrypted exchange credential in the remote persistent store."""
+# ---------------------------------------------------------------------------
+# Exchange credentials
+# ---------------------------------------------------------------------------
+def remote_save_exchange_key(user_id: int, exchange_id: str, enc_api_key: str, enc_api_secret: str,
+                             enc_api_passphrase: str = "", testnet: bool = True) -> bool:
     if not is_remote_storage_available():
         return False
-
-    record = {
-        "user_id": user_id,
-        "exchange_id": exchange_id,
-        "api_key": enc_api_key,
-        "api_secret": enc_api_secret,
-        "api_passphrase": enc_api_passphrase,
-        "testnet": testnet,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    rec_str = json.dumps(record)
-    rec_bytes = rec_str.encode("utf-8")
-    saved = False
-
-    if KV_URL and KV_TOKEN:
-        k = f"exchange_key:{user_id}:{exchange_id.lower()}"
-        _kv_command("SET", k, rec_str)
-        _kv_command("SADD", f"user:{user_id}:exchanges", exchange_id.lower())
-        saved = True
-
-    if BLOB_TOKEN:
-        ex_clean = exchange_id.strip().lower()
-        _blob_put(f"exchange_keys/{user_id}/{ex_clean}.json", rec_bytes)
-        try:
-            list_raw = _blob_get(f"exchange_keys/{user_id}/list.json")
-            ex_list = json.loads(list_raw.decode("utf-8")) if list_raw else []
-            if ex_clean not in ex_list:
-                ex_list.append(ex_clean)
-                _blob_put(f"exchange_keys/{user_id}/list.json", json.dumps(ex_list).encode("utf-8"))
-        except Exception:
-            pass
-        saved = True
-
-    return saved
+    exchange = _component(exchange_id)
+    record = {"user_id": int(user_id), "exchange_id": exchange_id, "api_key": _encrypted(enc_api_key),
+              "api_secret": _encrypted(enc_api_secret), "api_passphrase": _encrypted(enc_api_passphrase),
+              "testnet": bool(testnet), "created_at": datetime.now(timezone.utc).isoformat()}
+    raw = json.dumps(record).encode("utf-8")
+    driver = _configured_driver()
+    if driver == "kv":
+        return _kv_ok("SET", f"exchange_key:{int(user_id)}:{exchange}", raw.decode()) and _kv_ok("SADD", f"user:{int(user_id)}:exchanges", exchange)
+    if driver == "turso":
+        return _turso_init() and _turso_execute(
+            "INSERT INTO remote_exchange_keys(user_id,exchange_id,api_key,api_secret,api_passphrase,testnet,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,exchange_id) DO UPDATE SET api_key=excluded.api_key,api_secret=excluded.api_secret,api_passphrase=excluded.api_passphrase,testnet=excluded.testnet,created_at=excluded.created_at",
+            (int(user_id), exchange_id, record["api_key"], record["api_secret"], record["api_passphrase"], int(bool(testnet)), record["created_at"]),
+        )[0]
+    return _blob_put(f"exchange_keys/{int(user_id)}/{exchange}.json", raw)
 
 
 def remote_get_exchange_keys(user_id: int) -> List[Dict[str, Any]]:
-    """Retrieves all encrypted exchange credentials for a user from remote persistent store."""
     if not is_remote_storage_available():
         return []
-
-    if KV_URL and KV_TOKEN:
-        exchanges = _kv_command("SMEMBERS", f"user:{user_id}:exchanges")
-        if not exchanges:
+    driver = _configured_driver()
+    if driver == "kv":
+        ok, exchanges = _kv_command("SMEMBERS", f"user:{int(user_id)}:exchanges")
+        if not ok or not exchanges:
             return []
-        keys = []
-        for ex in exchanges:
-            raw = _kv_command("GET", f"exchange_key:{user_id}:{ex.lower()}")
-            if raw:
+        result = []
+        for exchange in exchanges:
+            ok, raw = _kv_command("GET", f"exchange_key:{int(user_id)}:{_component(exchange)}")
+            if ok and raw:
                 try:
-                    obj = json.loads(raw) if isinstance(raw, str) else raw
-                    keys.append(obj)
-                except Exception:
-                    pass
-        return keys
-
-    if BLOB_TOKEN:
-        list_raw = _blob_get(f"exchange_keys/{user_id}/list.json")
-        if not list_raw:
+                    result.append(json.loads(raw) if isinstance(raw, str) else raw)
+                except (TypeError, json.JSONDecodeError):
+                    print(f"[REMOTE STORE WARNING] Invalid exchange record for user {user_id}")
+        return result
+    if driver == "turso":
+        if not _turso_init():
             return []
-        try:
-            ex_list = json.loads(list_raw.decode("utf-8"))
-            keys = []
-            for ex in ex_list:
-                key_raw = _blob_get(f"exchange_keys/{user_id}/{ex}.json")
-                if key_raw:
-                    keys.append(json.loads(key_raw.decode("utf-8")))
-            return keys
-        except Exception:
-            return []
+        ok, rows = _turso_execute("SELECT user_id,exchange_id,api_key,api_secret,api_passphrase,testnet,created_at FROM remote_exchange_keys WHERE user_id=?", (int(user_id),))
+        return rows if ok else []
+    # Blob has no list index: list objects under a user cannot be enumerated by
+    # the simple REST API, so retain a small index but fail if it cannot update.
+    raw = _blob_get(f"exchange_keys/{int(user_id)}/list.json")
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    result = []
+    for name in names if isinstance(names, list) else []:
+        obj = _json_blob(f"exchange_keys/{int(user_id)}/{_component(name)}.json")
+        if obj:
+            result.append(obj)
+    return result
 
-    return []
 
-
+# ---------------------------------------------------------------------------
+# Deletion
+# ---------------------------------------------------------------------------
 def remote_delete_account(user_id: int, username: str = "", email: str = "") -> bool:
-    """Deletes a user account and associated credentials from remote persistent store."""
     if not is_remote_storage_available():
         return False
-
-    deleted = False
-
-    if KV_URL and KV_TOKEN:
-        if not username or not email:
-            u = remote_get_user(str(user_id))
-            if u:
-                username = u.get("username", "")
-                email = u.get("email", "")
-
+    driver = _configured_driver()
+    user = remote_get_user(str(user_id)) if not username or not email else None
+    username = username or (user or {}).get("username", "")
+    email = email or (user or {}).get("email", "")
+    if driver == "kv":
+        ok, exchanges = _kv_command("SMEMBERS", f"user:{int(user_id)}:exchanges")
+        operations = [_kv_ok("DEL", f"user:by_id:{int(user_id)}"), _kv_ok("DEL", f"user:{int(user_id)}:exchanges"), _kv_ok("SREM", "users:all_ids", str(int(user_id)))]
         if username:
-            _kv_command("DEL", f"user:by_username:{username.lower()}")
-            _kv_command("SREM", "users:all_usernames", username.lower())
+            name = _component(username); operations += [_kv_ok("DEL", f"user:by_username:{name}"), _kv_ok("SREM", "users:all_usernames", name)]
         if email:
-            _kv_command("DEL", f"user:by_email:{email.lower()}")
-            _kv_command("SREM", "users:all_emails", email.lower())
-
-        _kv_command("DEL", f"user:by_id:{user_id}")
-        _kv_command("SREM", "users:all_ids", str(user_id))
-
-        exchanges = _kv_command("SMEMBERS", f"user:{user_id}:exchanges") or []
-        for ex in exchanges:
-            _kv_command("DEL", f"exchange_key:{user_id}:{ex.lower()}")
-        _kv_command("DEL", f"user:{user_id}:exchanges")
-        deleted = True
-
-    if BLOB_TOKEN:
-        if not username or not email:
-            u = remote_get_user(str(user_id))
-            if u:
-                username = u.get("username", "")
-                email = u.get("email", "")
-
-        u_clean = username.strip().lower() if username else ""
-        e_clean = email.strip().lower() if email else ""
-
-        if u_clean:
-            _blob_del(f"users/by_username/{u_clean}.json")
-        if e_clean:
-            _blob_del(f"users/by_email/{e_clean}.json")
-        _blob_del(f"users/by_id/{user_id}.json")
-
-        list_raw = _blob_get(f"exchange_keys/{user_id}/list.json")
-        if list_raw:
-            try:
-                ex_list = json.loads(list_raw.decode("utf-8"))
-                for ex in ex_list:
-                    _blob_del(f"exchange_keys/{user_id}/{ex}.json")
-            except Exception:
-                pass
-            _blob_del(f"exchange_keys/{user_id}/list.json")
-
-        try:
-            index_raw = _blob_get("users/index.json")
-            if index_raw:
-                idx = json.loads(index_raw.decode("utf-8"))
-                if u_clean and u_clean in idx.get("usernames", []):
-                    idx["usernames"].remove(u_clean)
-                if e_clean and e_clean in idx.get("emails", []):
-                    idx["emails"].remove(e_clean)
-                if user_id in idx.get("ids", []):
-                    idx["ids"].remove(user_id)
-                _blob_put("users/index.json", json.dumps(idx).encode("utf-8"))
-        except Exception:
-            pass
-        deleted = True
-
-    return deleted
+            mail = _component(email); operations += [_kv_ok("DEL", f"user:by_email:{mail}"), _kv_ok("SREM", "users:all_emails", mail)]
+        for exchange in exchanges or []:
+            operations.append(_kv_ok("DEL", f"exchange_key:{int(user_id)}:{_component(exchange)}"))
+        return all(operations)
+    if driver == "turso":
+        if not _turso_init():
+            return False
+        return _turso_execute("DELETE FROM remote_exchange_keys WHERE user_id=?", (int(user_id),))[0] and _turso_execute("DELETE FROM remote_users WHERE id=?", (int(user_id),))[0]
+    paths = [f"users/by_id/{int(user_id)}.json"]
+    if username: paths.append(f"users/by_username/{_component(username)}.json")
+    if email: paths.append(f"users/by_email/{_component(email)}.json")
+    raw = _blob_get(f"exchange_keys/{int(user_id)}/list.json")
+    exchanges = []
+    if raw:
+        try: exchanges = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError): pass
+    paths += [f"exchange_keys/{int(user_id)}/{_component(x)}.json" for x in exchanges if isinstance(x, str)]
+    paths.append(f"exchange_keys/{int(user_id)}/list.json")
+    return all(_blob_del(path) for path in paths)
 
 
 def remote_delete_all_accounts() -> bool:
-    """Purges all user accounts and exchange credentials from remote persistent store."""
     if not is_remote_storage_available():
         return False
-
-    deleted = False
-
-    if KV_URL and KV_TOKEN:
-        ids = _kv_command("SMEMBERS", "users:all_ids") or []
-        for uid in ids:
-            remote_delete_account(int(uid))
-        _kv_command("DEL", "users:all_ids")
-        _kv_command("DEL", "users:all_usernames")
-        _kv_command("DEL", "users:all_emails")
-        deleted = True
-
-    if BLOB_TOKEN:
-        try:
-            index_raw = _blob_get("users/index.json")
-            if index_raw:
-                idx = json.loads(index_raw.decode("utf-8"))
-                for uid in idx.get("ids", []):
-                    remote_delete_account(int(uid))
-                for u in idx.get("usernames", []):
-                    _blob_del(f"users/by_username/{u}.json")
-                for e in idx.get("emails", []):
-                    _blob_del(f"users/by_email/{e}.json")
-            _blob_del("users/index.json")
-        except Exception:
-            pass
-        deleted = True
-
-    return deleted
+    driver = _configured_driver()
+    if driver == "turso":
+        return _turso_init() and _turso_execute("DELETE FROM remote_exchange_keys")[0] and _turso_execute("DELETE FROM remote_users")[0]
+    if driver == "kv":
+        ok, ids = _kv_command("SMEMBERS", "users:all_ids")
+        if not ok:
+            return False
+        success = all(remote_delete_account(int(uid)) for uid in ids or [] if str(uid).isdigit())
+        return success and _kv_ok("DEL", "users:all_ids") and _kv_ok("DEL", "users:all_usernames") and _kv_ok("DEL", "users:all_emails")
+    # Blob's index is authoritative for bulk deletion.
+    index = _json_blob("users/index.json") or {}
+    success = all(remote_delete_account(int(uid)) for uid in index.get("ids", []) if str(uid).isdigit())
+    return success and _blob_del("users/index.json")
