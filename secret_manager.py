@@ -60,15 +60,36 @@ def get_master_key() -> bytes:
             "Please set the BOT_SECRET_KEY or SECRET_KEY environment variable."
         )
 
-    # 3. Check local key file
+    # 3. Check local key file (if not serverless)
+    is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
     key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
-    if key_path.exists():
+    if not is_serverless and key_path.exists():
         try:
             key_data = key_path.read_bytes().strip()
             Fernet(key_data)
             return key_data
         except Exception:
             pass
+
+    # 4. In serverless or container environments, derive deterministically from platform secret
+    # so that all serverless containers share the exact same encryption & signing key
+    platform_secret = (
+        os.getenv("RESEND_API_KEY") or
+        os.getenv("BREVO_API_KEY") or
+        os.getenv("SENDGRID_API_KEY") or
+        os.getenv("SMTP_PASS") or
+        os.getenv("KV_REST_API_TOKEN") or
+        os.getenv("TURSO_AUTH_TOKEN") or
+        ""
+    ).strip()
+    if platform_secret:
+        import base64
+        import hashlib
+        import hmac
+        derived = hmac.new(b"crypto_trading_bot_master_salt_v1", platform_secret.encode("utf-8"), hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(derived)
+
+    # 5. Check local key file if serverless and exists
 
     # 4. Generate new key and save with restricted 0600 permissions
     new_key = Fernet.generate_key()

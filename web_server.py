@@ -1156,8 +1156,32 @@ def get_logs(lines: int = 50):
 @app.get("/activate", response_class=HTMLResponse)
 def activate_page(token: str = Query(...)):
     res = AuthService.activate_account(token)
-    status_icon = "fa-check-circle text-emerald-400" if res["success"] else "fa-times-circle text-rose-400"
-    title = "Account Activated!" if res["success"] else "Activation Failed"
+    success = res["success"]
+    status_icon = "fa-check-circle text-emerald-400" if success else "fa-times-circle text-rose-400"
+    title = "Account Activated!" if success else "Activation Failed"
+    session_token = res.get("session_token", "")
+
+    auto_script = ""
+    if success and session_token:
+        auto_script = f"""
+        <script>
+          try {{
+            localStorage.setItem('bot_auth_token', '{session_token}');
+            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=604800; SameSite=Lax; Secure";
+          }} catch (e) {{}}
+
+          let count = 3;
+          const countdownEl = document.getElementById('countdown');
+          const timer = setInterval(() => {{
+            count--;
+            if (countdownEl) countdownEl.innerText = count;
+            if (count <= 0) {{
+              clearInterval(timer);
+              window.location.href = '/';
+            }}
+          }}, 1000);
+        </script>
+        """
 
     html = f"""<!DOCTYPE html>
     <html lang="en" class="dark">
@@ -1169,16 +1193,19 @@ def activate_page(token: str = Query(...)):
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
-      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-8 text-center shadow-2xl space-y-4">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 text-center shadow-2xl space-y-4">
         <i class="fa-solid {status_icon} text-5xl"></i>
         <h1 class="text-2xl font-bold">{title}</h1>
-        <p class="text-sm text-slate-400">{res['message']}</p>
-        <div class="pt-4">
-          <a href="/" class="inline-block px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 font-semibold text-white rounded-xl shadow transition">
-            Proceed to Dashboard
+        <p class="text-sm text-slate-300 leading-relaxed">{res['message']}</p>
+        {f'<p class="text-xs text-emerald-400 font-medium"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> You are logged in! Entering trading dashboard in <span id="countdown">3</span>s...</p>' if success else ''}
+        <div class="pt-3 space-y-2">
+          <a href="/" class="inline-block w-full py-3 {'bg-emerald-600 hover:bg-emerald-500' if success else 'bg-slate-800 hover:bg-slate-700 border border-slate-700'} font-semibold text-white rounded-xl shadow transition">
+            {'Enter Trading Dashboard' if success else 'Return to Home'}
           </a>
+          {'' if success else '<a href="/?action=resend" class="inline-block w-full py-2.5 bg-amber-600 hover:bg-amber-500 font-semibold text-white rounded-xl shadow transition text-xs"><i class="fa-solid fa-paper-plane mr-1.5"></i> Request New Verification Link</a>'}
         </div>
       </div>
+      {auto_script}
     </body>
     </html>"""
     return HTMLResponse(content=html, status_code=200)
@@ -2858,7 +2885,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     async function checkAuth() {
-      const token = localStorage.getItem('bot_auth_token');
+      let token = localStorage.getItem('bot_auth_token');
+      if (!token) {
+        const m = document.cookie.match(/(?:^|;\\s*)bot_auth_token=([^;]+)/);
+        if (m) {
+          try {
+            token = decodeURIComponent(m[1]);
+            localStorage.setItem('bot_auth_token', token);
+          } catch (e) {}
+        }
+      }
       const authButtons = document.getElementById('auth-buttons');
       const userBadge = document.getElementById('user-badge');
       const authButtonsMob = document.getElementById('auth-buttons-mobile');
@@ -2904,12 +2940,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (unlockedDiv) unlockedDiv.classList.remove('hidden');
 
           // Render saved exchange keys
-          const list = document.getElementById('saved-keys-list');
-          if (data.saved_exchanges && data.saved_exchanges.length) {
-            list.innerHTML = '';
+          const list = document.getElementById('configured-keys-list');
+          list.innerHTML = '';
+          if (data.saved_exchanges && data.saved_exchanges.length > 0) {
             data.saved_exchanges.forEach(k => {
               const div = document.createElement('div');
-              div.className = 'flex flex-wrap items-center justify-between p-2.5 bg-slate-900/80 rounded border border-bordercol/80 gap-2';
+              div.className = 'flex items-center justify-between bg-slate-900/90 border border-slate-800 rounded-lg p-2 text-xs';
               div.innerHTML = `
                 <div class="flex items-center gap-2 min-w-0">
                   <span class="font-bold text-white uppercase">${k.exchange_id}</span>
@@ -2923,6 +2959,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         } else {
           localStorage.removeItem('bot_auth_token');
+          document.cookie = "bot_auth_token=; path=/; max-age=0; SameSite=Lax; Secure";
           currentUser = null;
           if (authButtons) authButtons.classList.remove('hidden');
           if (userBadge) userBadge.classList.add('hidden');
@@ -2941,6 +2978,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function logout() {
       localStorage.removeItem('bot_auth_token');
+      document.cookie = "bot_auth_token=; path=/; max-age=0; SameSite=Lax; Secure";
       currentUser = null;
       checkAuth();
     }
@@ -3816,6 +3854,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     refreshAnalysis();
     refreshLogs();
     checkEmailStatusBadge();
+
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('action') === 'resend') {
+      openAuthModal('resend');
+    } else if (urlParams.get('action') === 'login') {
+      openAuthModal('login');
+    }
 
     setInterval(fetchStatus, 3000);
     setInterval(refreshAnalysis, 15000);

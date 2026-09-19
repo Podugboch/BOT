@@ -299,6 +299,151 @@ class TestAuthRegistrationFlow:
         assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
         conn.close()
 
+    def test_cross_container_serverless_activation_flow(self, tmp_path, monkeypatch):
+        """
+        Simulates Vercel multi-container serverless environment:
+        Container A processes registration into DB A.
+        Container B (cold start, completely empty DB B) processes activation.
+        Verifies that Container B verifies the self-sovereign token, creates the user,
+        marks them active, and returns an active session token.
+        """
+        db_a = tmp_path / "container_a.db"
+        db_b = tmp_path / "container_b.db"
+
+        # 1. Container A handles registration
+        monkeypatch.setattr("auth.DB_PATH", db_a)
+        init_auth_db()
+
+        reg_res = AuthService.register("serverless_trader", "serverless@trader.io", "PassSecure123!")
+        assert reg_res["success"] is True
+
+        conn_a = sqlite3.connect(str(db_a))
+        conn_a.row_factory = sqlite3.Row
+        row_a = conn_a.execute("SELECT activation_token FROM users WHERE username = 'serverless_trader'").fetchone()
+        token = row_a["activation_token"]
+        conn_a.close()
+
+        # 2. Container B handles activation with blank DB
+        monkeypatch.setattr("auth.DB_PATH", db_b)
+        init_auth_db()
+
+        # Before activation, Container B has no users
+        conn_b_pre = sqlite3.connect(str(db_b))
+        assert conn_b_pre.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+        conn_b_pre.close()
+
+        # Activation on Container B
+        act_res = AuthService.activate_account(token)
+        assert act_res["success"] is True
+        assert "serverless_trader" in act_res["message"]
+        assert "session_token" in act_res
+        assert act_res["session_token"] is not None
+
+        # Verify Container B now has the active user
+        conn_b = sqlite3.connect(str(db_b))
+        conn_b.row_factory = sqlite3.Row
+        user_b = conn_b.execute("SELECT * FROM users WHERE username = 'serverless_trader'").fetchone()
+        conn_b.close()
+
+        assert user_b is not None
+        assert user_b["is_active"] == 1
+        assert user_b["email"] == "serverless@trader.io"
+
+    def test_cross_container_session_resolution(self, tmp_path, monkeypatch):
+        """
+        Verifies that a stateless session token issued by one container can be
+        authenticated on a brand-new, cold container with an empty sessions table.
+        """
+        from auth import create_stateless_session_token
+        db_cold = tmp_path / "container_cold.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+
+        token = create_stateless_session_token(user_id=42, username="cloud_trader", email="cloud@trader.io")
+        user = AuthService.get_user_from_token(token)
+
+        assert user is not None
+        assert user["id"] == 42
+        assert user["username"] == "cloud_trader"
+        assert user["email"] == "cloud@trader.io"
+
+    def test_expired_activation_token_rejected(self, tmp_path, monkeypatch):
+        from auth import generate_activation_token
+        db = tmp_path / "test_exp.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Token with negative expiration (-2 hours)
+        token = generate_activation_token(1, "expired_user", "exp@test.com", "hash", "salt", expires_hours=-2)
+        res = AuthService.activate_account(token)
+        assert res["success"] is False
+        assert "expired" in res["message"].lower()
+
+    def test_tampered_activation_token_rejected(self, tmp_path, monkeypatch):
+        db = tmp_path / "test_tamp.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        reg = AuthService.register("valid_user", "valid@test.com", "ValidPass123!")
+        conn = get_db_connection()
+        tok = conn.execute("SELECT activation_token FROM users WHERE username = 'valid_user'").fetchone()["activation_token"]
+        conn.close()
+
+        tampered = tok[:-6] + "xxxxxx"
+        res = AuthService.activate_account(tampered)
+        assert res["success"] is False
+        assert "invalid" in res["message"].lower()
+
+    def test_storage_adapter_mock_kv(self, monkeypatch):
+        from storage_adapter import (
+            remote_save_user,
+            remote_get_user,
+            remote_save_exchange_key,
+            remote_get_exchange_keys,
+            remote_delete_account,
+            remote_delete_all_accounts
+        )
+        fake_redis = {}
+
+        def mock_kv_cmd(*args):
+            cmd = args[0]
+            if cmd == "SET":
+                fake_redis[args[1]] = args[2]
+                return "OK"
+            elif cmd == "GET":
+                return fake_redis.get(args[1])
+            elif cmd == "DEL":
+                fake_redis.pop(args[1], None)
+                return 1
+            elif cmd == "SADD":
+                s = fake_redis.setdefault(args[1], set())
+                s.add(args[2])
+                return 1
+            elif cmd == "SMEMBERS":
+                return list(fake_redis.get(args[1], []))
+            elif cmd == "SREM":
+                s = fake_redis.get(args[1], set())
+                s.discard(args[2])
+                return 1
+            return None
+
+        monkeypatch.setattr("storage_adapter.KV_URL", "https://fake-kv.upstash.io")
+        monkeypatch.setattr("storage_adapter.KV_TOKEN", "fake_token")
+        monkeypatch.setattr("storage_adapter._kv_command", mock_kv_cmd)
+
+        assert remote_save_user(10, "remote_user", "remote@test.com", "h123", "s123", is_active=1)
+        u = remote_get_user("remote_user")
+        assert u is not None
+        assert u["email"] == "remote@test.com"
+
+        assert remote_save_exchange_key(10, "binance", "enc_k", "enc_s", "enc_p", testnet=True)
+        keys = remote_get_exchange_keys(10)
+        assert len(keys) == 1
+        assert keys[0]["exchange_id"] == "binance"
+
+        assert remote_delete_account(10, "remote_user", "remote@test.com")
+        assert remote_get_user("remote_user") is None
+
 
 class TestSecretEncryptionAndVault:
     def test_fernet_encrypt_decrypt(self):

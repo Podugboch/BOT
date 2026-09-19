@@ -23,15 +23,137 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import urllib.request
 import urllib.error
+import urllib.parse
 from secret_manager import (
     safe_load_dotenv,
     encrypt_secret,
     decrypt_secret,
     is_encrypted,
     SENSITIVE_ENV_KEYS,
+    get_master_key,
+    Fernet,
+)
+from storage_adapter import (
+    is_remote_storage_available,
+    remote_save_user,
+    remote_get_user,
+    remote_save_exchange_key,
+    remote_get_exchange_keys,
+    remote_delete_account,
+    remote_delete_all_accounts,
 )
 
 safe_load_dotenv()
+
+
+def generate_activation_token(user_id: int, username: str, email: str, password_hash: str, salt: str, expires_hours: int = 24) -> str:
+    """Generates a tamper-proof cryptographically signed activation token containing user state."""
+    exp = int((datetime.now(timezone.utc) + timedelta(hours=expires_hours)).timestamp())
+    payload = {
+        "act": "activate",
+        "uid": user_id,
+        "u": username,
+        "e": email,
+        "h": password_hash,
+        "s": salt,
+        "exp": exp,
+        "nonce": secrets.token_hex(8)
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    f = Fernet(get_master_key())
+    return f.encrypt(raw).decode("utf-8")
+
+
+def verify_activation_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verifies and decrypts a cryptographically signed activation token."""
+    if not token or not isinstance(token, str):
+        return None
+    token = token.strip()
+    try:
+        f = Fernet(get_master_key())
+        raw = f.decrypt(token.encode("utf-8"), ttl=86400 * 30)
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("act") != "activate":
+            return None
+        exp = data.get("exp", 0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts > exp:
+            return {"expired": True, "data": data}
+        return {"expired": False, "data": data}
+    except Exception:
+        return None
+
+
+def create_stateless_session_token(user_id: int, username: str, email: str, expires_days: int = 7) -> str:
+    """Generates a tamper-proof cryptographically signed session token for cross-container authentication."""
+    exp = int((datetime.now(timezone.utc) + timedelta(days=expires_days)).timestamp())
+    payload = {
+        "act": "session",
+        "uid": user_id,
+        "u": username,
+        "e": email,
+        "exp": exp,
+        "nonce": secrets.token_hex(8)
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    f = Fernet(get_master_key())
+    return f.encrypt(raw).decode("utf-8")
+
+
+def verify_stateless_session_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verifies and decrypts a cryptographically signed session token."""
+    if not token or not isinstance(token, str):
+        return None
+    token = token.strip()
+    try:
+        f = Fernet(get_master_key())
+        raw = f.decrypt(token.encode("utf-8"), ttl=86400 * 30)
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("act") != "session":
+            return None
+        exp = data.get("exp", 0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts > exp:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def generate_password_reset_token(user_id: int, username: str, email: str, expires_hours: int = 2) -> str:
+    """Generates a tamper-proof cryptographically signed password reset token."""
+    exp = int((datetime.now(timezone.utc) + timedelta(hours=expires_hours)).timestamp())
+    payload = {
+        "act": "reset",
+        "uid": user_id,
+        "u": username,
+        "e": email,
+        "exp": exp,
+        "nonce": secrets.token_hex(8)
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    f = Fernet(get_master_key())
+    return f.encrypt(raw).decode("utf-8")
+
+
+def verify_password_reset_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verifies and decrypts a cryptographically signed password reset token."""
+    if not token or not isinstance(token, str):
+        return None
+    token = token.strip()
+    try:
+        f = Fernet(get_master_key())
+        raw = f.decrypt(token.encode("utf-8"), ttl=86400 * 7)
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("act") != "reset":
+            return None
+        exp = data.get("exp", 0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts > exp:
+            return {"expired": True, "data": data}
+        return {"expired": False, "data": data}
+    except Exception:
+        return None
 
 # Detect serverless environment for DB path
 if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
@@ -750,27 +872,39 @@ class AuthService:
 
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id FROM users WHERE username = ? OR email = ?", (username, email))
+        cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (username.lower(), email))
         existing = cur.fetchone()
+        if not existing and is_remote_storage_available():
+            remote_u = remote_get_user(username) or remote_get_user(email)
+            if remote_u:
+                existing = remote_u
+
         if existing:
             conn.close()
             return {"success": False, "message": "A user with this username or email already exists"}
 
         password_hash, salt = hash_password(password)
-        activation_token = secrets.token_urlsafe(32)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
         created_at = datetime.now(timezone.utc).isoformat()
+        temp_token = secrets.token_urlsafe(32)
 
         cur.execute("""
             INSERT INTO users (username, email, password_hash, salt, is_active, activation_token, activation_expires_at, created_at)
             VALUES (?, ?, ?, ?, 0, ?, ?, ?)
-        """, (username, email, password_hash, salt, activation_token, expires_at, created_at))
+        """, (username, email, password_hash, salt, temp_token, expires_at, created_at))
         user_id = cur.lastrowid
+
+        # Generate cryptographically signed self-sovereign token containing user state
+        activation_token = generate_activation_token(user_id, username, email, password_hash, salt, expires_hours=24)
+        cur.execute("UPDATE users SET activation_token = ? WHERE id = ?", (activation_token, user_id))
         conn.commit()
         conn.close()
 
+        # Persist user in remote store if available
+        remote_save_user(user_id, username, email, password_hash, salt, is_active=0, created_at=created_at)
+
         # Send activation email to recipient
-        activation_link = f"{base_url}/activate?token={activation_token}"
+        activation_link = f"{base_url}/activate?token={urllib.parse.quote(activation_token)}"
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Activate Your Crypto Trading Bot Account</h2>
@@ -802,29 +936,95 @@ class AuthService:
 
     @staticmethod
     def activate_account(token: str) -> Dict[str, Any]:
+        token = token.strip()
         conn = get_db_connection()
         cur = conn.cursor()
+
+        # 1. First check local database
         cur.execute("SELECT id, username, email, is_active, activation_expires_at FROM users WHERE activation_token = ?", (token,))
         user = cur.fetchone()
 
-        if not user:
-            conn.close()
-            return {"success": False, "message": "Invalid or already used activation token"}
+        if user:
+            session_token = create_stateless_session_token(user["id"], user["username"], user["email"])
+            if user["is_active"] == 1:
+                conn.close()
+                return {
+                    "success": True,
+                    "already_active": True,
+                    "message": "Account is already activated. You can log in now.",
+                    "session_token": session_token,
+                    "username": user["username"],
+                    "email": user["email"]
+                }
 
-        if user["is_active"] == 1:
-            conn.close()
-            return {"success": True, "message": "Account is already activated. You can log in now."}
+            # Check expiration
+            expires = datetime.fromisoformat(user["activation_expires_at"])
+            if datetime.now(timezone.utc) > expires:
+                conn.close()
+                return {"success": False, "message": "Activation link has expired. Please request a new one."}
 
-        # Check expiration
-        expires = datetime.fromisoformat(user["activation_expires_at"])
-        if datetime.now(timezone.utc) > expires:
+            cur.execute("UPDATE users SET is_active = 1, activation_token = NULL WHERE id = ?", (user["id"],))
+            conn.commit()
             conn.close()
-            return {"success": False, "message": "Activation link has expired. Please request a new one."}
 
-        cur.execute("UPDATE users SET is_active = 1, activation_token = NULL WHERE id = ?", (user["id"],))
-        conn.commit()
+            # Sync to remote persistent store
+            remote_u = remote_get_user(user["username"])
+            if remote_u:
+                remote_save_user(user["id"], user["username"], user["email"], remote_u["password_hash"], remote_u["salt"], is_active=1)
+
+            return {
+                "success": True,
+                "message": f"Account {user['username']} successfully activated! You can now log in.",
+                "session_token": session_token,
+                "username": user["username"],
+                "email": user["email"]
+            }
+
+        # 2. Cryptographic self-sovereign token verification (handles cross-container serverless cold starts)
+        token_info = verify_activation_token(token)
+        if token_info:
+            if token_info["expired"]:
+                conn.close()
+                return {"success": False, "message": "Activation link has expired. Please request a new one."}
+
+            data = token_info["data"]
+            username = data["u"]
+            email = data["e"]
+            pwd_hash = data["h"]
+            salt = data["s"]
+            uid = data.get("uid", 1)
+
+            cur.execute("SELECT id, username, email, is_active FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?",
+                        (username.lower(), email.lower()))
+            existing = cur.fetchone()
+            if existing:
+                user_id = existing["id"]
+                cur.execute("UPDATE users SET is_active = 1, activation_token = NULL WHERE id = ?", (user_id,))
+            else:
+                created_at = datetime.now(timezone.utc).isoformat()
+                cur.execute("""
+                    INSERT INTO users (id, username, email, password_hash, salt, is_active, activation_token, activation_expires_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, 1, NULL, NULL, ?)
+                    ON CONFLICT(id) DO UPDATE SET is_active = 1, activation_token = NULL
+                """, (uid, username, email, pwd_hash, salt, created_at))
+                user_id = uid
+
+            conn.commit()
+            conn.close()
+
+            session_token = create_stateless_session_token(user_id, username, email)
+            remote_save_user(user_id, username, email, pwd_hash, salt, is_active=1)
+
+            return {
+                "success": True,
+                "message": f"Account {username} successfully activated! You can now log in.",
+                "session_token": session_token,
+                "username": username,
+                "email": email
+            }
+
         conn.close()
-        return {"success": True, "message": f"Account {user['username']} successfully activated! You can now log in."}
+        return {"success": False, "message": "Invalid or already used activation token"}
 
     @staticmethod
     def resend_activation_email(email: str, base_url: str = "http://localhost:8000") -> Dict[str, Any]:
@@ -834,8 +1034,31 @@ class AuthService:
 
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, username, email, is_active FROM users WHERE LOWER(email) = ?", (email,))
+        cur.execute("SELECT id, username, email, password_hash, salt, is_active FROM users WHERE LOWER(email) = ?", (email,))
         user = cur.fetchone()
+
+        if not user:
+            remote_u = remote_get_user(email)
+            if remote_u:
+                try:
+                    cur.execute("""
+                        INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET is_active = excluded.is_active
+                    """, (
+                        remote_u["id"],
+                        remote_u["username"],
+                        remote_u["email"],
+                        remote_u["password_hash"],
+                        remote_u["salt"],
+                        remote_u.get("is_active", 0),
+                        remote_u.get("created_at", datetime.now(timezone.utc).isoformat())
+                    ))
+                    conn.commit()
+                    cur.execute("SELECT id, username, email, password_hash, salt, is_active FROM users WHERE id = ?", (remote_u["id"],))
+                    user = cur.fetchone()
+                except Exception:
+                    pass
 
         if not user:
             conn.close()
@@ -846,7 +1069,7 @@ class AuthService:
             conn.close()
             return {"success": False, "already_active": True, "message": "Account is already activated. Please sign in."}
 
-        activation_token = secrets.token_urlsafe(32)
+        activation_token = generate_activation_token(user["id"], user["username"], user["email"], user["password_hash"], user["salt"], expires_hours=24)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
 
         cur.execute("UPDATE users SET activation_token = ?, activation_expires_at = ? WHERE id = ?",
@@ -854,7 +1077,7 @@ class AuthService:
         conn.commit()
         conn.close()
 
-        activation_link = f"{base_url}/activate?token={activation_token}"
+        activation_link = f"{base_url}/activate?token={urllib.parse.quote(activation_token)}"
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Your New Verification Link</h2>
@@ -892,6 +1115,29 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
+            remote_u = remote_get_user(val)
+            if remote_u:
+                try:
+                    cur.execute("""
+                        INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash, salt = excluded.salt, is_active = excluded.is_active
+                    """, (
+                        remote_u["id"],
+                        remote_u["username"],
+                        remote_u["email"],
+                        remote_u["password_hash"],
+                        remote_u["salt"],
+                        remote_u.get("is_active", 1),
+                        remote_u.get("created_at", datetime.now(timezone.utc).isoformat())
+                    ))
+                    conn.commit()
+                    cur.execute("SELECT * FROM users WHERE id = ?", (remote_u["id"],))
+                    user = cur.fetchone()
+                except Exception as e:
+                    print(f"[AUTH WARNING] Failed caching remote user into local DB: {e}")
+
+        if not user:
             conn.close()
             return {"success": False, "message": "Invalid username/email or password"}
 
@@ -908,13 +1154,16 @@ class AuthService:
                 "message": "Your account is not activated yet. Please check your email for the activation link."
             }
 
-        session_token = secrets.token_urlsafe(32)
+        session_token = create_stateless_session_token(user["id"], user["username"], user["email"])
         created_at = datetime.now(timezone.utc).isoformat()
         expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
-        cur.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                    (session_token, user["id"], created_at, expires_at))
-        conn.commit()
+        try:
+            cur.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                        (session_token, user["id"], created_at, expires_at))
+            conn.commit()
+        except Exception:
+            pass
         conn.close()
 
         return {
@@ -936,19 +1185,27 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
+            remote_u = remote_get_user(email)
+            if remote_u:
+                user = remote_u
+
+        if not user:
             conn.close()
             # Security: Don't disclose if email exists
             return {"success": True, "message": "If an account with that email exists, password reset instructions have been sent."}
 
-        reset_token = secrets.token_urlsafe(32)
+        reset_token = generate_password_reset_token(user["id"], user["username"], email, expires_hours=2)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
 
-        cur.execute("UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ?",
-                    (reset_token, expires_at, user["id"]))
-        conn.commit()
+        try:
+            cur.execute("UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ?",
+                        (reset_token, expires_at, user["id"]))
+            conn.commit()
+        except Exception:
+            pass
         conn.close()
 
-        reset_link = f"{base_url}/reset-password?token={reset_token}"
+        reset_link = f"{base_url}/reset-password?token={urllib.parse.quote(reset_token)}"
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #f59e0b; margin-top: 0;">Reset Your Password</h2>
@@ -984,50 +1241,108 @@ class AuthService:
 
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, reset_expires_at FROM users WHERE reset_token = ?", (token,))
+        cur.execute("SELECT id, username, email, reset_expires_at FROM users WHERE reset_token = ?", (token,))
         user = cur.fetchone()
 
-        if not user:
-            conn.close()
-            return {"success": False, "message": "Invalid or expired password reset link"}
-
-        expires = datetime.fromisoformat(user["reset_expires_at"])
-        if datetime.now(timezone.utc) > expires:
-            conn.close()
-            return {"success": False, "message": "Password reset link has expired"}
+        if user:
+            expires = datetime.fromisoformat(user["reset_expires_at"])
+            if datetime.now(timezone.utc) > expires:
+                conn.close()
+                return {"success": False, "message": "Password reset link has expired"}
+            user_id = user["id"]
+            username = user["username"]
+            email = user["email"]
+        else:
+            t_info = verify_password_reset_token(token)
+            if not t_info:
+                conn.close()
+                return {"success": False, "message": "Invalid or expired password reset link"}
+            if t_info["expired"]:
+                conn.close()
+                return {"success": False, "message": "Password reset link has expired"}
+            d = t_info["data"]
+            username = d["u"]
+            email = d["e"]
+            user_id = d.get("uid", 1)
 
         password_hash, salt = hash_password(new_password)
-        cur.execute("UPDATE users SET password_hash = ?, salt = ?, reset_token = NULL, reset_expires_at = NULL WHERE id = ?",
-                    (password_hash, salt, user["id"]))
+        cur.execute("""
+            INSERT INTO users (id, username, email, password_hash, salt, is_active, reset_token, reset_expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, NULL, NULL, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                salt = excluded.salt,
+                reset_token = NULL,
+                reset_expires_at = NULL,
+                is_active = 1
+        """, (user_id, username, email, password_hash, salt, datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
+
+        remote_save_user(user_id, username, email, password_hash, salt, is_active=1)
         return {"success": True, "message": "Password has been successfully updated! You can now log in."}
 
     @staticmethod
     def get_user_from_token(session_token: str) -> Optional[Dict[str, Any]]:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT u.id, u.username, u.email, s.expires_at
-            FROM sessions s
-            JOIN users u ON s.user_id = u.id
-            WHERE s.token = ?
-        """, (session_token,))
-        row = cur.fetchone()
-        conn.close()
-
-        if not row:
+        if not session_token:
             return None
+        session_token = session_token.strip()
 
-        expires = datetime.fromisoformat(row["expires_at"])
-        if datetime.now(timezone.utc) > expires:
-            return None
+        # 1. First check local sessions table
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.id, u.username, u.email, s.expires_at
+                FROM sessions s
+                JOIN users u ON s.user_id = u.id
+                WHERE s.token = ?
+            """, (session_token,))
+            row = cur.fetchone()
+            if row:
+                expires = datetime.fromisoformat(row["expires_at"])
+                if datetime.now(timezone.utc) <= expires:
+                    conn.close()
+                    return {
+                        "id": row["id"],
+                        "username": row["username"],
+                        "email": row["email"]
+                    }
+            conn.close()
+        except Exception:
+            pass
 
-        return {
-            "id": row["id"],
-            "username": row["username"],
-            "email": row["email"]
-        }
+        # 2. Cryptographic stateless token verification (cross-container support)
+        data = verify_stateless_session_token(session_token)
+        if data:
+            uid = data.get("uid", 1)
+            username = data.get("u")
+            email = data.get("e")
+
+            # Ensure user exists in local SQLite for foreign key references
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM users WHERE id = ? OR LOWER(username) = ?", (uid, username.lower()))
+                u_row = cur.fetchone()
+                if not u_row:
+                    cur.execute("""
+                        INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                        VALUES (?, ?, ?, 'stateless_placeholder', 'stateless_salt', 1, ?)
+                        ON CONFLICT(id) DO UPDATE SET is_active = 1
+                    """, (uid, username, email, datetime.now(timezone.utc).isoformat()))
+                    conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+            return {
+                "id": uid,
+                "username": username,
+                "email": email
+            }
+
+        return None
 
     @staticmethod
     def save_exchange_key(user_id: int, exchange_id: str, api_key: str, api_secret: str, api_passphrase: str = "", testnet: bool = True, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
@@ -1053,6 +1368,10 @@ class AuthService:
             """, (user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, 1 if testnet else 0, created_at))
             if should_close:
                 conn.commit()
+
+            # Sync to remote persistent store
+            remote_save_exchange_key(user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, testnet)
+
             return {"success": True, "message": f"Credentials for {exchange_id} saved successfully"}
         except Exception as e:
             print(f"[AUTH ERROR] Failed to save exchange key for user {user_id} and {exchange_id}: {e}")
@@ -1070,6 +1389,36 @@ class AuthService:
         cur = conn.cursor()
         cur.execute("SELECT exchange_id, api_key, api_passphrase, testnet, created_at FROM exchange_keys WHERE user_id = ?", (user_id,))
         rows = cur.fetchall()
+
+        if not rows:
+            # Check remote persistent store and sync into local DB
+            rem_keys = remote_get_exchange_keys(user_id)
+            if rem_keys:
+                for rk in rem_keys:
+                    try:
+                        cur.execute("""
+                            INSERT INTO exchange_keys (user_id, exchange_id, api_key, api_secret, api_passphrase, testnet, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(user_id, exchange_id) DO UPDATE SET
+                                api_key = excluded.api_key,
+                                api_secret = excluded.api_secret,
+                                api_passphrase = excluded.api_passphrase,
+                                testnet = excluded.testnet
+                        """, (
+                            user_id,
+                            rk["exchange_id"],
+                            rk["api_key"],
+                            rk["api_secret"],
+                            rk.get("api_passphrase", ""),
+                            1 if rk.get("testnet", True) else 0,
+                            rk.get("created_at", datetime.now(timezone.utc).isoformat())
+                        ))
+                    except Exception:
+                        pass
+                conn.commit()
+                cur.execute("SELECT exchange_id, api_key, api_passphrase, testnet, created_at FROM exchange_keys WHERE user_id = ?", (user_id,))
+                rows = cur.fetchall()
+
         conn.close()
 
         result = []
@@ -1093,6 +1442,19 @@ class AuthService:
         cur.execute("SELECT api_key, api_secret, api_passphrase, testnet FROM exchange_keys WHERE user_id = ? AND exchange_id = ?",
                     (user_id, exchange_id))
         row = cur.fetchone()
+
+        if not row:
+            rem_keys = remote_get_exchange_keys(user_id)
+            for rk in rem_keys:
+                if rk["exchange_id"].lower() == exchange_id.lower():
+                    conn.close()
+                    return {
+                        "api_key": decrypt_secret(rk["api_key"]),
+                        "api_secret": decrypt_secret(rk["api_secret"]),
+                        "api_passphrase": decrypt_secret(rk["api_passphrase"]) if rk.get("api_passphrase") else "",
+                        "testnet": bool(rk.get("testnet", True)),
+                    }
+
         conn.close()
         if row:
             return {
@@ -1131,6 +1493,7 @@ class AuthService:
         cur.execute("DELETE FROM users")
         conn.commit()
         conn.close()
+        remote_delete_all_accounts()
         return {"success": True, "message": "All registered user accounts and sessions have been permanently deleted"}
 
     @staticmethod
@@ -1142,6 +1505,7 @@ class AuthService:
         cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
         conn.commit()
         conn.close()
+        remote_delete_account(user_id)
         return {"success": True, "message": "Account deleted successfully"}
 
     @staticmethod
