@@ -367,6 +367,94 @@ class TestAuthRegistrationFlow:
         assert user["username"] == "cloud_trader"
         assert user["email"] == "cloud@trader.io"
 
+    def test_client_token_rehydration_on_cold_container(self, tmp_path, monkeypatch):
+        """
+        Tests that when a cold container with an empty SQLite database receives a login
+        request with a client_token, it verifies credentials, hydrates the user into SQLite,
+        and returns a valid session token.
+        """
+        from auth import create_stateless_session_token, hash_password
+        db_cold = tmp_path / "container_login_cold.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+
+        # Generate a valid token with real hash and salt
+        pwd_hash, salt = hash_password("MySuperPassword123!")
+        client_tok = create_stateless_session_token(
+            user_id=88,
+            username="rehydrate_user",
+            email="rehydrate@market.io",
+            password_hash=pwd_hash,
+            salt=salt
+        )
+
+        # Container has 0 users initially
+        conn = sqlite3.connect(str(db_cold))
+        assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+        conn.close()
+
+        # Login with wrong password fails
+        fail_res = AuthService.login("rehydrate_user", "WrongPassword!", client_token=client_tok)
+        assert fail_res["success"] is False
+
+        # Login with correct password succeeds and rehydrates
+        succ_res = AuthService.login("rehydrate_user", "MySuperPassword123!", client_token=client_tok)
+        assert succ_res["success"] is True
+        assert succ_res["user"]["username"] == "rehydrate_user"
+        assert "token" in succ_res
+
+        # Verify user is now in local database
+        conn = sqlite3.connect(str(db_cold))
+        conn.row_factory = sqlite3.Row
+        u = conn.execute("SELECT * FROM users WHERE username = 'rehydrate_user'").fetchone()
+        assert u is not None
+        assert u["is_active"] == 1
+        assert u["email"] == "rehydrate@market.io"
+        conn.close()
+
+    def test_magic_login_token_flow(self, tmp_path, monkeypatch):
+        """
+        Tests the 1-click magic login token generation, verification, and instant sign-in.
+        """
+        db = tmp_path / "magic_test.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Request magic login link
+        res = AuthService.send_magic_login_link("magic_user@trader.io")
+        assert res["success"] is True
+
+        # Extract token from dev link if email was mock/unconfigured
+        magic_tok = res.get("dev_magic_link", "").split("token=")[-1]
+        if not magic_tok:
+            from auth import generate_magic_login_token
+            magic_tok = generate_magic_login_token("magic_user@trader.io", username="magic_user")
+
+        # Magic login on empty container
+        login_res = AuthService.magic_login(magic_tok)
+        assert login_res["success"] is True
+        assert login_res["email"] == "magic_user@trader.io"
+        assert "session_token" in login_res
+
+    def test_serverless_auto_activate_flow(self, tmp_path, monkeypatch):
+        """
+        Tests that when auto_activate is enabled (as on Vercel), registration immediately
+        marks user active and issues a session token.
+        """
+        db = tmp_path / "auto_act.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        reg_res = AuthService.register("instant_user", "instant@trader.io", "PassInstant123!", auto_activate=True)
+        assert reg_res["success"] is True
+        assert reg_res["is_active"] == 1
+        assert "token" in reg_res
+        assert reg_res["user"]["username"] == "instant_user"
+
+        # Login succeeds immediately without clicking email
+        login_res = AuthService.login("instant_user", "PassInstant123!")
+        assert login_res["success"] is True
+
     def test_expired_activation_token_rejected(self, tmp_path, monkeypatch):
         from auth import generate_activation_token
         db = tmp_path / "test_exp.db"

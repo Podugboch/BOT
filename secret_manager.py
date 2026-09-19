@@ -71,27 +71,27 @@ def get_master_key() -> bytes:
         except Exception:
             pass
 
-    # 4. In serverless or container environments, derive deterministically from platform secret
+    # 4. In serverless or container environments, derive deterministically from platform secret or stable fallback
     # so that all serverless containers share the exact same encryption & signing key
-    platform_secret = (
-        os.getenv("RESEND_API_KEY") or
-        os.getenv("BREVO_API_KEY") or
-        os.getenv("SENDGRID_API_KEY") or
-        os.getenv("SMTP_PASS") or
-        os.getenv("KV_REST_API_TOKEN") or
-        os.getenv("TURSO_AUTH_TOKEN") or
-        ""
-    ).strip()
-    if platform_secret:
+    if is_serverless:
+        platform_secret = (
+            os.getenv("BOT_SECRET_KEY") or
+            os.getenv("SECRET_KEY") or
+            os.getenv("RESEND_API_KEY") or
+            os.getenv("BREVO_API_KEY") or
+            os.getenv("SENDGRID_API_KEY") or
+            os.getenv("SMTP_PASS") or
+            os.getenv("KV_REST_API_TOKEN") or
+            os.getenv("TURSO_AUTH_TOKEN") or
+            "traderqueen_production_vault_stable_key_salt_2026_deterministic"
+        ).strip()
         import base64
         import hashlib
         import hmac
         derived = hmac.new(b"crypto_trading_bot_master_salt_v1", platform_secret.encode("utf-8"), hashlib.sha256).digest()
         return base64.urlsafe_b64encode(derived)
 
-    # 5. Check local key file if serverless and exists
-
-    # 4. Generate new key and save with restricted 0600 permissions
+    # 5. Generate new key and save with restricted 0600 permissions (for local persistent servers)
     new_key = Fernet.generate_key()
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC

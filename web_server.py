@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Response, Request, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
@@ -214,6 +214,11 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username_or_email: str
     password: str
+    client_token: Optional[str] = None
+
+
+class MagicLinkRequest(BaseModel):
+    email: str
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -277,10 +282,17 @@ class TestEmailRequest(BaseModel):
 
 
 # --- Auth Dependency Helper ---
-def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
-    if not authorization:
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None)
+) -> Optional[Dict[str, Any]]:
+    token = ""
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+    elif bot_auth_token:
+        token = bot_auth_token.strip()
+    if not token:
         return None
-    token = authorization.replace("Bearer ", "").strip()
     return AuthService.get_user_from_token(token)
 
 
@@ -333,20 +345,24 @@ def get_request_base_url(request: Request) -> str:
 # API ENDPOINTS: AUTHENTICATION & USER MANAGEMENT
 # ============================================================================
 @app.post("/api/auth/register")
-def register(req: RegisterRequest, request: Request):
+def register(req: RegisterRequest, request: Request, response: Response):
     base_url = get_request_base_url(request)
     res = AuthService.register(req.username, req.email, req.password, base_url=base_url)
     if not res["success"]:
-        raise HTTPException(status_code=400, detail=res["message"])
+        return JSONResponse(status_code=400, content=res)
+    if res.get("token"):
+        response.set_cookie(key="bot_auth_token", value=res["token"], max_age=2592000, path="/", samesite="lax", secure=True)
     return res
 
 
 @app.get("/api/auth/activate")
 @app.post("/api/auth/activate")
-def activate_account(token: str = Query(...)):
+def activate_account(token: str = Query(...), response: Response = None):
     res = AuthService.activate_account(token)
     if not res["success"]:
-        raise HTTPException(status_code=400, detail=res["message"])
+        return JSONResponse(status_code=400, content=res)
+    if response and res.get("session_token"):
+        response.set_cookie(key="bot_auth_token", value=res["session_token"], max_age=2592000, path="/", samesite="lax", secure=True)
     return res
 
 
@@ -358,16 +374,27 @@ def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
 
 
 @app.post("/api/auth/login")
-def login(req: LoginRequest):
-    res = AuthService.login(req.username_or_email, req.password)
+def login(req: LoginRequest, response: Response):
+    res = AuthService.login(req.username_or_email, req.password, client_token=req.client_token)
     if not res["success"]:
-        raise HTTPException(status_code=400, detail=res["message"])
+        return JSONResponse(status_code=400, content=res)
+    if res.get("token"):
+        response.set_cookie(key="bot_auth_token", value=res["token"], max_age=2592000, path="/", samesite="lax", secure=True)
+    return res
+
+
+@app.post("/api/auth/magic-link")
+def send_magic_link_endpoint(req: MagicLinkRequest, request: Request):
+    base_url = get_request_base_url(request)
+    res = AuthService.send_magic_login_link(req.email, base_url=base_url)
+    if not res["success"]:
+        return JSONResponse(status_code=400, content=res)
     return res
 
 
 @app.get("/api/auth/me")
-def get_profile(authorization: Optional[str] = Header(None)):
-    user = get_current_user(authorization)
+def get_profile(authorization: Optional[str] = Header(None), bot_auth_token: Optional[str] = Cookie(None)):
+    user = get_current_user(authorization, bot_auth_token)
     if not user:
         return {"authenticated": False}
     keys = AuthService.get_exchange_keys(user["id"])
@@ -1211,6 +1238,63 @@ def activate_page(token: str = Query(...)):
     return HTMLResponse(content=html, status_code=200)
 
 
+@app.get("/magic-login", response_class=HTMLResponse)
+def magic_login_page(token: str = Query(...)):
+    res = AuthService.magic_login(token)
+    success = res["success"]
+    status_icon = "fa-check-circle text-emerald-400" if success else "fa-times-circle text-rose-400"
+    title = "Signed In Successfully!" if success else "Sign-In Failed"
+    session_token = res.get("session_token", "")
+
+    auto_script = ""
+    if success and session_token:
+        auto_script = f"""
+        <script>
+          try {{
+            localStorage.setItem('bot_auth_token', '{session_token}');
+            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+          }} catch (e) {{}}
+
+          let count = 2;
+          const countdownEl = document.getElementById('countdown');
+          const timer = setInterval(() => {{
+            count--;
+            if (countdownEl) countdownEl.innerText = count;
+            if (count <= 0) {{
+              clearInterval(timer);
+              window.location.href = '/';
+            }}
+          }}, 1000);
+        </script>
+        """
+
+    html = f"""<!DOCTYPE html>
+    <html lang="en" class="dark">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>{title}</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    </head>
+    <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 text-center shadow-2xl space-y-4">
+        <i class="fa-solid {status_icon} text-5xl"></i>
+        <h1 class="text-2xl font-bold">{title}</h1>
+        <p class="text-sm text-slate-300 leading-relaxed">{res['message']}</p>
+        {f'<p class="text-xs text-emerald-400 font-medium"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Entering trading dashboard in <span id="countdown">2</span>s...</p>' if success else ''}
+        <div class="pt-3 space-y-2">
+          <a href="/" class="inline-block w-full py-3 {'bg-emerald-600 hover:bg-emerald-500' if success else 'bg-slate-800 hover:bg-slate-700 border border-slate-700'} font-semibold text-white rounded-xl shadow transition">
+            {'Enter Trading Dashboard' if success else 'Return to Home'}
+          </a>
+        </div>
+      </div>
+      {auto_script}
+    </body>
+    </html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
 @app.get("/reset-password", response_class=HTMLResponse)
 def reset_password_page(token: str = Query(...)):
     html = f"""<!DOCTYPE html>
@@ -1990,6 +2074,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button type="submit" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-bold text-white rounded-lg shadow transition">
           Sign In
         </button>
+        <div class="relative flex py-2 items-center">
+          <div class="flex-grow border-t border-slate-800"></div>
+          <span class="flex-shrink mx-2 text-[10px] text-slate-500 uppercase">Or</span>
+          <div class="flex-grow border-t border-slate-800"></div>
+        </div>
+        <button type="button" id="btn-magic-login" onclick="handleSendMagicLink()" class="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg border border-slate-700 shadow transition flex items-center justify-center gap-1.5 text-xs">
+          <i class="fa-solid fa-wand-magic-sparkles text-amber-400"></i> Email 1-Click Instant Sign-In Link
+        </button>
         <div class="text-center text-slate-400 pt-2 space-y-1">
           <div>Don't have an account? <a href="javascript:void(0)" onclick="openAuthModal('register')" class="text-emerald-400 font-semibold hover:underline">Register now</a></div>
           <div><a href="javascript:void(0)" onclick="openAuthModal('resend')" class="text-[11px] text-slate-400 hover:text-emerald-400 underline">Didn't receive verification email? Resend link</a></div>
@@ -2689,19 +2781,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function handleLogin(e) {
       e.preventDefault();
-      const user = document.getElementById('login-user').value;
+      const user = document.getElementById('login-user').value.trim();
       const pass = document.getElementById('login-pass').value;
       const notice = document.getElementById('modal-notice');
+      let clientToken = localStorage.getItem('bot_auth_token') || '';
+      if (!clientToken) {
+        try {
+          const saved = JSON.parse(localStorage.getItem('bot_saved_account') || '{}');
+          if (saved && saved.token) clientToken = saved.token;
+        } catch (e) {}
+      }
 
       try {
         const res = await fetch('/api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username_or_email: user, password: pass })
+          body: JSON.stringify({ username_or_email: user, password: pass, client_token: clientToken })
         });
         const data = await res.json();
         if (res.ok && data.success) {
           localStorage.setItem('bot_auth_token', data.token);
+          try {
+            document.cookie = "bot_auth_token=" + encodeURIComponent(data.token) + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+          } catch (ce) {}
+          localStorage.setItem('bot_saved_account', JSON.stringify({
+            username: data.user ? data.user.username : user,
+            email: data.user ? data.user.email : '',
+            token: data.token
+          }));
           closeAuthModal();
           await checkAuth();
         } else {
@@ -2714,11 +2821,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span>Account Verification Required</span>
               </div>
               <p class="text-slate-300 leading-relaxed mt-1">
-                Your account is not yet activated. Please open the verification email sent to <strong>${data.email}</strong> and click the link to activate your account.
+                Your account is pending verification. Please open the email sent to <strong>${data.email || user}</strong> and click the link to activate your account.
               </p>
               <div class="pt-2 flex flex-col gap-2">
-                <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
+                <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email || user}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-paper-plane text-xs"></i> Resend Verification Link
+                </button>
+              </div>
+            `;
+          } else if (data.not_found) {
+            notice.innerHTML = `
+              <div class="flex items-center gap-2 font-bold text-amber-400">
+                <i class="fa-solid fa-triangle-exclamation text-base"></i>
+                <span>Account Not Recognized On This Server</span>
+              </div>
+              <p class="text-slate-300 leading-relaxed mt-1">
+                Unable to locate credentials for <strong>${user}</strong>. You can sign in immediately using a 1-Click Instant Login Link sent to your email:
+              </p>
+              <div class="pt-2 flex flex-col gap-2">
+                <button type="button" id="btn-magic-notfound" onclick="handleSendMagicLink('${data.email || user}', 'btn-magic-notfound')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs">
+                  <i class="fa-solid fa-wand-magic-sparkles text-xs"></i> Email 1-Click Instant Sign-In Link
                 </button>
               </div>
             `;
@@ -2728,6 +2850,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       } catch (err) {
         alert('Login error: ' + err);
+      }
+    }
+
+    async function handleSendMagicLink(presetEmail, btnId) {
+      let email = presetEmail;
+      if (!email || !email.includes('@')) {
+        const userInput = document.getElementById('login-user') ? document.getElementById('login-user').value.trim() : '';
+        if (userInput && userInput.includes('@')) {
+          email = userInput;
+        } else {
+          email = prompt('Enter your registered email address to receive an Instant Sign-In Link:');
+        }
+      }
+      if (!email || !email.includes('@')) {
+        alert('A valid email address is required to send a sign-in link.');
+        return;
+      }
+
+      const btn = btnId ? document.getElementById(btnId) : document.getElementById('btn-magic-login');
+      const oldHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-xs"></i> Sending Link...';
+      }
+
+      const notice = document.getElementById('modal-notice');
+      try {
+        const res = await fetch('/api/auth/magic-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email })
+        });
+        const data = await res.json();
+        if (notice) {
+          notice.classList.remove('hidden');
+          if (data.success) {
+            notice.className = 'p-3.5 rounded-lg border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-2';
+            notice.innerHTML = `
+              <div class="flex items-center gap-2 font-bold text-emerald-400">
+                <i class="fa-solid fa-envelope-circle-check text-base"></i>
+                <span>1-Click Sign-In Link Sent!</span>
+              </div>
+              <p class="text-slate-200 leading-relaxed">
+                We sent an instant sign-in link to <strong>${email}</strong>. Open your email and click the button to log in immediately on this device.
+              </p>
+            `;
+          } else {
+            notice.className = 'p-3 rounded-lg border bg-rose-950/70 border-rose-500/40 text-rose-200 text-xs';
+            notice.innerText = data.detail || data.message || 'Failed to send sign-in link.';
+          }
+        }
+      } catch (e) {
+        alert('Sign-in link error: ' + e);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = oldHtml;
+        }
       }
     }
 
@@ -2747,6 +2927,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         notice.classList.remove('hidden');
         if (res.ok && data.success) {
+          if (data.token) {
+            localStorage.setItem('bot_auth_token', data.token);
+            try {
+              document.cookie = "bot_auth_token=" + encodeURIComponent(data.token) + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+            } catch (ce) {}
+            localStorage.setItem('bot_saved_account', JSON.stringify({
+              username: data.user ? data.user.username : user,
+              email: data.user ? data.user.email : email,
+              token: data.token
+            }));
+            closeAuthModal();
+            await checkAuth();
+            alert('Welcome, ' + (data.user ? data.user.username : user) + '! Your account is active and you are now signed in.');
+            return;
+          }
           if (data.email_sent) {
             notice.className = 'p-4 rounded-xl border bg-emerald-950/80 border-emerald-500/40 text-emerald-200 text-xs space-y-3';
             notice.innerHTML = `
@@ -2887,7 +3082,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function checkAuth() {
       let token = localStorage.getItem('bot_auth_token');
       if (!token) {
-        const m = document.cookie.match(/(?:^|;\\s*)bot_auth_token=([^;]+)/);
+        const m = document.cookie.match(/(?:^|;[ \t]*)bot_auth_token=([^;]+)/);
         if (m) {
           try {
             token = decodeURIComponent(m[1]);
@@ -2921,6 +3116,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (data.authenticated) {
           currentUser = data.user;
+          try {
+            localStorage.setItem('bot_saved_account', JSON.stringify({
+              username: currentUser.username,
+              email: currentUser.email,
+              token: token
+            }));
+          } catch (e) {}
           if (authButtons) authButtons.classList.add('hidden');
           if (userBadge) userBadge.classList.remove('hidden');
           if (authButtonsMob) authButtonsMob.classList.add('hidden');
