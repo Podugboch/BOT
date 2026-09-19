@@ -3151,22 +3151,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (unlockedDiv) unlockedDiv.classList.remove('hidden');
 
           // Render saved exchange keys
-          const list = document.getElementById('configured-keys-list');
-          list.innerHTML = '';
-          if (data.saved_exchanges && data.saved_exchanges.length > 0) {
-            data.saved_exchanges.forEach(k => {
-              const div = document.createElement('div');
-              div.className = 'flex items-center justify-between bg-slate-900/90 border border-slate-800 rounded-lg p-2 text-xs';
-              div.innerHTML = `
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="font-bold text-white uppercase">${k.exchange_id}</span>
-                  <span class="text-[10px] px-1.5 py-0.5 rounded ${k.testnet ? 'bg-blue-500/20 text-blue-300' : 'bg-emerald-500/20 text-emerald-300'} shrink-0">${k.testnet ? 'TESTNET' : 'LIVE'}</span>
-                  <span class="font-mono text-slate-400 text-[11px] truncate">${k.api_key_masked}</span>
-                </div>
-                <span class="text-[10px] text-slate-500 shrink-0">Configured</span>
-              `;
-              list.appendChild(div);
-            });
+          const list = document.getElementById('saved-keys-list') || document.getElementById('configured-keys-list');
+          if (list) {
+            list.innerHTML = '';
+            if (data.saved_exchanges && data.saved_exchanges.length > 0) {
+              data.saved_exchanges.forEach(k => {
+                const div = document.createElement('div');
+                div.className = 'flex items-center justify-between bg-slate-900/90 border border-slate-800 rounded-lg p-2 text-xs';
+                div.innerHTML = `
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span class="font-bold text-white uppercase">${k.exchange_id}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded ${k.testnet ? 'bg-blue-500/20 text-blue-300' : 'bg-emerald-500/20 text-emerald-300'} shrink-0">${k.testnet ? 'TESTNET' : 'LIVE'}</span>
+                    <span class="font-mono text-slate-400 text-[11px] truncate">${k.api_key_masked}</span>
+                  </div>
+                  <span class="text-[10px] text-slate-500 shrink-0">Configured</span>
+                `;
+                list.appendChild(div);
+              });
+            } else {
+              list.innerHTML = '<div class="text-slate-500 italic">No custom keys saved yet. Bot currently defaults to Binance public data / paper mode.</div>';
+            }
           }
         } else {
           localStorage.removeItem('bot_auth_token');
@@ -3182,8 +3186,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       } catch (e) {
         console.error('Check auth error:', e);
-        if (lockedDiv) lockedDiv.classList.remove('hidden');
-        if (unlockedDiv) unlockedDiv.classList.add('hidden');
+        if (!currentUser) {
+          if (lockedDiv) lockedDiv.classList.remove('hidden');
+          if (unlockedDiv) unlockedDiv.classList.add('hidden');
+        }
       }
     }
 
