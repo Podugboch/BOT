@@ -1665,3 +1665,6 @@ class AuthService:
 
 # Initialize DB on module import
 init_auth_db()
+
+auth_service = AuthService
+

@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Response, Request, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from pydantic import BaseModel, model_validator
 import uvicorn
 import pandas as pd
 import numpy as np
@@ -42,7 +42,8 @@ from strategy import Signal, add_indicators, generate_signal, _near_fib_support,
 from risk_manager import RiskManager
 from backtester import fetch_historical, run_backtest, summarize
 from bot import TradingBot, setup_logging
-from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection
+from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection, auth_service
+auth_service = AuthService
 
 AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 
@@ -212,9 +213,20 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username_or_email: str
+    username: Optional[str] = None
+    username_or_email: Optional[str] = None
     password: str
     client_token: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_usernames(cls, values):
+        if isinstance(values, dict):
+            u = values.get("username") or values.get("username_or_email")
+            if u:
+                values.setdefault("username", u)
+                values.setdefault("username_or_email", u)
+        return values
 
 
 class MagicLinkRequest(BaseModel):
@@ -373,14 +385,25 @@ def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
     return res
 
 
+@app.post("/api/login")
 @app.post("/api/auth/login")
-def login(req: LoginRequest, response: Response):
-    res = AuthService.login(req.username_or_email, req.password, client_token=req.client_token)
-    if not res["success"]:
-        return JSONResponse(status_code=400, content=res)
-    if res.get("token"):
-        response.set_cookie(key="bot_auth_token", value=res["token"], max_age=2592000, path="/", samesite="lax", secure=True)
-    return res
+async def login(payload: LoginRequest):
+    try:
+        # Authentication logic here
+        result = auth_service.login(payload.username, payload.password)
+        if not result.get("success"):
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "message": result.get("message", "Invalid credentials")}
+            )
+        return result
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()  # Check terminal logs for full stack trace
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": f"Internal server error: {str(exc)}"}
+        )
 
 
 @app.post("/api/auth/magic-link")
@@ -2795,10 +2818,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       try {
-        const res = await fetch('/api/auth/login', {
+        const res = await fetch('/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username_or_email: user, password: pass, client_token: clientToken })
+          body: JSON.stringify({ username: user, username_or_email: user, password: pass, client_token: clientToken })
         });
         const data = await res.json();
         if (res.ok && data.success) {
@@ -2816,14 +2839,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } else {
           notice.classList.remove('hidden');
           notice.className = 'p-3 rounded-lg border bg-rose-950/70 border-rose-500/40 text-rose-200 text-xs';
-          if (data.needs_activation) {
+          const msg = (data && data.message) ? data.message : 'Invalid credentials';
+          if (data.needs_activation || msg.toLowerCase().includes('not activated') || msg.toLowerCase().includes('activation')) {
             notice.innerHTML = `
               <div class="flex items-center gap-2 font-bold text-amber-400">
                 <i class="fa-solid fa-envelope-open-text text-base"></i>
                 <span>Account Verification Required</span>
               </div>
               <p class="text-slate-300 leading-relaxed mt-1">
-                Your account is pending verification. Please open the email sent to <strong>${data.email || user}</strong> and click the link to activate your account.
+                ${msg}
               </p>
               <div class="pt-2 flex flex-col gap-2">
                 <button type="button" id="btn-resend-login" onclick="resendVerificationLink('${data.email || user}', 'btn-resend-login')" class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5">
@@ -2831,7 +2855,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </button>
               </div>
             `;
-          } else if (data.not_found) {
+          } else if (data.not_found || msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('invalid')) {
             notice.innerHTML = `
               <div class="flex items-center gap-2 font-bold text-amber-400">
                 <i class="fa-solid fa-triangle-exclamation text-base"></i>
