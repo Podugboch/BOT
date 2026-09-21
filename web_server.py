@@ -727,10 +727,21 @@ def save_exchange_credentials(
     if ex_id not in ccxt.exchanges:
         raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange_id}'")
 
-    # Store in DB per user (encrypted at rest)
-    AuthService.save_exchange_key(
-        user["id"], ex_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
-    )
+    try:
+        # Store in DB per user (encrypted at rest)
+        AuthService.save_exchange_key(
+            user["id"], ex_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
+        )
+    except Exception as e:
+        logger.exception("Failed saving exchange credentials for user %s on %s", user.get("id"), ex_id)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": "Could not save exchange credentials. Please retry, or check server storage configuration.",
+                "detail": str(e),
+            },
+        )
 
     # In-memory updates for non-sensitive routing metadata only
     os.environ["EXCHANGE_ID"] = ex_id
@@ -2933,10 +2944,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           headers: headers,
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
+        const raw = await res.text();
+        let data;
+        try {
+          data = raw ? JSON.parse(raw) : {};
+        } catch (parseErr) {
+          data = {
+            success: false,
+            message: raw ? raw.slice(0, 300) : ('HTTP ' + res.status + ' ' + res.statusText)
+          };
+        }
         const resBox = document.getElementById('key-test-result');
         resBox.classList.remove('hidden');
-        if (data.success) {
+        if (res.ok && data.success) {
           resBox.className = 'text-xs p-3 rounded-lg border bg-emerald-950/60 border-emerald-500/40 text-emerald-200';
           resBox.innerHTML = `<strong><i class="fa-solid fa-check"></i> ${data.message}</strong>`;
           await checkAuth();
