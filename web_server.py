@@ -1576,19 +1576,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       animation: slideDown 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
     @media (min-width: 768px) {
-      .responsive-modal-section {
+      #section-kpi,
+      #panel-market-analysis,
+      #section-api-keys,
+      #section-backtester,
+      #section-bot-activity {
         display: block !important;
-        position: static !important;
-        background: transparent !important;
-        backdrop-filter: none !important;
-        padding: 0 !important;
-        z-index: auto !important;
-        overflow: visible !important;
+      }
+      #section-account {
+        display: none !important;
+      }
+      .mobile-only-header {
+        display: none !important;
+      }
+    }
+    @media (max-width: 767px) {
+      #section-api-keys,
+      #section-backtester,
+      #section-bot-activity,
+      #section-account {
+        display: none;
+      }
+      body.mobile-view-dashboard #section-kpi,
+      body.mobile-view-dashboard #dashboard-detail-grid,
+      body.mobile-view-dashboard #panel-market-analysis,
+      body.mobile-view-backtester #dashboard-detail-grid,
+      body.mobile-view-keys #section-api-keys,
+      body.mobile-view-backtester #section-backtester,
+      body.mobile-view-activity #section-bot-activity,
+      body.mobile-view-account #section-account {
+        display: block;
+      }
+      body.mobile-view-dashboard #dashboard-detail-grid,
+      body.mobile-view-backtester #dashboard-detail-grid {
+        display: grid;
+      }
+      body:not(.mobile-view-dashboard) #section-kpi,
+      body:not(.mobile-view-dashboard) #position-banner,
+      body:not(.mobile-view-dashboard) #panel-market-analysis {
+        display: none !important;
+      }
+      body:not(.mobile-view-dashboard):not(.mobile-view-backtester) #dashboard-detail-grid {
+        display: none !important;
       }
     }
   </style>
 </head>
-<body class="bg-darkbg text-slate-100 min-h-screen font-sans antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+<body class="mobile-view-dashboard bg-darkbg text-slate-100 min-h-screen font-sans antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
 
   <!-- Top Navigation -->
   <header class="border-b border-bordercol bg-cardbg/95 backdrop-blur-md sticky top-0 z-40">
@@ -1666,137 +1700,91 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- Mobile Dropdown Navigation Drawer -->
-      <div id="mobile-menu-panel" class="hidden md:hidden pt-3 mt-2 border-t border-bordercol/80 space-y-3 text-xs animate-slideDown max-h-[82vh] overflow-y-auto pb-4">
-        <!-- 1. Profile & Account Section (Top of Hamburger Menu) -->
-        <!-- Logged Out View -->
-        <div id="auth-buttons-mobile" class="p-3 bg-slate-900/90 rounded-xl border border-bordercol/80 space-y-2.5">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-2 text-slate-300">
-              <i class="fa-solid fa-circle-user text-slate-400 text-base"></i>
-              <span class="font-semibold text-slate-200">Guest Account</span>
-            </div>
-            <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-medium">Logged Out</span>
-          </div>
-          <p class="text-[11px] text-slate-400">Log in or create an account to configure Exchange API keys and live trading.</p>
-          <div class="grid grid-cols-2 gap-2 pt-1">
-            <button onclick="openAuthModal('login'); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition text-center flex items-center justify-center gap-1.5">
-              <i class="fa-solid fa-right-to-bracket text-xs"></i>
-              <span>Login</span>
-            </button>
-            <button onclick="openAuthModal('register'); toggleMobileMenu();" class="py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition text-center flex items-center justify-center gap-1.5">
-              <i class="fa-solid fa-user-plus text-xs"></i>
-              <span>Register</span>
-            </button>
-          </div>
+      <div id="mobile-menu-panel" class="hidden md:hidden pt-2.5 mt-2 border-t border-bordercol/80 space-y-2 text-xs animate-slideDown max-h-[85vh] overflow-y-auto pb-4">
+        <!-- Auth / Profile Top Action (Clean like Screenshot 2) -->
+        <div id="auth-buttons-mobile">
+          <button type="button" onclick="openAuthModal('login'); toggleMobileMenu();" class="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl shadow transition flex items-center justify-center gap-2 text-xs">
+            <i class="fa-solid fa-user"></i>
+            <span>SIGN IN / REGISTER</span>
+          </button>
         </div>
 
-        <!-- Logged In Profile View with Delete Button -->
-        <div id="user-badge-mobile" class="hidden p-3 bg-slate-900/90 rounded-xl border border-bordercol/80 space-y-2.5">
-          <div class="flex items-center justify-between">
+        <div id="user-badge-mobile" class="hidden">
+          <button type="button" onclick="showMobileView('account'); toggleMobileMenu();" class="w-full p-2.5 bg-slate-900 border border-emerald-500/40 hover:border-emerald-500 rounded-xl text-left flex items-center justify-between transition">
             <div class="flex items-center gap-2.5 min-w-0">
               <div class="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 flex items-center justify-center shrink-0">
                 <i class="fa-solid fa-user text-sm"></i>
               </div>
               <div class="min-w-0">
-                <div class="font-bold text-white text-xs truncate flex items-center gap-1.5">
-                  <span id="user-name-display-mobile"></span>
-                  <span class="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Active</span>
-                </div>
-                <div class="text-[10px] text-slate-400 truncate">Trader Profile</div>
+                <div class="font-bold text-white text-xs truncate" id="user-name-display-mobile">Account</div>
+                <div class="text-[10px] text-emerald-400">View Profile & Delete Account</div>
               </div>
             </div>
-            <button onclick="logout(); toggleMobileMenu();" class="text-xs px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-rose-300 rounded-lg border border-bordercol flex items-center gap-1 transition">
-              <i class="fa-solid fa-arrow-right-from-bracket"></i> Logout
-            </button>
-          </div>
-
-          <!-- Profile Actions & Delete Button -->
-          <div class="pt-2 border-t border-bordercol/60 flex items-center justify-between gap-2">
-            <span class="text-[11px] text-slate-400">Account Safety</span>
-            <button onclick="confirmDeleteAccount()" class="text-xs px-2.5 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 hover:text-rose-300 border border-rose-500/30 rounded-lg flex items-center gap-1.5 transition font-semibold" title="Permanently delete registered profile and stored keys">
-              <i class="fa-solid fa-trash-can text-[11px]"></i> Delete Account
-            </button>
-          </div>
-        </div>
-
-        <!-- 2. Hamburger Navigation List -->
-        <div class="space-y-1.5 pt-1">
-          <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">Navigation & Tools</div>
-
-          <!-- Exchange API Keys Item -->
-          <button type="button" onclick="openMobileSection('modal-api-keys'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
-                <i class="fa-solid fa-key text-sm"></i>
-              </div>
-              <div>
-                <div class="font-bold text-white text-xs group-hover:text-amber-400 transition">Exchange API Keys & Credential Management</div>
-                <div class="text-[10px] text-slate-400">Configure keys, testnet & live credentials</div>
-              </div>
-            </div>
-            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
-          </button>
-
-          <!-- Bot Activity Item -->
-          <button type="button" onclick="openMobileSection('modal-bot-activity'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
-                <i class="fa-solid fa-terminal text-sm"></i>
-              </div>
-              <div>
-                <div class="font-bold text-white text-xs group-hover:text-emerald-400 transition">Bot Activity</div>
-                <div class="text-[10px] text-slate-400">Live trading logs & cycle terminal stream</div>
-              </div>
-            </div>
-            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
-          </button>
-
-          <!-- Backtester Item -->
-          <button type="button" onclick="openMobileSection('modal-backtester'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center shrink-0">
-                <i class="fa-solid fa-vial text-sm"></i>
-              </div>
-              <div>
-                <div class="font-bold text-white text-xs group-hover:text-purple-400 transition">Backtester</div>
-                <div class="text-[10px] text-slate-400">Run historical backtests & strategy stats</div>
-              </div>
-            </div>
-            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
-          </button>
-
-          <!-- Bot Settings Item -->
-          <button type="button" onclick="openSettingsModal(); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
-                <i class="fa-solid fa-gear text-sm"></i>
-              </div>
-              <div>
-                <div class="font-bold text-white text-xs group-hover:text-sky-400 transition">Settings</div>
-                <div class="text-[10px] text-slate-400">Strategy indicators, risk parameters, auto/manual</div>
-              </div>
-            </div>
-            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
-          </button>
-
-          <!-- Email Settings Item -->
-          <button type="button" onclick="openEmailSettingsModal(); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center shrink-0">
-                <i class="fa-solid fa-envelope text-sm"></i>
-              </div>
-              <div>
-                <div class="font-bold text-white text-xs group-hover:text-blue-400 transition">Email & Verification Settings</div>
-                <div class="text-[10px] text-slate-400">SMTP provider, verification codes & resend</div>
-              </div>
-            </div>
-            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+            <i class="fa-solid fa-chevron-right text-emerald-400 text-xs"></i>
           </button>
         </div>
 
-        <!-- 3. Emergency Kill Switch (Bottom of Hamburger Menu) -->
+        <!-- Clean Navigation Links (One page at a time) -->
+        <div class="bg-cardbg rounded-xl border border-bordercol divide-y divide-bordercol/60 overflow-hidden shadow-lg">
+          <!-- 1. Live Dashboard -->
+          <button type="button" onclick="showMobileView('dashboard'); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-chart-line text-emerald-400 w-4 text-center"></i>
+              <span>Live Dashboard</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+          <!-- 2. Profile & Account -->
+          <button type="button" onclick="showMobileView('account'); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-id-card text-sky-400 w-4 text-center"></i>
+              <span>Profile & Delete Account</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+          <!-- 3. Exchange API Keys & Credential Management -->
+          <button type="button" onclick="showMobileView('keys'); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-key text-amber-400 w-4 text-center"></i>
+              <span>Exchange API Keys & Credentials</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+          <!-- 4. Settings -->
+          <button type="button" onclick="openSettingsModal(); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-gear text-indigo-400 w-4 text-center"></i>
+              <span>Settings & Strategy Parameters</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+          <!-- 5. Backtester -->
+          <button type="button" onclick="showMobileView('backtester'); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-vial text-purple-400 w-4 text-center"></i>
+              <span>Honest Backtester</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+          <!-- 6. Bot Activity -->
+          <button type="button" onclick="showMobileView('activity'); toggleMobileMenu();" class="w-full px-3.5 py-3 text-left flex items-center justify-between text-slate-200 hover:bg-slate-800/60 active:bg-slate-800 transition font-medium">
+            <div class="flex items-center gap-2.5">
+              <i class="fa-solid fa-terminal text-teal-400 w-4 text-center"></i>
+              <span>Bot Activity Logs</span>
+            </div>
+            <i class="fa-solid fa-caret-right text-slate-500 text-xs"></i>
+          </button>
+
+        </div>
+
+        <!-- Emergency Kill Switch (Bottom item) -->
         <div class="pt-1">
-          <button type="button" onclick="triggerKillSwitch()" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-xl transition flex items-center justify-center gap-2">
+          <button type="button" onclick="triggerKillSwitch(); toggleMobileMenu();" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-xl transition flex items-center justify-center gap-2 text-xs">
             <i class="fa-solid fa-skull-crossbones"></i>
             <span>Emergency Kill Switch</span>
           </button>
@@ -1808,8 +1796,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Main Container -->
   <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-5 space-y-4 sm:space-y-5 pb-safe-main md:pb-6">
 
-    <!-- KPI Cards Grid -->
-    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
+    <!-- KPI Cards Grid (Dashboard Landing Page) -->
+    <div id="section-kpi" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
       <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
         <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Portfolio Equity</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-white truncate" id="val-equity">$1,000.00</div>
@@ -1860,29 +1848,111 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <!-- ========================================================================= -->
-    <!-- EXCHANGE API KEYS CONFIGURATION SECTION                                   -->
-    <!-- Desktop: in-page card | Mobile: modal opened via hamburger menu            -->
+    <!-- MOBILE PROFILE & ACCOUNT VIEW (Shown on mobile when Account is clicked)   -->
     <!-- ========================================================================= -->
-    <div id="modal-api-keys" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
-      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 max-w-4xl w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
-        <div class="flex items-center justify-between border-b border-bordercol pb-3 gap-2">
-          <div class="flex items-center gap-2">
-            <i class="fa-solid fa-key text-amber-400"></i>
-            <div>
-              <h2 class="font-bold text-sm text-white">Exchange API Keys & Credential Management</h2>
-              <p class="text-[11px] text-slate-400">Select an exchange first, then enter your API credentials with trade permissions.</p>
+    <div id="section-account" class="hidden md:hidden space-y-4">
+      <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3">
+        <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <span class="text-xs font-bold text-slate-400">My Profile & Account</span>
+      </div>
+
+      <!-- Logged Out State -->
+      <div id="account-view-logged-out" class="bg-cardbg border border-bordercol rounded-xl p-6 text-center space-y-4">
+        <div class="w-14 h-14 rounded-full bg-slate-800 border border-bordercol flex items-center justify-center mx-auto text-slate-400 text-2xl">
+          <i class="fa-solid fa-circle-user"></i>
+        </div>
+        <div>
+          <h2 class="text-base font-bold text-white">Sign In to Your Account</h2>
+          <p class="text-xs text-slate-400 mt-1">Log in or register to configure exchange API keys and control live trading.</p>
+        </div>
+        <div class="flex flex-col gap-2 pt-2">
+          <button type="button" onclick="openAuthModal('login')" class="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg text-xs flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-right-to-bracket"></i> Log In
+          </button>
+          <button type="button" onclick="openAuthModal('register')" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg text-xs shadow flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-user-plus"></i> Create Account
+          </button>
+        </div>
+      </div>
+
+      <!-- Logged In State with Delete Button -->
+      <div id="account-view-logged-in" class="hidden space-y-4">
+        <div class="bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
+          <div class="flex items-center gap-3">
+            <div class="w-12 h-12 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center text-xl shrink-0 font-bold">
+              <i class="fa-solid fa-user"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="text-base font-bold text-white truncate flex items-center gap-2">
+                <span id="account-view-username">Trader</span>
+                <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">Active</span>
+              </div>
+              <div class="text-xs text-slate-400 truncate mt-0.5" id="account-view-email">trader@example.com</div>
             </div>
           </div>
-          <div class="flex items-center gap-2">
-            <span class="hidden sm:inline-block text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium shrink-0">
-              <i class="fa-solid fa-shield-halved"></i> Trade-only keys (No withdrawal)
-            </span>
-            <!-- Mobile Close Button -->
-            <button type="button" onclick="closeMobileSection('modal-api-keys')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close exchange keys modal">
-              <i class="fa-solid fa-xmark"></i>
+
+          <div class="grid grid-cols-2 gap-2 text-xs pt-2 border-t border-bordercol">
+            <div class="p-2.5 bg-slate-900/80 rounded-lg border border-bordercol/60">
+              <div class="text-[10px] text-slate-400">Account Role</div>
+              <div class="font-bold text-slate-200 mt-0.5">Bot Administrator</div>
+            </div>
+            <div class="p-2.5 bg-slate-900/80 rounded-lg border border-bordercol/60">
+              <div class="text-[10px] text-slate-400">Session Status</div>
+              <div class="font-bold text-emerald-400 mt-0.5">Authenticated</div>
+            </div>
+          </div>
+
+          <div class="pt-2 flex items-center justify-between gap-2 border-t border-bordercol">
+            <span class="text-xs text-slate-400">Current Session</span>
+            <button type="button" onclick="logout()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-rose-300 rounded-lg border border-bordercol text-xs font-semibold flex items-center gap-1.5 transition">
+              <i class="fa-solid fa-arrow-right-from-bracket"></i> Log Out
             </button>
           </div>
         </div>
+
+        <!-- Danger Zone Card: Delete Account -->
+        <div class="bg-rose-950/20 border border-rose-500/40 rounded-xl p-5 space-y-3">
+          <div class="flex items-center gap-2 text-rose-400 font-bold text-sm">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            <span>Danger Zone</span>
+          </div>
+          <p class="text-xs text-slate-400 leading-relaxed">
+            Permanently delete your profile, active sessions, and stored exchange API keys. This action is immediate and cannot be undone.
+          </p>
+          <button type="button" onclick="confirmDeleteAccount()" class="w-full py-2.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold rounded-lg text-xs shadow transition flex items-center justify-center gap-2">
+            <i class="fa-solid fa-trash-can"></i> Delete My Account
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- EXCHANGE API KEYS CONFIGURATION SECTION                                   -->
+    <!-- Desktop: in-page card | Mobile: separate page view                         -->
+    <!-- ========================================================================= -->
+    <div id="section-api-keys" class="hidden md:block bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
+      <!-- Mobile Back Header -->
+      <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3 mb-2 md:hidden">
+        <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <span class="text-xs font-bold text-slate-400">Exchange API Keys</span>
+      </div>
+
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-bordercol pb-3 gap-2">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-key text-amber-400"></i>
+          <div>
+            <h2 class="font-bold text-sm text-white">Exchange API Keys & Credential Management</h2>
+            <p class="text-[11px] text-slate-400">Select an exchange first, then enter your API credentials with trade permissions.</p>
+          </div>
+        </div>
+        <span class="self-start sm:self-auto text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium shrink-0">
+          <i class="fa-solid fa-shield-halved"></i> Trade-only keys (No withdrawal)
+        </span>
+      </div>
 
       <!-- LOCKED STATE: Shown when user is not logged in -->
       <div id="api-keys-locked" class="bg-slate-900/90 border border-bordercol/80 rounded-xl p-5 sm:p-8 text-center space-y-3">
@@ -2004,9 +2074,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
     <!-- Live Analysis & Backtester 2-col layout -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+    <div id="dashboard-detail-grid" class="grid grid-cols-1 lg:grid-cols-3 gap-5">
       <!-- Live Market Analysis (2 cols) -->
-      <div class="lg:col-span-2 bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
+      <div id="panel-market-analysis" class="lg:col-span-2 bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
         <div class="flex items-center justify-between border-b border-bordercol pb-3 flex-wrap gap-2">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-radar text-emerald-400"></i>
@@ -2116,21 +2186,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- Quick Backtester Panel (1 col) -->
-      <!-- Desktop: in-page 3rd col | Mobile: modal opened via hamburger menu -->
-      <div id="modal-backtester" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
-        <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 max-w-lg w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
+      <!-- Desktop: in-page 3rd col | Mobile: separate hamburger page view -->
+      <div id="section-backtester" class="hidden md:block">
+        <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 w-full">
+          <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3 mb-2 md:hidden">
+            <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+              <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+            </button>
+            <span class="text-xs font-bold text-slate-400">Backtester</span>
+          </div>
           <div class="flex items-center justify-between border-b border-bordercol pb-3">
             <div class="flex items-center gap-2">
               <i class="fa-solid fa-vial text-purple-400"></i>
               <h2 class="font-bold text-sm text-white">Honest Backtester</h2>
             </div>
-            <div class="flex items-center gap-2">
-              <span class="text-[10px] text-slate-400 hidden sm:inline">No lookahead bias</span>
-              <!-- Mobile Close Button -->
-              <button type="button" onclick="closeMobileSection('modal-backtester')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close backtester modal">
-                <i class="fa-solid fa-xmark"></i>
-              </button>
-            </div>
+            <span class="text-[10px] text-slate-400 hidden sm:inline">No lookahead bias</span>
           </div>
 
         <form id="backtest-form" onsubmit="executeBacktest(event)" class="space-y-3 text-xs">
@@ -2216,9 +2286,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <!-- Live Activity Logs -->
-    <!-- Desktop: in-page card | Mobile: modal opened via hamburger menu -->
-    <div id="modal-bot-activity" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
-      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-3 max-w-4xl w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
+    <!-- Desktop: in-page card | Mobile: separate hamburger page view -->
+    <div id="section-bot-activity" class="hidden md:block">
+      <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3 mb-3 md:hidden">
+        <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <span class="text-xs font-bold text-slate-400">Bot Activity</span>
+      </div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-3 w-full">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-terminal text-slate-400"></i>
@@ -2227,10 +2303,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="flex items-center gap-2">
             <button type="button" onclick="refreshLogs()" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol">
               <i class="fa-solid fa-rotate"></i> Refresh
-            </button>
-            <!-- Mobile Close Button -->
-            <button type="button" onclick="closeMobileSection('modal-bot-activity')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close bot activity modal">
-              <i class="fa-solid fa-xmark"></i>
             </button>
           </div>
         </div>
@@ -2255,24 +2327,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="text-[10px] font-semibold mt-0.5">Kill</span>
     </button>
 
-    <!-- 3. Bot Settings -->
-    <button onclick="openSettingsModal()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1">
-      <i class="fa-solid fa-gear text-amber-400 text-base"></i>
-      <span class="text-[10px] font-semibold mt-0.5">Settings</span>
-    </button>
-
-    <!-- 4. Email & Verification Settings -->
-    <button onclick="openEmailSettingsModal()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1 relative">
-      <span id="email-status-dot-bottom" class="w-2 h-2 rounded-full bg-slate-500 absolute top-1 right-1/4"></span>
-      <i class="fa-solid fa-envelope text-sky-400 text-base"></i>
-      <span class="text-[10px] font-semibold mt-0.5">Email</span>
-    </button>
-
-    <!-- 5. User Account -->
-    <button id="bottom-btn-account" onclick="handleMobileAccountClick()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-300 hover:text-white active:scale-95 transition flex-1">
-      <i class="fa-solid fa-circle-user text-emerald-400 text-base"></i>
-      <span id="bottom-account-text" class="text-[10px] font-semibold mt-0.5 truncate max-w-[60px]">Account</span>
-    </button>
   </nav>
 
   <!-- ========================================================================= -->
@@ -3313,40 +3367,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function openMobileSection(sectionId) {
-      const el = document.getElementById(sectionId);
-      if (!el) return;
-      el.classList.remove('hidden');
-      el.classList.add('flex');
-      if (sectionId === 'modal-bot-activity') {
+    function showMobileView(view) {
+      const activeView = view || 'dashboard';
+      document.body.classList.remove(
+        'mobile-view-dashboard',
+        'mobile-view-keys',
+        'mobile-view-backtester',
+        'mobile-view-activity',
+        'mobile-view-account'
+      );
+      document.body.classList.add('mobile-view-' + activeView);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      if (activeView === 'activity') {
         refreshLogs();
+      }
+      if (activeView === 'account') {
+        renderMobileAccountView();
       }
     }
 
-    function closeMobileSection(sectionId) {
-      const el = document.getElementById(sectionId);
-      if (!el) return;
-      el.classList.remove('flex');
-      el.classList.add('hidden');
+    function renderMobileAccountView() {
+      const loggedOut = document.getElementById('account-view-logged-out');
+      const loggedIn = document.getElementById('account-view-logged-in');
+      const name = document.getElementById('account-view-username');
+      const email = document.getElementById('account-view-email');
+      if (!loggedOut || !loggedIn) return;
+      if (!currentUser) {
+        loggedOut.classList.remove('hidden');
+        loggedIn.classList.add('hidden');
+        return;
+      }
+      loggedOut.classList.add('hidden');
+      loggedIn.classList.remove('hidden');
+      if (name) name.innerText = currentUser.username || 'Trader';
+      if (email) email.innerText = currentUser.email || 'No email saved';
     }
 
     function handleMobileAccountClick() {
-      toggleMobileMenu();
+      showMobileView('account');
     }
 
-    document.addEventListener('click', function(e) {
-      if (window.innerWidth >= 768) return;
-      ['modal-api-keys', 'modal-backtester', 'modal-bot-activity'].forEach(function(id) {
-        const modal = document.getElementById(id);
-        if (modal && !modal.classList.contains('hidden') && e.target === modal) {
-          closeMobileSection(id);
-        }
-      });
-    });
-
     document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') {
-        ['modal-api-keys', 'modal-backtester', 'modal-bot-activity'].forEach(closeMobileSection);
+      if (e.key === 'Escape' && window.innerWidth < 768) {
+        showMobileView('dashboard');
       }
     });
 
@@ -3388,7 +3451,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const userBadgeMob = document.getElementById('user-badge-mobile');
       const lockedDiv = document.getElementById('api-keys-locked');
       const unlockedDiv = document.getElementById('api-keys-unlocked');
-      const bottomAccountText = document.getElementById('bottom-account-text');
 
       if (!token) {
         if (authButtons) authButtons.classList.remove('hidden');
@@ -3397,7 +3459,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (userBadgeMob) userBadgeMob.classList.add('hidden');
         if (lockedDiv) lockedDiv.classList.remove('hidden');
         if (unlockedDiv) unlockedDiv.classList.add('hidden');
-        if (bottomAccountText) bottomAccountText.innerText = 'Account';
+        renderMobileAccountView();
         return;
       }
 
@@ -3426,9 +3488,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (document.getElementById('user-name-display-mobile')) {
             document.getElementById('user-name-display-mobile').innerText = currentUser.username;
           }
-          if (bottomAccountText) {
-            bottomAccountText.innerText = currentUser.username.length > 7 ? currentUser.username.slice(0, 6) + '…' : currentUser.username;
-          }
+          renderMobileAccountView();
 
           if (lockedDiv) lockedDiv.classList.add('hidden');
           if (unlockedDiv) unlockedDiv.classList.remove('hidden');
@@ -3465,7 +3525,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (userBadgeMob) userBadgeMob.classList.add('hidden');
           if (lockedDiv) lockedDiv.classList.remove('hidden');
           if (unlockedDiv) unlockedDiv.classList.add('hidden');
-          if (bottomAccountText) bottomAccountText.innerText = 'Account';
+          renderMobileAccountView();
         }
       } catch (e) {
         console.error('Check auth error:', e);
@@ -4105,7 +4165,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ? 'w-2 h-2 rounded-full bg-emerald-400 inline-block'
             : 'w-2 h-2 rounded-full bg-amber-400 inline-block animate-pulse';
         }
-        ['email-status-dot', 'email-status-dot-mobile', 'email-status-dot-bottom'].forEach(id => {
+        ['email-status-dot', 'email-status-dot-mobile'].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.className = cls;
         });
