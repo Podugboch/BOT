@@ -21,6 +21,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+import html
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -44,6 +45,22 @@ from storage_adapter import (
 )
 
 safe_load_dotenv()
+
+
+def is_valid_username(username: str) -> bool:
+    if not username or not isinstance(username, str):
+        return False
+    u = username.strip()
+    return 3 <= len(u) <= 32 and bool(re.match(r"^[a-zA-Z0-9_.-]+$", u))
+
+
+def is_valid_email(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    e = email.strip().lower()
+    if len(e) > 254 or "\r" in e or "\n" in e:
+        return False
+    return bool(re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", e))
 
 
 def generate_activation_token(user_id: int, username: str, email: str, *args, expires_hours: int = 24, **kwargs) -> str:
@@ -554,7 +571,7 @@ def save_email_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     ]
     for k in allowed_keys:
         if k in settings and settings[k] is not None:
-            val = str(settings[k]).strip()
+            val = str(settings[k]).replace("\r", "").replace("\n", "").strip()
             # Do not overwrite sensitive credentials with blank if already configured
             if k in ["SMTP_PASS", "RESEND_API_KEY", "BREVO_API_KEY", "SENDGRID_API_KEY"] and val == "":
                 continue
@@ -873,8 +890,8 @@ def send_email_message(to_email: str, subject: str, body: str, token: str, email
 
 def test_email_connection(to_email: str) -> Dict[str, Any]:
     """Test sending a verification email to the specified address."""
-    to_email = to_email.strip().lower()
-    if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+    to_email = (to_email or "").strip().lower()
+    if not is_valid_email(to_email):
         return {"success": False, "message": "Invalid test email address format"}
 
     settings = get_email_settings()
@@ -891,10 +908,10 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
       <h2 style="color: #22c55e; margin-top: 0;">✓ Email Dispatch Test Successful!</h2>
       <p>Hello,</p>
       <p>This is a confirmation test email sent from your <strong>Trader Queen</strong> platform.</p>
-      <p>Your email service (<strong>{settings['provider'].upper()}</strong>) is configured and working properly!</p>
+      <p>Your email service (<strong>{html.escape(settings['provider'].upper())}</strong>) is configured and working properly!</p>
       <div style="background: #1e293b; padding: 12px 16px; border-radius: 8px; margin: 20px 0; font-family: monospace; font-size: 12px;">
-        Provider: {settings['provider'].upper()}<br>
-        Recipient: {to_email}<br>
+        Provider: {html.escape(settings['provider'].upper())}<br>
+        Recipient: {html.escape(to_email)}<br>
         Dispatched at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
       </div>
       <p style="font-size: 12px; color: #64748b; border-top: 1px solid #334155; padding-top: 15px;">Trader Queen Verification Engine</p>
@@ -915,15 +932,17 @@ def test_email_connection(to_email: str) -> Dict[str, Any]:
 class AuthService:
     @staticmethod
     def register(username: str, email: str, password: str, base_url: str = "http://localhost:8000", auto_activate: Optional[bool] = None) -> Dict[str, Any]:
-        username = username.strip()
-        email = email.strip().lower()
+        username = (username or "").strip()
+        email = (email or "").strip().lower()
 
-        if len(username) < 3:
-            return {"success": False, "message": "Username must be at least 3 characters long"}
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        if not is_valid_username(username):
+            return {"success": False, "message": "Username must be between 3 and 32 characters long and contain only letters, numbers, underscores, dashes, and periods"}
+        if not is_valid_email(email):
             return {"success": False, "message": "Invalid email address format"}
         if len(password) < 10:
             return {"success": False, "message": "Password must be at least 10 characters long"}
+        if len(password) > 128:
+            return {"success": False, "message": "Password is too long (maximum 128 characters)"}
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -970,12 +989,12 @@ class AuthService:
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">{"Welcome to Trader Queen" if auto_activate else "Activate Your Trader Queen Account"}</h2>
-          <p>Hello <strong>{username}</strong>,</p>
+          <p>Hello <strong>{html.escape(username)}</strong>,</p>
           <p>{"Thank you for registering on the Trader Queen platform! Your account is active and ready to trade." if auto_activate else "Thank you for registering on the Trader Queen platform. Please click the button below to accept and activate your account:"}</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">{"Open Trading Dashboard" if auto_activate else "Activate Account"}</a>
           </div>
-          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{activation_link}" style="color: #38bdf8;">{activation_link}</a></p>
+          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{activation_link}" style="color: #38bdf8;">{html.escape(activation_link)}</a></p>
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">{"This direct access link is secured for your account." if auto_activate else "This activation link expires in 24 hours."}</p>
         </div>
         """
@@ -1099,8 +1118,8 @@ class AuthService:
 
     @staticmethod
     def resend_activation_email(email: str, base_url: str = "http://localhost:8000") -> Dict[str, Any]:
-        email = email.strip().lower()
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        email = (email or "").strip().lower()
+        if not is_valid_email(email):
             return {"success": False, "message": "Invalid email address format"}
 
         conn = get_db_connection()
@@ -1152,12 +1171,12 @@ class AuthService:
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Your New Verification Link</h2>
-          <p>Hello <strong>{user['username']}</strong>,</p>
+          <p>Hello <strong>{html.escape(user['username'])}</strong>,</p>
           <p>You requested a new verification link for your Trader Queen account. Please click the button below to accept and activate your account:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{activation_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Activate Account</a>
           </div>
-          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{activation_link}" style="color: #38bdf8;">{activation_link}</a></p>
+          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{activation_link}" style="color: #38bdf8;">{html.escape(activation_link)}</a></p>
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This verification link expires in 24 hours.</p>
         </div>
         """
@@ -1179,7 +1198,12 @@ class AuthService:
 
     @staticmethod
     def login(username_or_email: str, password: str, client_token: Optional[str] = None) -> Dict[str, Any]:
-        val = username_or_email.strip().lower()
+        val = (username_or_email or "").strip().lower()
+        if not val:
+            return {"success": False, "message": "Username or email is required"}
+        if not password:
+            return {"success": False, "message": "Password is required"}
+
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (val, val))
@@ -1254,8 +1278,8 @@ class AuthService:
 
     @staticmethod
     def send_magic_login_link(email: str, base_url: str = "http://localhost:8000") -> Dict[str, Any]:
-        email = email.strip().lower()
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        email = (email or "").strip().lower()
+        if not is_valid_email(email):
             return {"success": False, "message": "Invalid email address format"}
 
         conn = get_db_connection()
@@ -1276,12 +1300,12 @@ class AuthService:
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #22c55e; margin-top: 0;">Instant 1-Click Sign In</h2>
-          <p>Hello <strong>{username}</strong>,</p>
+          <p>Hello <strong>{html.escape(username)}</strong>,</p>
           <p>Click the button below to sign in instantly to your Trader Queen account on this device:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{magic_link}" style="background-color: #16a34a; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Sign In Instantly</a>
           </div>
-          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{magic_link}" style="color: #38bdf8;">{magic_link}</a></p>
+          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{magic_link}" style="color: #38bdf8;">{html.escape(magic_link)}</a></p>
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">This instant sign-in link expires in 2 hours.</p>
         </div>
         """
@@ -1339,7 +1363,10 @@ class AuthService:
 
     @staticmethod
     def request_password_reset(email: str, base_url: str = "http://localhost:8000") -> Dict[str, Any]:
-        email = email.strip().lower()
+        email = (email or "").strip().lower()
+        if not is_valid_email(email):
+            return {"success": False, "message": "Invalid email address format"}
+
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT id, username FROM users WHERE LOWER(email) = ?", (email,))
@@ -1370,12 +1397,12 @@ class AuthService:
         email_body = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 12px; border: 1px solid #334155;">
           <h2 style="color: #f59e0b; margin-top: 0;">Reset Your Password</h2>
-          <p>Hello <strong>{user['username']}</strong>,</p>
+          <p>Hello <strong>{html.escape(user['username'])}</strong>,</p>
           <p>We received a request to reset your password for your Trader Queen account. Click below to set a new password:</p>
           <div style="text-align: center; margin: 30px 0;">
             <a href="{reset_link}" style="background-color: #d97706; color: #ffffff; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 8px; display: inline-block;">Reset Password</a>
           </div>
-          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{reset_link}" style="color: #38bdf8;">{reset_link}</a></p>
+          <p style="font-size: 12px; color: #94a3b8;">Or copy and paste this link into your browser:<br><a href="{reset_link}" style="color: #38bdf8;">{html.escape(reset_link)}</a></p>
           <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #334155; padding-top: 15px;">If you did not request this, please ignore this email. This link expires in 2 hours.</p>
         </div>
         """
@@ -1397,8 +1424,10 @@ class AuthService:
 
     @staticmethod
     def reset_password(token: str, new_password: str) -> Dict[str, Any]:
-        if len(new_password) < 6:
-            return {"success": False, "message": "Password must be at least 6 characters long"}
+        if len(new_password) < 10:
+            return {"success": False, "message": "Password must be at least 10 characters long"}
+        if len(new_password) > 128:
+            return {"success": False, "message": "Password is too long (maximum 128 characters)"}
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1437,6 +1466,8 @@ class AuthService:
                 reset_expires_at = NULL,
                 is_active = 1
         """, (user_id, username, email, password_hash, salt, datetime.now(timezone.utc).isoformat()))
+        # Invalidate any existing sessions for this user upon password reset
+        cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
 

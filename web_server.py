@@ -15,6 +15,8 @@ import json
 import logging
 import threading
 import zipfile
+import html
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -348,8 +350,25 @@ def create_bot_zip() -> str:
 
 
 def get_request_base_url(request: Request) -> str:
-    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    configured = os.getenv("BASE_URL") or os.getenv("APP_URL")
+    if configured and configured.strip():
+        return configured.strip().rstrip("/")
+
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).lower().strip()
+    if proto not in ("http", "https"):
+        proto = "https" if getattr(request.url, "is_secure", False) else "http"
+
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc)).strip()
+    if not re.match(r"^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$", host):
+        host = request.url.netloc or "localhost:8000"
+
+    allowed = os.getenv("ALLOWED_HOSTS", "").strip()
+    if allowed:
+        allowed_list = [h.strip().lower() for h in allowed.split(",") if h.strip()]
+        host_no_port = host.split(":")[0].lower()
+        if host.lower() not in allowed_list and host_no_port not in allowed_list:
+            host = request.url.netloc or "localhost:8000"
+
     return f"{proto}://{host}".rstrip("/")
 
 
@@ -363,7 +382,8 @@ def register(req: RegisterRequest, request: Request, response: Response):
     if not res["success"]:
         return JSONResponse(status_code=400, content=res)
     if res.get("token"):
-        response.set_cookie(key="bot_auth_token", value=res["token"], max_age=2592000, path="/", samesite="lax", secure=True)
+        is_secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie(key="bot_auth_token", value=res["token"], max_age=2592000, path="/", samesite="lax", secure=is_secure)
     return res
 
 
@@ -374,7 +394,7 @@ def activate_account(token: str = Query(...), response: Response = None):
     if not res["success"]:
         return JSONResponse(status_code=400, content=res)
     if response and res.get("session_token"):
-        response.set_cookie(key="bot_auth_token", value=res["session_token"], max_age=2592000, path="/", samesite="lax", secure=True)
+        response.set_cookie(key="bot_auth_token", value=res["session_token"], max_age=2592000, path="/", samesite="lax", secure=False)
     return res
 
 
@@ -387,14 +407,23 @@ def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
 
 @app.post("/api/login")
 @app.post("/api/auth/login")
-async def login(payload: LoginRequest):
+async def login(payload: LoginRequest, response: Response):
     try:
-        # Authentication logic here
-        result = auth_service.login(payload.username, payload.password)
+        username = (payload.username or payload.username_or_email or "").strip()
+        result = auth_service.login(username, payload.password, payload.client_token)
         if not result.get("success"):
             return JSONResponse(
                 status_code=400,
                 content={"success": False, "message": result.get("message", "Invalid credentials")}
+            )
+        if result.get("token"):
+            response.set_cookie(
+                key="bot_auth_token",
+                value=result["token"],
+                max_age=2592000,
+                path="/",
+                samesite="lax",
+                secure=False
             )
         return result
     except Exception as exc:
@@ -440,14 +469,23 @@ def reset_password(req: ResetPasswordRequest):
 
 
 @app.post("/api/auth/delete-all-accounts")
-def delete_all_accounts_endpoint():
+def delete_all_accounts_endpoint(
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None)
+):
+    user = get_current_user(authorization, bot_auth_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required to delete accounts")
     res = AuthService.delete_all_accounts()
     return res
 
 
 @app.delete("/api/auth/account")
-def delete_my_account(authorization: Optional[str] = Header(None)):
-    user = get_current_user(authorization)
+def delete_my_account(
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None)
+):
+    user = get_current_user(authorization, bot_auth_token)
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
     res = AuthService.delete_account(user["id"])
@@ -555,23 +593,28 @@ def get_exchanges():
 
 
 @app.post("/api/exchange/test")
-def test_exchange(req: TestExchangeRequest, authorization: Optional[str] = Header(None)):
+def test_exchange(
+    req: TestExchangeRequest,
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None)
+):
     """Test connection and credential validity using CCXT."""
-    user = get_current_user(authorization)
+    user = get_current_user(authorization, bot_auth_token)
     if not user:
         raise HTTPException(
             status_code=401,
             detail="Authentication required. Please create an account and log in to test exchange API keys."
         )
 
-    if not hasattr(ccxt, req.exchange_id):
+    ex_id = req.exchange_id.strip().lower()
+    if ex_id not in ccxt.exchanges:
         raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange_id}'")
 
     clean_key = req.api_key.strip().strip("'\"")
     clean_secret = req.api_secret.strip().strip("'\"")
     clean_passphrase = (req.api_passphrase or "").strip().strip("'\"")
 
-    exchange_class = getattr(ccxt, req.exchange_id)
+    exchange_class = getattr(ccxt, ex_id)
 
     def init_exchange_instance(use_sandbox: bool):
         opts = {
@@ -668,21 +711,29 @@ def test_exchange(req: TestExchangeRequest, authorization: Optional[str] = Heade
 
 
 @app.post("/api/exchange/save")
-def save_exchange_credentials(req: SaveExchangeKeyRequest, authorization: Optional[str] = Header(None)):
-    user = get_current_user(authorization)
+def save_exchange_credentials(
+    req: SaveExchangeKeyRequest,
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None)
+):
+    user = get_current_user(authorization, bot_auth_token)
     if not user:
         raise HTTPException(
             status_code=401,
             detail="Authentication required. Please create an account and log in to manage exchange API keys."
         )
 
+    ex_id = req.exchange_id.strip().lower()
+    if ex_id not in ccxt.exchanges:
+        raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange_id}'")
+
     # Store in DB per user (encrypted at rest)
     AuthService.save_exchange_key(
-        user["id"], req.exchange_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
+        user["id"], ex_id, req.api_key, req.api_secret, req.api_passphrase or "", req.testnet
     )
 
     # In-memory updates for non-sensitive routing metadata only
-    os.environ["EXCHANGE_ID"] = req.exchange_id
+    os.environ["EXCHANGE_ID"] = ex_id
     os.environ["TESTNET"] = "true" if req.testnet else "false"
 
     # Remove sensitive keys from os.environ to prevent runtime exposure
@@ -831,6 +882,8 @@ def save_bot_settings(req: BotSettingsRequest):
         raise HTTPException(status_code=400, detail=f"Invalid strategy '{strategy_id}'. Supported: {', '.join(valid_strat_ids)}")
 
     symbol = (req.symbol or "BTC/USDT").strip().upper()
+    if not re.match(r"^[A-Z0-9/_-]{2,20}$", symbol):
+        raise HTTPException(status_code=400, detail=f"Invalid trading pair symbol '{symbol}'. Must match pattern like BTC/USDT.")
 
     # Update OS env vars
     os.environ["EXECUTION_MODE"] = exec_mode
@@ -856,13 +909,15 @@ def save_bot_settings(req: BotSettingsRequest):
                 if s and not s.startswith("#") and "=" in s:
                     k = s.split("=", 1)[0].strip()
                     if k in updates:
-                        new_lines.append(f"{k}={updates[k]}\n")
+                        clean_val = str(updates[k]).replace("\r", "").replace("\n", "").strip()
+                        new_lines.append(f"{k}={clean_val}\n")
                         written.add(k)
                         continue
                 new_lines.append(l)
             for k, v in updates.items():
                 if k not in written:
-                    new_lines.append(f"{k}={v}\n")
+                    clean_val = str(v).replace("\r", "").replace("\n", "").strip()
+                    new_lines.append(f"{k}={clean_val}\n")
             env_file.write_text("".join(new_lines))
     except Exception as e:
         logger.warning(f"Failed updating .env file with new bot settings: {e}")
@@ -879,21 +934,39 @@ def save_bot_settings(req: BotSettingsRequest):
 
     if req.use_fib_filter is not None:
         runner.cfg.strategy.use_fib_filter = req.use_fib_filter
-    if req.fast_ema is not None and req.fast_ema > 0:
+    if req.fast_ema is not None:
+        if req.fast_ema < 2 or req.fast_ema > 200:
+            raise HTTPException(status_code=400, detail="fast_ema must be between 2 and 200")
         runner.cfg.strategy.fast_ema = req.fast_ema
-    if req.slow_ema is not None and req.slow_ema > 0:
+    if req.slow_ema is not None:
+        if req.slow_ema < 3 or req.slow_ema > 500:
+            raise HTTPException(status_code=400, detail="slow_ema must be between 3 and 500")
         runner.cfg.strategy.slow_ema = req.slow_ema
-    if req.rsi_period is not None and req.rsi_period > 0:
+    if runner.cfg.strategy.fast_ema >= runner.cfg.strategy.slow_ema:
+        raise HTTPException(status_code=400, detail="Fast EMA must be less than Slow EMA")
+    if req.rsi_period is not None:
+        if req.rsi_period < 2 or req.rsi_period > 100:
+            raise HTTPException(status_code=400, detail="rsi_period must be between 2 and 100")
         runner.cfg.strategy.rsi_period = req.rsi_period
-    if req.rsi_overbought is not None and req.rsi_overbought > 0:
+    if req.rsi_overbought is not None:
+        if req.rsi_overbought < 50.0 or req.rsi_overbought > 95.0:
+            raise HTTPException(status_code=400, detail="rsi_overbought must be between 50.0 and 95.0")
         runner.cfg.strategy.rsi_overbought = req.rsi_overbought
-    if req.adx_trend_threshold is not None and req.adx_trend_threshold >= 0:
+    if req.adx_trend_threshold is not None:
+        if req.adx_trend_threshold < 5.0 or req.adx_trend_threshold > 80.0:
+            raise HTTPException(status_code=400, detail="adx_trend_threshold must be between 5.0 and 80.0")
         runner.cfg.strategy.adx_trend_threshold = req.adx_trend_threshold
-    if req.risk_per_trade_pct is not None and req.risk_per_trade_pct > 0:
+    if req.risk_per_trade_pct is not None:
+        if req.risk_per_trade_pct <= 0 or req.risk_per_trade_pct > 0.20:
+            raise HTTPException(status_code=400, detail="risk_per_trade_pct must be between 0.0001 (0.01%) and 0.20 (20%)")
         runner.cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
-    if req.stop_loss_atr_mult is not None and req.stop_loss_atr_mult > 0:
+    if req.stop_loss_atr_mult is not None:
+        if req.stop_loss_atr_mult < 0.1 or req.stop_loss_atr_mult > 20.0:
+            raise HTTPException(status_code=400, detail="stop_loss_atr_mult must be between 0.1 and 20.0")
         runner.cfg.risk.stop_loss_atr_mult = req.stop_loss_atr_mult
-    if req.take_profit_atr_mult is not None and req.take_profit_atr_mult > 0:
+    if req.take_profit_atr_mult is not None:
+        if req.take_profit_atr_mult < 0.1 or req.take_profit_atr_mult > 50.0:
+            raise HTTPException(status_code=400, detail="take_profit_atr_mult must be between 0.1 and 50.0")
         runner.cfg.risk.take_profit_atr_mult = req.take_profit_atr_mult
 
     # Recreate bot instance with updated configuration
@@ -1157,15 +1230,21 @@ def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, 
 @app.post("/api/backtest")
 def run_backtest_endpoint(req: BacktestRequest):
     try:
+        exch = req.exchange.strip().lower()
+        if exch not in ccxt.exchanges:
+            raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
+        days = max(1, min(int(req.days), 730))
+        starting_equity = max(1.0, float(req.starting_equity))
+
         cfg = BotConfig()
-        cfg.exchange.exchange_id = req.exchange
+        cfg.exchange.exchange_id = exch
         cfg.exchange.symbol = req.symbol
         cfg.exchange.timeframe = req.timeframe
-        cfg.starting_equity = req.starting_equity
+        cfg.starting_equity = starting_equity
         cfg.strategy.use_fib_filter = req.use_fib_filter
         cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
 
-        df = fetch_historical(req.exchange, req.symbol, req.timeframe, req.days)
+        df = fetch_historical(exch, req.symbol, req.timeframe, days)
         if df is None or len(df) < 60:
             raise HTTPException(status_code=400, detail="Insufficient historical bars returned for backtest")
 
@@ -1176,6 +1255,8 @@ def run_backtest_endpoint(req: BacktestRequest):
             "bars_analyzed": len(df),
             "results": results,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Backtest execution failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1183,6 +1264,7 @@ def run_backtest_endpoint(req: BacktestRequest):
 
 @app.get("/api/logs")
 def get_logs(lines: int = 50):
+    lines = max(1, min(int(lines), 1000))
     log_file = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
     if not log_file.exists() or log_file.stat().st_size == 0:
         if runner.running:
@@ -1209,20 +1291,26 @@ def activate_page(token: str = Query(...)):
     success = res["success"]
     status_icon = "fa-check-circle text-emerald-400" if success else "fa-times-circle text-rose-400"
     title = "Account Activated!" if success else "Activation Failed"
+    title_escaped = html.escape(title)
+    msg_escaped = html.escape(str(res.get("message", "")))
     session_token = res.get("session_token", "")
+    username = res.get("username", "")
+    email = res.get("email", "")
 
     auto_script = ""
     if success and session_token:
+        safe_session_token = json.dumps(str(session_token)).replace("<", "\\u003c")
+        safe_user_obj = json.dumps({
+            "username": str(username),
+            "email": str(email),
+            "token": str(session_token)
+        }).replace("<", "\\u003c")
         auto_script = f"""
         <script>
           try {{
-            localStorage.setItem('bot_auth_token', '{session_token}');
-            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=2592000; SameSite=Lax; Secure";
-            localStorage.setItem('bot_saved_account', JSON.stringify({{
-              username: '{res.get("username", "")}',
-              email: '{res.get("email", "")}',
-              token: '{session_token}'
-            }}));
+            localStorage.setItem('bot_auth_token', {safe_session_token});
+            document.cookie = "bot_auth_token=" + encodeURIComponent({safe_session_token}) + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+            localStorage.setItem('bot_saved_account', JSON.stringify({safe_user_obj}));
           }} catch (e) {{}}
 
           let count = 3;
@@ -1238,20 +1326,20 @@ def activate_page(token: str = Query(...)):
         </script>
         """
 
-    html = f"""<!DOCTYPE html>
+    html_content = f"""<!DOCTYPE html>
     <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>{title}</title>
+      <title>{title_escaped}</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
       <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 text-center shadow-2xl space-y-4">
         <i class="fa-solid {status_icon} text-5xl"></i>
-        <h1 class="text-2xl font-bold">{title}</h1>
-        <p class="text-sm text-slate-300 leading-relaxed">{res['message']}</p>
+        <h1 class="text-2xl font-bold">{title_escaped}</h1>
+        <p class="text-sm text-slate-300 leading-relaxed">{msg_escaped}</p>
         {f'<p class="text-xs text-emerald-400 font-medium"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> You are logged in! Entering trading dashboard in <span id="countdown">3</span>s...</p>' if success else ''}
         <div class="pt-3 space-y-2">
           <a href="/" class="inline-block w-full py-3 {'bg-emerald-600 hover:bg-emerald-500' if success else 'bg-slate-800 hover:bg-slate-700 border border-slate-700'} font-semibold text-white rounded-xl shadow transition">
@@ -1263,7 +1351,7 @@ def activate_page(token: str = Query(...)):
       {auto_script}
     </body>
     </html>"""
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html_content, status_code=200)
 
 
 @app.get("/magic-login", response_class=HTMLResponse)
@@ -1272,15 +1360,18 @@ def magic_login_page(token: str = Query(...)):
     success = res["success"]
     status_icon = "fa-check-circle text-emerald-400" if success else "fa-times-circle text-rose-400"
     title = "Signed In Successfully!" if success else "Sign-In Failed"
+    title_escaped = html.escape(title)
+    msg_escaped = html.escape(str(res.get("message", "")))
     session_token = res.get("session_token", "")
 
     auto_script = ""
     if success and session_token:
+        safe_session_token = json.dumps(str(session_token)).replace("<", "\\u003c")
         auto_script = f"""
         <script>
           try {{
-            localStorage.setItem('bot_auth_token', '{session_token}');
-            document.cookie = "bot_auth_token=" + encodeURIComponent('{session_token}') + "; path=/; max-age=2592000; SameSite=Lax; Secure";
+            localStorage.setItem('bot_auth_token', {safe_session_token});
+            document.cookie = "bot_auth_token=" + encodeURIComponent({safe_session_token}) + "; path=/; max-age=2592000; SameSite=Lax; Secure";
           }} catch (e) {{}}
 
           let count = 2;
@@ -1296,20 +1387,20 @@ def magic_login_page(token: str = Query(...)):
         </script>
         """
 
-    html = f"""<!DOCTYPE html>
+    html_content = f"""<!DOCTYPE html>
     <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>{title}</title>
+      <title>{title_escaped}</title>
       <script src="https://cdn.tailwindcss.com"></script>
-      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/react/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body class="bg-slate-950 text-slate-100 flex items-center justify-center min-h-screen p-4 font-sans">
       <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 text-center shadow-2xl space-y-4">
         <i class="fa-solid {status_icon} text-5xl"></i>
-        <h1 class="text-2xl font-bold">{title}</h1>
-        <p class="text-sm text-slate-300 leading-relaxed">{res['message']}</p>
+        <h1 class="text-2xl font-bold">{title_escaped}</h1>
+        <p class="text-sm text-slate-300 leading-relaxed">{msg_escaped}</p>
         {f'<p class="text-xs text-emerald-400 font-medium"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Entering trading dashboard in <span id="countdown">2</span>s...</p>' if success else ''}
         <div class="pt-3 space-y-2">
           <a href="/" class="inline-block w-full py-3 {'bg-emerald-600 hover:bg-emerald-500' if success else 'bg-slate-800 hover:bg-slate-700 border border-slate-700'} font-semibold text-white rounded-xl shadow transition">
@@ -1320,12 +1411,13 @@ def magic_login_page(token: str = Query(...)):
       {auto_script}
     </body>
     </html>"""
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html_content, status_code=200)
 
 
 @app.get("/reset-password", response_class=HTMLResponse)
 def reset_password_page(token: str = Query(...)):
-    html = f"""<!DOCTYPE html>
+    safe_token = html.escape(token, quote=True)
+    html_content = f"""<!DOCTYPE html>
     <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8">
@@ -1342,11 +1434,11 @@ def reset_password_page(token: str = Query(...)):
           <p class="text-xs text-slate-400 mt-1">Please enter your new account password below.</p>
         </div>
         <form onsubmit="handleReset(event)" class="space-y-4 text-xs">
-          <input type="hidden" id="reset-token" value="{token}">
+          <input type="hidden" id="reset-token" value="{safe_token}">
           <div>
-            <label class="block text-slate-400 mb-1">New Password (min 6 characters)</label>
+            <label class="block text-slate-400 mb-1">New Password (min 10 characters)</label>
             <div class="relative">
-              <input type="password" id="new-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
+              <input type="password" id="new-pw" required minlength="10" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
               <button type="button" onclick="togglePasswordVisibility('new-pw', 'new-pw-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 transition" tabindex="-1">
                 <i class="fa-solid fa-eye text-xs" id="new-pw-eye"></i>
               </button>
@@ -1355,7 +1447,7 @@ def reset_password_page(token: str = Query(...)):
           <div>
             <label class="block text-slate-400 mb-1">Confirm New Password</label>
             <div class="relative">
-              <input type="password" id="confirm-pw" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
+              <input type="password" id="confirm-pw" required minlength="10" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-10 py-2 text-white focus:outline-none focus:border-amber-500">
               <button type="button" onclick="togglePasswordVisibility('confirm-pw', 'confirm-pw-eye')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200 transition" tabindex="-1">
                 <i class="fa-solid fa-eye text-xs" id="confirm-pw-eye"></i>
               </button>
@@ -1376,6 +1468,11 @@ def reset_password_page(token: str = Query(...)):
           const pw = document.getElementById('new-pw').value;
           const cpw = document.getElementById('confirm-pw').value;
           const msg = document.getElementById('reset-msg');
+          if (pw.length < 10) {{
+            msg.className = 'text-xs p-2 rounded bg-rose-950 text-rose-300 block';
+            msg.innerText = 'Password must be at least 10 characters long';
+            return;
+          }}
           if (pw !== cpw) {{
             msg.className = 'text-xs p-2 rounded bg-rose-950 text-rose-300 block';
             msg.innerText = 'Passwords do not match';
@@ -1414,7 +1511,7 @@ def reset_password_page(token: str = Query(...)):
       </script>
     </body>
     </html>"""
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html_content, status_code=200)
 
 
 # Main Dashboard HTML with integrated Auth & Exchange Key manager
@@ -1477,6 +1574,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .animate-slideDown {
       animation: slideDown 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    @media (min-width: 768px) {
+      .responsive-modal-section {
+        display: block !important;
+        position: static !important;
+        background: transparent !important;
+        backdrop-filter: none !important;
+        padding: 0 !important;
+        z-index: auto !important;
+        overflow: visible !important;
+      }
     }
   </style>
 </head>
@@ -1558,42 +1666,140 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- Mobile Dropdown Navigation Drawer -->
-      <div id="mobile-menu-panel" class="hidden md:hidden pt-3 mt-2 border-t border-bordercol/80 space-y-2.5 text-xs animate-slideDown">
-        <!-- Emergency Stop Banner Button -->
-        <div>
-          <button onclick="triggerKillSwitch()" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center justify-center gap-2">
-            <i class="fa-solid fa-skull-crossbones"></i>
-            <span>Emergency Kill Switch</span>
-          </button>
-        </div>
-
-        <!-- Auth Controls (Mobile Drawer) -->
-        <div id="auth-buttons-mobile" class="grid grid-cols-2 gap-2 pt-2 border-t border-bordercol/60">
-          <button onclick="openAuthModal('login'); toggleMobileMenu();" class="py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition text-center flex items-center justify-center gap-1.5">
-            <i class="fa-solid fa-right-to-bracket text-xs"></i>
-            <span>Login</span>
-          </button>
-          <button onclick="openAuthModal('register'); toggleMobileMenu();" class="py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition text-center flex items-center justify-center gap-1.5">
-            <i class="fa-solid fa-user-plus text-xs"></i>
-            <span>Register</span>
-          </button>
-        </div>
-
-        <div id="user-badge-mobile" class="hidden flex-col gap-2 p-2.5 bg-slate-900 rounded-lg border border-bordercol">
+      <div id="mobile-menu-panel" class="hidden md:hidden pt-3 mt-2 border-t border-bordercol/80 space-y-3 text-xs animate-slideDown max-h-[82vh] overflow-y-auto pb-4">
+        <!-- 1. Profile & Account Section (Top of Hamburger Menu) -->
+        <!-- Logged Out View -->
+        <div id="auth-buttons-mobile" class="p-3 bg-slate-900/90 rounded-xl border border-bordercol/80 space-y-2.5">
           <div class="flex items-center justify-between">
-            <div class="flex items-center gap-2">
-              <i class="fa-solid fa-user-circle text-emerald-400 text-base"></i>
-              <span id="user-name-display-mobile" class="font-semibold text-slate-200"></span>
+            <div class="flex items-center gap-2 text-slate-300">
+              <i class="fa-solid fa-circle-user text-slate-400 text-base"></i>
+              <span class="font-semibold text-slate-200">Guest Account</span>
             </div>
-            <button onclick="logout(); toggleMobileMenu();" class="text-xs px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-rose-300 rounded border border-bordercol flex items-center gap-1">
+            <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-medium">Logged Out</span>
+          </div>
+          <p class="text-[11px] text-slate-400">Log in or create an account to configure Exchange API keys and live trading.</p>
+          <div class="grid grid-cols-2 gap-2 pt-1">
+            <button onclick="openAuthModal('login'); toggleMobileMenu();" class="py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition text-center flex items-center justify-center gap-1.5">
+              <i class="fa-solid fa-right-to-bracket text-xs"></i>
+              <span>Login</span>
+            </button>
+            <button onclick="openAuthModal('register'); toggleMobileMenu();" class="py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow transition text-center flex items-center justify-center gap-1.5">
+              <i class="fa-solid fa-user-plus text-xs"></i>
+              <span>Register</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Logged In Profile View with Delete Button -->
+        <div id="user-badge-mobile" class="hidden p-3 bg-slate-900/90 rounded-xl border border-bordercol/80 space-y-2.5">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2.5 min-w-0">
+              <div class="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-user text-sm"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-bold text-white text-xs truncate flex items-center gap-1.5">
+                  <span id="user-name-display-mobile"></span>
+                  <span class="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Active</span>
+                </div>
+                <div class="text-[10px] text-slate-400 truncate">Trader Profile</div>
+              </div>
+            </div>
+            <button onclick="logout(); toggleMobileMenu();" class="text-xs px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-rose-300 rounded-lg border border-bordercol flex items-center gap-1 transition">
               <i class="fa-solid fa-arrow-right-from-bracket"></i> Logout
             </button>
           </div>
-          <div class="pt-1.5 border-t border-bordercol/50 flex justify-end">
-            <button onclick="confirmDeleteAccount()" class="text-[11px] text-rose-400 hover:text-rose-300 underline flex items-center gap-1">
-              <i class="fa-solid fa-trash-can"></i> Delete My Account
+
+          <!-- Profile Actions & Delete Button -->
+          <div class="pt-2 border-t border-bordercol/60 flex items-center justify-between gap-2">
+            <span class="text-[11px] text-slate-400">Account Safety</span>
+            <button onclick="confirmDeleteAccount()" class="text-xs px-2.5 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 hover:text-rose-300 border border-rose-500/30 rounded-lg flex items-center gap-1.5 transition font-semibold" title="Permanently delete registered profile and stored keys">
+              <i class="fa-solid fa-trash-can text-[11px]"></i> Delete Account
             </button>
           </div>
+        </div>
+
+        <!-- 2. Hamburger Navigation List -->
+        <div class="space-y-1.5 pt-1">
+          <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">Navigation & Tools</div>
+
+          <!-- Exchange API Keys Item -->
+          <button type="button" onclick="openMobileSection('modal-api-keys'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
+            <div class="flex items-center gap-2.5">
+              <div class="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-key text-sm"></i>
+              </div>
+              <div>
+                <div class="font-bold text-white text-xs group-hover:text-amber-400 transition">Exchange API Keys & Credential Management</div>
+                <div class="text-[10px] text-slate-400">Configure keys, testnet & live credentials</div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+          </button>
+
+          <!-- Bot Activity Item -->
+          <button type="button" onclick="openMobileSection('modal-bot-activity'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
+            <div class="flex items-center gap-2.5">
+              <div class="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-terminal text-sm"></i>
+              </div>
+              <div>
+                <div class="font-bold text-white text-xs group-hover:text-emerald-400 transition">Bot Activity</div>
+                <div class="text-[10px] text-slate-400">Live trading logs & cycle terminal stream</div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+          </button>
+
+          <!-- Backtester Item -->
+          <button type="button" onclick="openMobileSection('modal-backtester'); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
+            <div class="flex items-center gap-2.5">
+              <div class="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-vial text-sm"></i>
+              </div>
+              <div>
+                <div class="font-bold text-white text-xs group-hover:text-purple-400 transition">Backtester</div>
+                <div class="text-[10px] text-slate-400">Run historical backtests & strategy stats</div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+          </button>
+
+          <!-- Bot Settings Item -->
+          <button type="button" onclick="openSettingsModal(); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
+            <div class="flex items-center gap-2.5">
+              <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-gear text-sm"></i>
+              </div>
+              <div>
+                <div class="font-bold text-white text-xs group-hover:text-sky-400 transition">Settings</div>
+                <div class="text-[10px] text-slate-400">Strategy indicators, risk parameters, auto/manual</div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+          </button>
+
+          <!-- Email Settings Item -->
+          <button type="button" onclick="openEmailSettingsModal(); toggleMobileMenu();" class="w-full p-2.5 bg-cardbg hover:bg-slate-800/80 active:bg-slate-800 border border-bordercol rounded-xl text-left flex items-center justify-between transition group">
+            <div class="flex items-center gap-2.5">
+              <div class="w-8 h-8 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center shrink-0">
+                <i class="fa-solid fa-envelope text-sm"></i>
+              </div>
+              <div>
+                <div class="font-bold text-white text-xs group-hover:text-blue-400 transition">Email & Verification Settings</div>
+                <div class="text-[10px] text-slate-400">SMTP provider, verification codes & resend</div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right text-slate-500 group-hover:text-slate-300 text-xs"></i>
+          </button>
+        </div>
+
+        <!-- 3. Emergency Kill Switch (Bottom of Hamburger Menu) -->
+        <div class="pt-1">
+          <button type="button" onclick="triggerKillSwitch()" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-xl transition flex items-center justify-center gap-2">
+            <i class="fa-solid fa-skull-crossbones"></i>
+            <span>Emergency Kill Switch</span>
+          </button>
         </div>
       </div>
     </div>
@@ -1655,20 +1861,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <!-- ========================================================================= -->
     <!-- EXCHANGE API KEYS CONFIGURATION SECTION                                   -->
+    <!-- Desktop: in-page card | Mobile: modal opened via hamburger menu            -->
     <!-- ========================================================================= -->
-    <div class="bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-bordercol pb-3 gap-2">
-        <div class="flex items-center gap-2">
-          <i class="fa-solid fa-key text-amber-400"></i>
-          <div>
-            <h2 class="font-bold text-sm text-white">Exchange API Keys & Credential Management</h2>
-            <p class="text-[11px] text-slate-400">Select an exchange first, then enter your API credentials with trade permissions.</p>
+    <div id="modal-api-keys" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
+      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 max-w-4xl w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
+        <div class="flex items-center justify-between border-b border-bordercol pb-3 gap-2">
+          <div class="flex items-center gap-2">
+            <i class="fa-solid fa-key text-amber-400"></i>
+            <div>
+              <h2 class="font-bold text-sm text-white">Exchange API Keys & Credential Management</h2>
+              <p class="text-[11px] text-slate-400">Select an exchange first, then enter your API credentials with trade permissions.</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="hidden sm:inline-block text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium shrink-0">
+              <i class="fa-solid fa-shield-halved"></i> Trade-only keys (No withdrawal)
+            </span>
+            <!-- Mobile Close Button -->
+            <button type="button" onclick="closeMobileSection('modal-api-keys')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close exchange keys modal">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
           </div>
         </div>
-        <span class="self-start sm:self-auto text-[10px] px-2 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded font-medium shrink-0">
-          <i class="fa-solid fa-shield-halved"></i> Trade-only keys (No withdrawal)
-        </span>
-      </div>
 
       <!-- LOCKED STATE: Shown when user is not logged in -->
       <div id="api-keys-locked" class="bg-slate-900/90 border border-bordercol/80 rounded-xl p-5 sm:p-8 text-center space-y-3">
@@ -1787,6 +2001,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+  </div>
 
     <!-- Live Analysis & Backtester 2-col layout -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -1901,14 +2116,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- Quick Backtester Panel (1 col) -->
-      <div class="bg-cardbg border border-bordercol rounded-xl p-5 space-y-4">
-        <div class="flex items-center justify-between border-b border-bordercol pb-3">
-          <div class="flex items-center gap-2">
-            <i class="fa-solid fa-vial text-purple-400"></i>
-            <h2 class="font-bold text-sm text-white">Honest Backtester</h2>
+      <!-- Desktop: in-page 3rd col | Mobile: modal opened via hamburger menu -->
+      <div id="modal-backtester" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
+        <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 max-w-lg w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
+          <div class="flex items-center justify-between border-b border-bordercol pb-3">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-vial text-purple-400"></i>
+              <h2 class="font-bold text-sm text-white">Honest Backtester</h2>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-slate-400 hidden sm:inline">No lookahead bias</span>
+              <!-- Mobile Close Button -->
+              <button type="button" onclick="closeMobileSection('modal-backtester')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close backtester modal">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+            </div>
           </div>
-          <span class="text-[10px] text-slate-400">No lookahead bias</span>
-        </div>
 
         <form id="backtest-form" onsubmit="executeBacktest(event)" class="space-y-3 text-xs">
           <div>
@@ -1990,20 +2213,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+    </div>
 
     <!-- Live Activity Logs -->
-    <div class="bg-cardbg border border-bordercol rounded-xl p-5 space-y-3">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <i class="fa-solid fa-terminal text-slate-400"></i>
-          <h3 class="font-bold text-sm text-white">Live Bot Activity Logs</h3>
+    <!-- Desktop: in-page card | Mobile: modal opened via hamburger menu -->
+    <div id="modal-bot-activity" class="responsive-modal-section hidden md:block fixed md:static inset-0 md:inset-auto z-50 md:z-auto bg-black/80 md:bg-transparent backdrop-blur-sm md:backdrop-blur-none p-3 sm:p-4 md:p-0 overflow-y-auto md:overflow-visible">
+      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-3 max-w-4xl w-full mx-auto md:max-w-none md:mx-0 my-auto md:my-0 shadow-2xl md:shadow-none max-h-[92vh] md:max-h-none overflow-y-auto md:overflow-visible">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <i class="fa-solid fa-terminal text-slate-400"></i>
+            <h3 class="font-bold text-sm text-white">Live Bot Activity Logs</h3>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="refreshLogs()" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
+            <!-- Mobile Close Button -->
+            <button type="button" onclick="closeMobileSection('modal-bot-activity')" class="md:hidden text-slate-400 hover:text-white p-1 text-base focus:outline-none" aria-label="Close bot activity modal">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
         </div>
-        <button onclick="refreshLogs()" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1">
-          <i class="fa-solid fa-rotate"></i> Refresh
-        </button>
-      </div>
-      <div id="log-container" class="bg-slate-950 font-mono text-[11px] p-3 rounded-lg border border-bordercol/60 h-40 overflow-y-auto space-y-1 text-slate-300">
-        <div class="text-slate-500">Loading recent logs...</div>
+        <div id="log-container" class="bg-slate-950 font-mono text-[11px] p-3 rounded-lg border border-bordercol/60 h-56 md:h-40 overflow-y-auto space-y-1 text-slate-300">
+          <div class="text-slate-500">Loading recent logs...</div>
+        </div>
       </div>
     </div>
   </main>
@@ -3080,16 +3313,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function handleMobileAccountClick() {
-      if (currentUser) {
-        const panel = document.getElementById('mobile-menu-panel');
-        if (panel && panel.classList.contains('hidden')) {
-          toggleMobileMenu();
-        }
-      } else {
-        openAuthModal('login');
+    function openMobileSection(sectionId) {
+      const el = document.getElementById(sectionId);
+      if (!el) return;
+      el.classList.remove('hidden');
+      el.classList.add('flex');
+      if (sectionId === 'modal-bot-activity') {
+        refreshLogs();
       }
     }
+
+    function closeMobileSection(sectionId) {
+      const el = document.getElementById(sectionId);
+      if (!el) return;
+      el.classList.remove('flex');
+      el.classList.add('hidden');
+    }
+
+    function handleMobileAccountClick() {
+      toggleMobileMenu();
+    }
+
+    document.addEventListener('click', function(e) {
+      if (window.innerWidth >= 768) return;
+      ['modal-api-keys', 'modal-backtester', 'modal-bot-activity'].forEach(function(id) {
+        const modal = document.getElementById(id);
+        if (modal && !modal.classList.contains('hidden') && e.target === modal) {
+          closeMobileSection(id);
+        }
+      });
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') {
+        ['modal-api-keys', 'modal-backtester', 'modal-bot-activity'].forEach(closeMobileSection);
+      }
+    });
 
     async function confirmDeleteAccount() {
       if (!confirm('⚠️ Permanently delete your registered account, active sessions, and saved exchange keys?\\\\n\\\\nThis cannot be undone. Click OK to delete.')) return;
