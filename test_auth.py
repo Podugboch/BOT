@@ -910,5 +910,52 @@ class TestSecretEncryptionAndVault:
             AuthService.save_exchange_key(1, "binance", "k", "s", conn=closed_conn)
         assert "Failed to save exchange key" in str(exc_info.value)
 
+    def test_save_exchange_key_survives_remote_sync_failure(self, monkeypatch):
+        """A remote store outage must not undo the encrypted local vault write."""
+        AuthService.register("remote_fail_user", "remote_fail@market.io", "Pass123456")
+        conn = get_db_connection()
+        user_id = conn.execute("SELECT id FROM users WHERE username = 'remote_fail_user'").fetchone()["id"]
+        conn.close()
+
+        def raise_remote_unavailable(*args, **kwargs):
+            raise RuntimeError("remote store unavailable")
+
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_save_exchange_key", raise_remote_unavailable)
+
+        result = AuthService.save_exchange_key(user_id, "binance", "remote_fail_key", "remote_fail_secret")
+        assert result["success"] is True
+
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT api_key FROM exchange_keys WHERE user_id = ? AND exchange_id = 'binance'", (user_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["api_key"].startswith("enc:")
+
+    def test_save_exchange_key_tolerates_false_sync_and_misconfigured_driver(self, monkeypatch):
+        """A refused sync or an unusable remote driver must not fail the local save."""
+        AuthService.register("remote_false_user", "remote_false@market.io", "Pass123456")
+        conn = get_db_connection()
+        user_id = conn.execute("SELECT id FROM users WHERE username = 'remote_false_user'").fetchone()["id"]
+        conn.close()
+
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_save_exchange_key", lambda *args, **kwargs: False)
+        assert AuthService.save_exchange_key(user_id, "kraken", "k", "s")["success"] is True
+
+        def raise_misconfigured_driver():
+            raise RuntimeError("REMOTE_STORAGE_DRIVER='blob' is not fully configured")
+
+        monkeypatch.setattr("auth.is_remote_storage_available", raise_misconfigured_driver)
+        assert AuthService.save_exchange_key(user_id, "okx", "k", "s", "pass")["success"] is True
+
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT exchange_id FROM exchange_keys WHERE user_id = ? ORDER BY exchange_id", (user_id,)
+        ).fetchall()
+        conn.close()
+        assert [row["exchange_id"] for row in rows] == ["kraken", "okx"]
 
 

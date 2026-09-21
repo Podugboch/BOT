@@ -1540,8 +1540,17 @@ class AuthService:
             if should_close:
                 conn.commit()
 
-            # Sync to remote persistent store
-            remote_save_exchange_key(user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, testnet)
+            # Sync to remote persistent store. A remote outage or misconfiguration
+            # must not undo the encrypted local vault write that already succeeded.
+            try:
+                if is_remote_storage_available():
+                    remote_saved = remote_save_exchange_key(
+                        user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, testnet
+                    )
+                    if not remote_saved:
+                        print(f"[AUTH WARNING] Remote exchange key sync returned false for user {user_id} and {exchange_id}")
+            except Exception as remote_exc:
+                print(f"[AUTH WARNING] Remote exchange key sync failed for user {user_id} and {exchange_id}: {remote_exc}")
 
             return {"success": True, "message": f"Credentials for {exchange_id} saved successfully"}
         except Exception as e:
@@ -1698,4 +1707,3 @@ class AuthService:
 init_auth_db()
 
 auth_service = AuthService
-
