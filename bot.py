@@ -169,7 +169,14 @@ class TradingBot:
         atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns and pd.notna(df["atr"].iloc[-1]) else (price * 0.02)
 
         stop, target = self.risk.stop_and_target(price, atr_val, "BUY")
-        size = custom_size if custom_size > 0 else self.risk.position_size(price, stop)
+        if custom_size > 0:
+            max_size = (self.risk.state.equity * 0.99) / price
+            if custom_size > max_size:
+                raise RuntimeError(f"Requested size {custom_size:.6f} exceeds maximum allowed by available equity ({max_size:.6f}).")
+            size = custom_size
+        else:
+            size = self.risk.position_size(price, stop)
+
         if size <= 0:
             raise RuntimeError("Calculated position size is 0. Check equity or risk settings.")
 
@@ -199,8 +206,14 @@ class TradingBot:
         if self.position is None:
             raise RuntimeError("No active open position to close.")
 
-        df = self.exchange.fetch_ohlcv(limit=10)
-        price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
+        try:
+            df = self.exchange.fetch_ohlcv(limit=10)
+            price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
+        except Exception:
+            try:
+                price = self.exchange.current_price()
+            except Exception:
+                price = self.position["entry"]
 
         fill = self.exchange.place_order("SELL", self.position["size"], price)
         pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]

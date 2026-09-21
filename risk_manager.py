@@ -31,14 +31,16 @@ class RiskManager:
 
     def position_size(self, entry_price: float, stop_price: float) -> float:
         """Risk a fixed % of equity per trade, sized by stop distance (not a fixed $ bet)."""
+        if self.state.equity <= 0 or entry_price <= 0:
+            return 0.0
         risk_amount = self.state.equity * self.cfg.risk_per_trade_pct
         stop_distance = abs(entry_price - stop_price)
-        if stop_distance <= 0 or entry_price <= 0:
+        if stop_distance <= 0:
             return 0.0
         size = risk_amount / stop_distance
         # Ensure spot order value does not exceed available equity
         max_size = (self.state.equity * 0.99) / entry_price
-        return min(size, max_size)
+        return max(0.0, min(size, max_size))
 
     def stop_and_target(self, entry_price: float, atr_value: float, side: str) -> tuple[float, float]:
         if side == "BUY":
@@ -60,6 +62,9 @@ class RiskManager:
 
     def can_trade(self) -> tuple[bool, str]:
         s, c = self.state, self.cfg
+
+        if s.equity <= 0:
+            return False, "Circuit breaker: equity fully depleted (<= 0)"
 
         drawdown = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0
         if drawdown >= c.max_drawdown_pct:

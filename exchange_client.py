@@ -22,13 +22,13 @@ class ExchangeClient:
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
 
-        if not hasattr(ccxt, cfg.exchange_id):
+        if cfg.exchange_id.lower() not in ccxt.exchanges:
             raise ValueError(
                 f"'{cfg.exchange_id}' is not a known ccxt exchange id. "
                 f"Run `python -c \"import ccxt; print(ccxt.exchanges)\"` to see all supported ids."
             )
 
-        exchange_class = getattr(ccxt, cfg.exchange_id)
+        exchange_class = getattr(ccxt, cfg.exchange_id.lower())
         exchange_opts = {
             "apiKey": cfg.api_key,
             "secret": cfg.api_secret,
@@ -62,12 +62,14 @@ class ExchangeClient:
 
     def fetch_ohlcv(self, limit: int = 200) -> pd.DataFrame:
         raw = self.exchange.fetch_ohlcv(self.cfg.symbol, timeframe=self.cfg.timeframe, limit=limit)
-        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(raw or [], columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         return df
 
     def current_price(self) -> float:
-        return self.exchange.fetch_ticker(self.cfg.symbol)["last"]
+        ticker = self.exchange.fetch_ticker(self.cfg.symbol)
+        price = ticker.get("last") or ticker.get("close") or ticker.get("bid") or 0.0
+        return float(price)
 
     def place_order(self, side: str, size: float, ref_price: float) -> dict:
         if self.mode == "live":
@@ -79,7 +81,11 @@ class ExchangeClient:
         try:
             order = self.exchange.create_order(self.cfg.symbol, "market", side.lower(), size)
             fill_price = order.get("average") or order.get("price") or self.current_price()
-            fee = sum(f.get("cost", 0) for f in order.get("fees", []) or [])
+            fee = 0.0
+            if order.get("fees"):
+                fee = sum(float(f.get("cost", 0) or 0) for f in order["fees"] if isinstance(f, dict))
+            elif isinstance(order.get("fee"), dict):
+                fee = float(order["fee"].get("cost", 0) or 0)
             log.info("LIVE %s order placed: id=%s price=%.2f", side, order.get("id"), fill_price)
             return {"side": side, "size": size, "price": fill_price, "fee": fee, "mode": "live"}
         except Exception:

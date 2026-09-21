@@ -74,17 +74,18 @@ def get_master_key() -> bytes:
     if is_prod:
         raise RuntimeError("Production / Live mode requires an externally managed master encryption key (BOT_SECRET_KEY, SECRET_KEY, or APP_SECRET_KEY) for persistent zero-loss security.")
 
-    # 2. Local key file — never on serverless, where it can't persist anyway.
-    if not _is_serverless():
-        key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
-        if key_path.exists():
-            try:
-                key_data = key_path.read_bytes().strip()
-                Fernet(key_data)
-                return key_data
-            except Exception:
-                pass  # corrupt/invalid file — fall through to generation below
+    # 2. Local key file — check if an existing key file exists
+    key_path = Path(os.getenv("BOT_SECRET_KEY_PATH", str(DEFAULT_KEY_FILE)))
+    if key_path.exists():
+        try:
+            key_data = key_path.read_bytes().strip()
+            Fernet(key_data)
+            return key_data
+        except Exception:
+            pass  # corrupt/invalid file — fall through to generation/error below
 
+    # Non-serverless can generate a persistent local key file on disk
+    if not _is_serverless():
         new_key = Fernet.generate_key()
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC

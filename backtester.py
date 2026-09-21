@@ -23,7 +23,11 @@ log = logging.getLogger("backtest")
 
 def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     """Paginated historical OHLCV pull via ccxt."""
-    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    ex_clean = exchange_id.strip().lower()
+    if ex_clean not in ccxt.exchanges:
+        raise ValueError(f"'{exchange_id}' is not a valid ccxt exchange id.")
+    days = max(1, min(days, 730))
+    exchange = getattr(ccxt, ex_clean)({"enableRateLimit": True})
     ms_per_bar = exchange.parse_timeframe(timeframe) * 1000
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
 
@@ -70,7 +74,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
         if position is None and can_trade:
             sig = generate_signal(window, cfg.strategy, position_open=False)
             if sig == Signal.BUY:
-                stop, target = risk.stop_and_target(price, row["atr"], "BUY")
+                atr_val = row["atr"] if (pd.notna(row["atr"]) and row["atr"] > 0) else (price * 0.02)
+                stop, target = risk.stop_and_target(price, atr_val, "BUY")
                 size = risk.position_size(price, stop)
                 if size > 0:
                     fill = price * (1 + cfg.slippage_pct)
@@ -119,7 +124,7 @@ def summarize(trades: list, equity_curve: list, starting_equity: float, timefram
     return {
         "starting_equity": round(starting_equity, 2),
         "final_equity": round(final_equity, 2),
-        "total_return_pct": round((final_equity / starting_equity - 1) * 100, 2),
+        "total_return_pct": round((final_equity / starting_equity - 1) * 100, 2) if starting_equity > 0 else 0.0,
         "num_trades": len(trades),
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2) if trades else 0,
         "avg_win": round(float(np.mean([t["pnl"] for t in wins])), 2) if wins else 0,
