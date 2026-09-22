@@ -55,6 +55,18 @@ def test_failed_blob_write_is_reported(storage, monkeypatch):
     assert storage.remote_save_user(1, "alice", "alice@example.com", "hash", "salt") is False
 
 
+def test_latest_exchange_key_round_trip(storage, monkeypatch):
+    objects = {}
+    monkeypatch.setattr(storage, "_blob_put", lambda path, data, content_type="application/json": objects.__setitem__(path, data) or True)
+    monkeypatch.setattr(storage, "_blob_get", lambda path: objects.get(path))
+    monkeypatch.setattr(storage, "_encrypt", lambda value: "enc:" + value if value else "")
+    assert storage.remote_save_latest_exchange_key(7, "mexc", "key7", "secret7", "", testnet=False)
+    record = storage.remote_get_latest_exchange_key()
+    assert record["exchange_id"] == "mexc"
+    assert record["api_key"] == "enc:key7"
+    assert record["testnet"] is False
+
+
 def test_alias_cleanup_and_account_delete(storage, monkeypatch):
     objects = {}
     monkeypatch.setattr(storage, "_blob_put", lambda path, data, content_type="application/json": objects.__setitem__(path, data) or True)

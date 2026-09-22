@@ -1012,3 +1012,64 @@ class TestSecretEncryptionAndVault:
         conn.close()
         assert [row["exchange_id"] for row in rows] == ["kraken", "okx"]
 
+    def test_cold_container_bot_config_hydrates_vault_key_from_remote(self, tmp_path, monkeypatch):
+        """
+        Order execution runs without a session on whatever container receives the
+        request, so an empty local vault must fall back to the remote store
+        instead of trading with blank credentials.
+        """
+        db_cold = tmp_path / "container_order_cold.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+        monkeypatch.setenv("EXCHANGE_ID", "mexc")
+        monkeypatch.delenv("EXCHANGE_API_KEY", raising=False)
+        monkeypatch.delenv("EXCHANGE_API_SECRET", raising=False)
+
+        from secret_manager import encrypt_secret
+        remote_record = {
+            "user_id": 6,
+            "exchange_id": "mexc",
+            "api_key": encrypt_secret("mx0vcoldkey000000000001"),
+            "api_secret": encrypt_secret("cold_secret_value"),
+            "api_passphrase": "",
+            "testnet": False,
+        }
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_get_latest_exchange_key", lambda: remote_record)
+
+        from config import BotConfig
+        cfg = BotConfig()
+        assert cfg.exchange.api_key == "mx0vcoldkey000000000001"
+        assert cfg.exchange.api_secret == "cold_secret_value"
+        assert cfg.exchange.exchange_id == "mexc"
+
+    def test_cold_container_without_remote_key_returns_none(self, tmp_path, monkeypatch):
+        db_cold = tmp_path / "container_order_empty.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_get_latest_exchange_key", lambda: None)
+        assert AuthService.get_latest_raw_exchange_key() is None
+
+    def test_save_exchange_key_records_remote_latest_pointer(self, monkeypatch):
+        """The save path must record the active key under the user-independent name."""
+        AuthService.register("pointer_user", "pointer@market.io", "Pass123456")
+        conn = get_db_connection()
+        user_id = conn.execute("SELECT id FROM users WHERE username = 'pointer_user'").fetchone()["id"]
+        conn.close()
+
+        captured = {}
+
+        def record_latest(*args, **kwargs):
+            captured["args"] = args
+            return True
+
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_save_exchange_key", lambda *args, **kwargs: True)
+        monkeypatch.setattr("auth.remote_save_latest_exchange_key", record_latest)
+
+        result = AuthService.save_exchange_key(user_id, "mexc", "APIKEY", "APISECRET", "", testnet=False)
+        assert result["success"] is True
+        assert captured["args"][0] == user_id
+        assert captured["args"][1] == "mexc"
+        assert captured["args"][5] is False

@@ -39,6 +39,8 @@ from storage_adapter import (
     remote_save_user,
     remote_get_user,
     remote_save_exchange_key,
+    remote_save_latest_exchange_key,
+    remote_get_latest_exchange_key,
     remote_get_exchange_keys,
     remote_delete_account,
     remote_delete_all_accounts,
@@ -141,6 +143,32 @@ def verify_stateless_session_token(token: str) -> Optional[Dict[str, Any]]:
         if now_ts > exp:
             return None
         return data
+    except Exception:
+        return None
+
+
+def _latest_exchange_key_from_remote() -> Optional[Dict[str, Any]]:
+    """Resolves the active credential from remote storage for a cold container.
+
+    Order execution has no user session, so it cannot look the record up by user
+    id; the save path records the most recent key under a fixed name instead.
+    """
+    try:
+        if not is_remote_storage_available():
+            return None
+        record = remote_get_latest_exchange_key()
+    except Exception:
+        return None
+    if not record:
+        return None
+    try:
+        return {
+            "exchange_id": record.get("exchange_id", ""),
+            "api_key": decrypt_secret(record.get("api_key", "")),
+            "api_secret": decrypt_secret(record.get("api_secret", "")),
+            "api_passphrase": decrypt_secret(record.get("api_passphrase", "")) if record.get("api_passphrase") else "",
+            "testnet": bool(record.get("testnet", True)),
+        }
     except Exception:
         return None
 
@@ -1635,7 +1663,10 @@ class AuthService:
                     remote_saved = remote_save_exchange_key(
                         user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, testnet
                     )
-                    if not remote_saved:
+                    remote_latest_saved = remote_save_latest_exchange_key(
+                        user_id, exchange_id, enc_api_key, enc_api_secret, enc_api_passphrase, testnet
+                    )
+                    if not remote_saved or not remote_latest_saved:
                         print(f"[AUTH WARNING] Remote exchange key sync returned false for user {user_id} and {exchange_id}")
             except Exception as remote_exc:
                 print(f"[AUTH WARNING] Remote exchange key sync failed for user {user_id} and {exchange_id}: {remote_exc}")
@@ -1735,7 +1766,12 @@ class AuthService:
 
     @staticmethod
     def get_latest_raw_exchange_key() -> Optional[Dict[str, Any]]:
-        """Returns the most recently saved raw exchange key (decrypted) for background bot execution."""
+        """Returns the most recently saved raw exchange key (decrypted) for background bot execution.
+
+        On a serverless deployment the container that places an order is usually
+        not the one that handled the dashboard save, and its SQLite vault starts
+        out empty, so fall back to the remote store before giving up.
+        """
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT exchange_id, api_key, api_secret, api_passphrase, testnet FROM exchange_keys ORDER BY id DESC LIMIT 1")
@@ -1749,7 +1785,7 @@ class AuthService:
                 "api_passphrase": decrypt_secret(row["api_passphrase"]) if row["api_passphrase"] else "",
                 "testnet": bool(row["testnet"]),
             }
-        return None
+        return _latest_exchange_key_from_remote()
 
     @staticmethod
     def delete_all_accounts() -> Dict[str, Any]:
