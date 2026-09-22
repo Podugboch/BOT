@@ -145,6 +145,90 @@ def verify_stateless_session_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _ensure_local_user(user_id: Any, username: str = "", email: str = "") -> Optional[int]:
+    """Materialize the local users row behind a cross-container session token.
+
+    A stateless session token stays valid on a container whose SQLite database
+    has never seen the user, but every row referencing users(id) — exchange
+    keys, sessions — needs a real parent row. Resolve an existing row by id and
+    then by username/email, and otherwise insert one hydrated from the remote
+    store (or from the signed token claims) so the foreign key is satisfiable.
+
+    Returns the local user id, or None when no row could be ensured.
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+
+    username = (username or "").strip()
+    email = (email or "").strip().lower()
+
+    try:
+        conn = get_db_connection()
+    except Exception:
+        return None
+
+    def match_existing(cursor: sqlite3.Cursor) -> Optional[sqlite3.Row]:
+        if username and email:
+            return cursor.execute("SELECT id FROM users WHERE username = ? OR LOWER(email) = ?", (username, email)).fetchone()
+        if username:
+            return cursor.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if email:
+            return cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+        return None
+
+    try:
+        cur = conn.cursor()
+        row = cur.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
+        if row:
+            return row["id"]
+
+        row = match_existing(cur)
+        if row:
+            return row["id"]
+
+        remote_user: Dict[str, Any] = {}
+        try:
+            if is_remote_storage_available():
+                remote_user = (
+                    remote_get_user(str(uid))
+                    or (remote_get_user(username) if username else None)
+                    or (remote_get_user(email) if email else None)
+                    or {}
+                )
+        except Exception:
+            remote_user = {}
+
+        # A signed session token already proves the account authenticated, so
+        # default to active when the remote store has nothing to say.
+        remote_active = remote_user.get("is_active")
+        is_active = 1 if remote_active is None else int(bool(remote_active))
+
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uid,
+                username or f"user_{uid}",
+                email or f"user_{uid}@cross-container.invalid",
+                remote_user.get("password_hash") or "",
+                remote_user.get("salt") or "",
+                is_active,
+                remote_user.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        row = cur.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone() or match_existing(cur)
+        return row["id"] if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def generate_magic_login_token(email: str, username: str = "", expires_hours: int = 2) -> str:
     """Generates a tamper-proof cryptographically signed 1-click magic login token."""
     exp = int((datetime.now(timezone.utc) + timedelta(hours=expires_hours)).timestamp())
@@ -1504,11 +1588,15 @@ class AuthService:
         except Exception:
             pass
 
-        # 2. Cryptographic stateless token verification (cross-container support)
+        # 2. Cryptographic stateless token verification (cross-container support).
+        # The users row is materialized first: this token is valid on a container
+        # whose database has never seen the user, and every write referencing
+        # users(id) would otherwise fail the foreign key.
         data = verify_stateless_session_token(session_token)
         if data:
+            local_id = _ensure_local_user(data.get("uid"), data.get("u") or "", data.get("e") or "")
             return {
-                "id": data.get("uid"),
+                "id": local_id if local_id is not None else data.get("uid"),
                 "username": data.get("u"),
                 "email": data.get("e")
             }

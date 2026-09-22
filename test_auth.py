@@ -367,6 +367,60 @@ class TestAuthRegistrationFlow:
         assert user["username"] == "cloud_trader"
         assert user["email"] == "cloud@trader.io"
 
+    def test_cross_container_session_materializes_user_for_key_writes(self, tmp_path, monkeypatch):
+        """
+        A stateless session token must satisfy exchange_keys' foreign key on a
+        cold container; otherwise saving credentials fails with
+        "FOREIGN KEY constraint failed".
+        """
+        from auth import create_stateless_session_token
+        db_cold = tmp_path / "container_writes.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+
+        token = create_stateless_session_token(user_id=777, username="cold_writer", email="cold_writer@trader.io")
+        user = AuthService.get_user_from_token(token)
+        assert user["id"] == 777
+
+        conn = sqlite3.connect(str(db_cold))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT username, email FROM users WHERE id = 777").fetchone()
+        conn.close()
+        assert row is not None
+        assert row["username"] == "cold_writer"
+        assert row["email"] == "cold_writer@trader.io"
+
+        AuthService.save_exchange_key(user["id"], "mexc", "mx0v_key", "mx0v_secret", "", testnet=True)
+        saved = AuthService.get_exchange_keys(user["id"])
+        assert [key["exchange_id"] for key in saved] == ["mexc"]
+
+    def test_cross_container_session_reuses_existing_local_user(self, tmp_path, monkeypatch):
+        """
+        A token minted against another container's uid must resolve to the
+        existing local row instead of duplicating the account.
+        """
+        from auth import create_stateless_session_token
+        db_cold = tmp_path / "container_alias.db"
+        monkeypatch.setattr("auth.DB_PATH", db_cold)
+        init_auth_db()
+
+        AuthService.register("alias_writer", "alias_writer@trader.io", "Pass123456")
+        conn = sqlite3.connect(str(db_cold))
+        conn.row_factory = sqlite3.Row
+        local_id = conn.execute("SELECT id FROM users WHERE username = 'alias_writer'").fetchone()["id"]
+        conn.close()
+
+        token = create_stateless_session_token(
+            user_id=local_id + 500, username="alias_writer", email="alias_writer@trader.io"
+        )
+        user = AuthService.get_user_from_token(token)
+        assert user["id"] == local_id
+
+        conn = sqlite3.connect(str(db_cold))
+        count = conn.execute("SELECT COUNT(*) FROM users WHERE username = 'alias_writer'").fetchone()[0]
+        conn.close()
+        assert count == 1
+
     def test_client_token_rehydration_on_cold_container(self, tmp_path, monkeypatch):
         """
         Tests that when a cold container with an empty SQLite database receives a login
@@ -957,5 +1011,4 @@ class TestSecretEncryptionAndVault:
         ).fetchall()
         conn.close()
         assert [row["exchange_id"] for row in rows] == ["kraken", "okx"]
-
 
