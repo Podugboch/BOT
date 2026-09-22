@@ -126,6 +126,7 @@ def _turso_init() -> bool:
         "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_username ON remote_users(username)",
         "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_email ON remote_users(email)",
         "CREATE TABLE IF NOT EXISTS remote_exchange_keys (user_id INTEGER NOT NULL, exchange_id TEXT NOT NULL, api_key TEXT NOT NULL, api_secret TEXT NOT NULL, api_passphrase TEXT NOT NULL, testnet INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(user_id, exchange_id))",
+        "CREATE TABLE IF NOT EXISTS remote_latest_exchange_key (id INTEGER PRIMARY KEY CHECK (id = 1), user_id INTEGER NOT NULL, exchange_id TEXT NOT NULL, api_key TEXT NOT NULL, api_secret TEXT NOT NULL, api_passphrase TEXT NOT NULL, testnet INTEGER NOT NULL, created_at TEXT NOT NULL)",
     ))
 
 
@@ -275,6 +276,41 @@ def remote_save_exchange_key(user_id: int, exchange_id: str, enc_api_key: str, e
     if names is None: names = []
     if not isinstance(names, list): return False
     return saved and _blob_write_index(f"exchange_keys/{uid}/list.json", list(names) + [exchange], "exchange")
+
+
+def remote_save_latest_exchange_key(user_id: int, exchange_id: str, enc_api_key: str, enc_api_secret: str, enc_api_passphrase: str = "", testnet: bool = True) -> bool:
+    """Record the most recent credential under a user-independent path.
+
+    Background execution has no session and, on a serverless deployment, the
+    container placing an order is usually not the one that handled the save, so
+    it must be able to resolve the active key without knowing the user id.
+    """
+    if not is_remote_storage_available(): return False
+    uid = int(user_id); exchange = _exchange(exchange_id)
+    record = {"user_id": uid, "exchange_id": exchange, "api_key": _encrypt(enc_api_key), "api_secret": _encrypt(enc_api_secret), "api_passphrase": _encrypt(enc_api_passphrase), "testnet": bool(testnet), "created_at": datetime.now(timezone.utc).isoformat()}
+    raw = _json(record).encode(); driver = _driver()
+    if driver == "kv": return _kv_ok("SET", "exchange_key:latest", raw.decode())
+    if driver == "turso": return _turso_init() and _turso_execute("INSERT INTO remote_latest_exchange_key(id,user_id,exchange_id,api_key,api_secret,api_passphrase,testnet,created_at) VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,exchange_id=excluded.exchange_id,api_key=excluded.api_key,api_secret=excluded.api_secret,api_passphrase=excluded.api_passphrase,testnet=excluded.testnet,created_at=excluded.created_at", (uid, exchange, record["api_key"], record["api_secret"], record["api_passphrase"], int(bool(testnet)), record["created_at"]))[0]
+    return _blob_put("exchange_keys/latest.json", raw)
+
+
+def remote_get_latest_exchange_key() -> Optional[Dict[str, Any]]:
+    """Returns the most recently saved credential record, or None."""
+    if not is_remote_storage_available(): return None
+    driver = _driver()
+    if driver == "kv":
+        ok, raw = _kv_command("GET", "exchange_key:latest")
+        if not (ok and raw): return None
+        try:
+            return json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            return None
+    if driver == "turso":
+        if not _turso_init(): return None
+        ok, rows = _turso_execute("SELECT user_id,exchange_id,api_key,api_secret,api_passphrase,testnet,created_at FROM remote_latest_exchange_key WHERE id=1")
+        return rows[0] if ok and rows else None
+    record = _blob_json("exchange_keys/latest.json")
+    return record if isinstance(record, dict) else None
 
 
 def _masked(record: Dict[str, Any]) -> Dict[str, Any]:
