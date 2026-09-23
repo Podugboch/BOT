@@ -122,6 +122,8 @@ class TradingBot:
                 rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
                 adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
                 if self.position is not None:
+                    atr_now = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
+                    self.risk.update_trailing_stop(self.position, price, atr_now, "BUY")
                     hit_stop = price <= self.position["stop"]
                     hit_target = price >= self.position["target"]
                     pnl_approx = (price - self.position["entry"]) * self.position["size"]
@@ -194,9 +196,11 @@ class TradingBot:
             "stop": stop,
             "target": target,
             "fee_paid": fill["fee"],
+            "initial_stop": stop,
             "manual": True,
         }
-        log.info("MANUAL BUY EXECUTED: entry=%.2f stop=%.2f target=%.2f size=%.6f", fill["price"], stop, target, size)
+        log.info("MANUAL BUY EXECUTED: entry=%.2f stop=%.2f target=%.2f size=%.6f (R:R 1:%.2f)",
+                 fill["price"], stop, target, size, self.risk.reward_risk_ratio())
         return {
             "success": True,
             "action": "BUY",
@@ -276,31 +280,54 @@ class TradingBot:
             return
         fill = self.exchange.place_order("BUY", size, price)
         self.position = {"entry": fill["price"], "size": size, "stop": stop,
-                          "target": target, "fee_paid": fill["fee"]}
+                          "target": target, "fee_paid": fill["fee"], "initial_stop": stop}
         log.info("Signal pipeline [%s %s]: core_trigger=True | fib_filter=%s | sizing=True -> order placed",
                  self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
                  "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")))
-        log.info("OPENED POSITION: entry=%.2f stop=%.2f target=%.2f size=%.6f (Signal: %s)",
-                  fill["price"], stop, target, size, sig.name)
+        log.info("OPENED POSITION: entry=%.2f stop=%.2f target=%.2f size=%.6f (Signal: %s, R:R 1:%.2f, "
+                 "stop %.2f ATR / target %.2f ATR, trailing from +%.2f ATR)",
+                  fill["price"], stop, target, size, sig.name, self.risk.reward_risk_ratio(),
+                  abs(fill["price"] - stop) / atr_val if atr_val else 0.0,
+                  abs(target - fill["price"]) / atr_val if atr_val else 0.0,
+                  float(getattr(self.risk.cfg, "trailing_arm_atr_mult", 1.0) or 0.0))
 
     def _maybe_exit(self, df, price):
+        atr_val = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
+
+        # Ratchet the trailing stop before testing it: a trade that has already
+        # run is protected at a profit rather than handed back to the entry stop.
+        previous_stop = self.position["stop"]
+        self.risk.update_trailing_stop(self.position, price, atr_val, "BUY")
+        if self.position["stop"] > previous_stop:
+            log.info("TRAILING STOP raised to %.2f (peak %.2f, entry %.2f) — letting the winner run",
+                     self.position["stop"], self.position.get("peak", price), self.position["entry"])
+
         hit_stop = price <= self.position["stop"]
         hit_target = price >= self.position["target"]
+        running = self.risk.is_running(self.position, price, atr_val, "BUY")
         sig = generate_signal(df, self.cfg.strategy, position_open=True)
+        # Once the trade is in profit far enough for the trail to be armed, a
+        # reversal signal no longer closes it early — the trail manages the exit,
+        # which is what stops winners being banked for roughly what losers cost.
+        signal_exit = sig == Signal.SELL and not running
 
-        if not (hit_stop or hit_target or sig == Signal.SELL):
+        if not (hit_stop or hit_target or signal_exit):
             pnl_approx = (price - self.position["entry"]) * self.position["size"]
-            log.info("Holding position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
-                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
+            log.info("Holding position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f%s",
+                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx,
+                     " | trailing (signal exit suppressed while the trend runs)" if running and sig == Signal.SELL else "")
             return
 
         fill = self.exchange.place_order("SELL", self.position["size"], price)
         pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]
                - self.position["fee_paid"] - fill["fee"])
+        reason = "stop" if hit_stop else ("target" if hit_target else "signal")
+        if hit_stop and self.position.get("trail_armed"):
+            reason = "trail"
         self.risk.record_trade_result(pnl)
-        log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f",
-                  "stop" if hit_stop else ("target" if hit_target else "signal"),
-                  self.position["entry"], fill["price"], pnl, self.risk.state.equity)
+        log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f%s",
+                  reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
+                  "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
 
     def run(self):

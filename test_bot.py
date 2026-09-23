@@ -5,6 +5,8 @@ Covers indicators, strategy signals, risk management, execution, and backtesting
 import os
 import shutil
 import tempfile
+from datetime import datetime, timedelta, timezone
+
 import ccxt
 import pytest
 import numpy as np
@@ -203,6 +205,223 @@ class TestRiskManager:
 # ============================================================================
 # EXCHANGE CLIENT (PAPER MODE) TESTS
 # ============================================================================
+class TestLossStreakCooldown:
+    """A losing streak must cool the bot off, not silence it forever."""
+
+    @staticmethod
+    def _trip(risk, losses=8, start=None):
+        """Trip the losing-streak breaker without touching the daily-loss one."""
+        start = start or datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc)
+        trip_time = start
+        for i in range(losses):
+            trip_time = start + timedelta(minutes=i)
+            risk.record_trade_result(-1.0, now=trip_time)   # 8 x $1 = 0.8% of $1000
+        return trip_time
+
+    def test_streak_limit_is_raised_above_a_normal_run_of_losses(self):
+        """Four losses in a row is ordinary in trend trading — no longer a halt."""
+        cfg = RiskConfig()
+        assert cfg.max_consecutive_losses == 8
+        assert cfg.loss_streak_cooldown_hours > 0
+        risk = RiskManager(cfg, starting_equity=1000.0)
+
+        for _ in range(4):
+            risk.record_trade_result(-5.0, now=datetime(2026, 3, 14, tzinfo=timezone.utc))
+        can_trade, reason = risk.can_trade(now=datetime(2026, 3, 14, tzinfo=timezone.utc))
+        assert can_trade is True
+        assert reason == "OK"
+
+    def test_cooldown_blocks_then_resumes_by_itself(self):
+        cfg = RiskConfig()
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        tripped_at = self._trip(risk)
+
+        can_trade, reason = risk.can_trade(now=tripped_at + timedelta(minutes=30))
+        assert can_trade is False
+        assert "8 consecutive losses" in reason
+        assert "resume" in reason
+        # The exact resume timestamp is published, not just "blocked".
+        assert (tripped_at + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M UTC") in reason
+
+        # ...and it lifts on its own once the cooldown window passes.
+        can_trade, reason = risk.can_trade(now=tripped_at + timedelta(hours=25))
+        assert can_trade is True
+        assert reason == "OK"
+        assert risk.state.consecutive_losses == 0
+        assert risk.state.cooldown_until is None
+
+    def test_tripping_the_breaker_logs_the_expiry_timestamp(self, caplog):
+        cfg = RiskConfig()
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        start = datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc)
+
+        with caplog.at_level("WARNING", logger="risk"):
+            tripped_at = self._trip(risk, start=start)
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        assert "Circuit breaker tripped: 8 consecutive losses" in text
+        assert (tripped_at + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M UTC") in text
+        assert "resumes automatically" in text
+        assert risk.state.cooldown_until == tripped_at + timedelta(hours=24)
+
+    def test_winning_trade_clears_the_cooldown_early(self):
+        cfg = RiskConfig()
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        tripped_at = self._trip(risk)
+        assert risk.can_trade(now=tripped_at + timedelta(hours=1))[0] is False
+
+        risk.record_trade_result(+25.0, now=tripped_at + timedelta(hours=1))
+        can_trade, reason = risk.can_trade(now=tripped_at + timedelta(hours=1))
+        assert can_trade is True
+        assert reason == "OK"
+        assert risk.state.cooldown_until is None
+
+    def test_zero_cooldown_keeps_the_old_hard_halt(self):
+        cfg = RiskConfig(loss_streak_cooldown_hours=0.0)
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        tripped_at = self._trip(risk)
+
+        can_trade, reason = risk.can_trade(now=tripped_at + timedelta(days=30))
+        assert can_trade is False
+        assert "until a winning trade" in reason
+
+        risk.record_trade_result(+10.0, now=tripped_at + timedelta(days=30))
+        assert risk.can_trade(now=tripped_at + timedelta(days=30))[0] is True
+
+    def test_backtest_rejections_carry_the_cooldown_expiry(self):
+        """The run report must say when trading resumes, not just 'circuit breaker'."""
+        res = run_backtest(TestPipelineDiagnostics._series(), TestPipelineDiagnostics._diag_cfg())
+        lines = res["diagnostics"]["rejection_log"]
+
+        assert any("Circuit breaker" in line and "resume" in line for line in lines)
+
+    def test_backtest_resumes_after_the_cooldown_mid_run(self):
+        """More trades than the old 4-loss hard halt would ever allow."""
+        cfg = TestPipelineDiagnostics._diag_cfg()
+        res = run_backtest(TestPipelineDiagnostics._series(), cfg)
+        diag = res["diagnostics"]
+
+        assert diag["rejections"].get("risk_gate", 0) < diag["trades_executed"]
+        assert res["trades_executed"] > 10
+
+
+class TestRewardRiskBalance:
+    """Stop 1.5 ATR, target >= 2R, and a trail that protects a running winner."""
+
+    @staticmethod
+    def _risk(**overrides):
+        return RiskManager(RiskConfig(**overrides), starting_equity=1000.0)
+
+    def test_defaults_take_at_least_two_and_a_half_times_the_risk(self):
+        cfg = RiskConfig()
+        assert cfg.stop_loss_atr_mult == 1.5
+        assert cfg.take_profit_atr_mult >= 3.0          # >= 3 ATR as requested
+        assert cfg.take_profit_atr_mult / cfg.stop_loss_atr_mult >= 2.5
+        assert cfg.min_reward_risk_ratio >= 2.0
+
+        risk = self._risk()
+        stop, target = risk.stop_and_target(entry_price=100.0, atr_value=4.0, side="BUY")
+        assert stop == pytest.approx(100.0 - 1.5 * 4.0)
+        assert target - 100.0 >= 2.0 * (100.0 - stop)
+        assert risk.reward_risk_ratio() == pytest.approx(cfg.take_profit_atr_mult / 1.5)
+
+    def test_thin_targets_are_lifted_to_the_minimum_reward_risk(self):
+        """A 1:1.2 setup would bleed with a 30-45% win rate — it gets widened."""
+        risk = self._risk(stop_loss_atr_mult=2.0, take_profit_atr_mult=2.5,
+                          min_reward_risk_ratio=2.0)
+        stop, target = risk.stop_and_target(entry_price=100.0, atr_value=5.0, side="BUY")
+        risk_distance = 100.0 - stop
+        assert risk_distance == pytest.approx(10.0)                  # 2.0 ATR stop
+        assert target - 100.0 == pytest.approx(2.0 * risk_distance)  # lifted to 1:2
+
+    def test_sell_side_is_mirrored(self):
+        risk = self._risk()
+        stop, target = risk.stop_and_target(entry_price=100.0, atr_value=4.0, side="SELL")
+        assert stop > 100.0 > target
+        assert (target - 100.0) <= -2.0 * (stop - 100.0)
+
+    def test_trailing_stop_waits_for_profit_then_only_tightens(self):
+        risk = self._risk()
+        position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+
+        # Not in profit enough to arm: the original stop stands.
+        assert risk.update_trailing_stop(position, 102.0, 4.0) == 94.0
+        assert risk.is_running(position, 102.0, 4.0) is False
+
+        # +1 ATR arms the trail and pulls the stop up to break-even...
+        assert risk.update_trailing_stop(position, 104.0, 4.0) == pytest.approx(100.0)
+        assert risk.is_running(position, 104.0, 4.0) is True
+
+        # ...then it trails 1.5 ATR behind the best price.
+        assert risk.update_trailing_stop(position, 120.0, 4.0) == pytest.approx(114.0)
+        assert position["peak"] == 120.0
+        # A pullback never loosens the stop again.
+        assert risk.update_trailing_stop(position, 112.0, 4.0) == pytest.approx(114.0)
+        assert position["trail_armed"] is True
+
+    def test_backtest_lets_winners_run_and_reports_realized_rr(self):
+        """Realised R:R must beat the ~1.1 the fix was written for."""
+        cfg = TestPipelineDiagnostics._diag_cfg()
+        res = run_backtest(TestPipelineDiagnostics._series(), cfg)
+
+        assert res["num_trades"] > 5
+        # Was ~1.1 (wins barely covering losses) before the stop/trail rebalance.
+        assert res["realized_rr"] > 1.5
+        assert abs(res["avg_win"]) > abs(res["avg_loss"])
+        # The trail (not an early reversal exit) is now a real exit path.
+        assert "trail" in res["exit_reasons"]
+        assert set(res["exit_reasons"]) <= {"stop", "target", "trail", "signal"}
+        assert "Expectancy" in res["diagnostics"]["report"]
+        assert "realized R:R" in res["diagnostics"]["report"]
+        # Fewer reversal-signal exits than before the change (they used to be the
+        # single biggest exit reason and kept winners no bigger than losers).
+        assert res["exit_reasons"].get("signal", 0) <= res["exit_reasons"].get("trail", 0)
+
+
+def web_server_dashboard_html() -> str:
+    """The dashboard page exactly as served — lets the UI wiring be asserted
+    without a browser or a live HTTP socket."""
+    import web_server
+    return web_server.DASHBOARD_HTML
+
+
+class TestDashboardRefreshWiring:
+    """The UI Refresh buttons must always do something visible (the deployed
+    build silently swallowed failed/cached refreshes)."""
+
+    def test_refresh_buttons_are_wired_to_the_handlers(self):
+        html = web_server_dashboard_html()
+
+        for handler in ("refreshAnalysis", "refreshLogs"):
+            assert f'onclick="{handler}(' in html
+        # Both are explicit buttons, so a stray form wrapper can never turn a
+        # click into a page submit.
+        for button_id in ('id="btn-refresh-analysis"', 'id="btn-refresh-logs"'):
+            assert button_id in html
+        for stamp_id in ('id="an-updated"', 'id="logs-updated"'):
+            assert stamp_id in html
+
+    def test_dashboard_never_reuses_a_cached_api_response(self):
+        html = web_server_dashboard_html()
+
+        # A cached GET is the classic reason a Refresh button appears dead once
+        # the app sits behind a CDN or a browser cache.
+        assert html.count("cache: 'no-store'") >= 2
+        assert "&_ts=" in html
+
+    def test_failed_refresh_is_visible_instead_of_console_only(self):
+        html = web_server_dashboard_html()
+        assert "Could not refresh" in html
+
+    def test_api_responses_are_marked_no_store(self):
+        import web_server
+        from fastapi import Response
+
+        response = Response()
+        web_server.get_logs(lines=5, response=response)
+        assert "no-store" in response.headers.get("Cache-Control", "")
+
+
 class TestExchangeClientPaper:
     def test_paper_execution_fees_and_slippage(self):
         cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
@@ -1035,7 +1254,11 @@ class TestPipelineDiagnostics:
         assert diag["core_signals_detected"] == diag["fib_filter_passed"] + diag["fib_filter_blocked"]
         assert diag["fib_filter_passed"] == (diag["sizing_passed"] + diag["sizing_blocked"]
                                              + diag["signals_risk_blocked"])
-        assert diag["trades_executed"] == res["num_trades"]
+        # A winning trade now rides the trailing stop instead of being banked on
+        # the first pullback, so the final position can still be open at the end
+        # of the window: entries taken >= closed trades.
+        assert diag["trades_executed"] >= res["num_trades"]
+        assert diag["trades_executed"] - res["num_trades"] <= 1
         assert res["raw_signals"] == diag["core_signals_detected"]
         assert res["trades_executed"] == diag["trades_executed"]
         # Every signal that fired is accounted for: executed or rejected by a named rule.
@@ -1044,7 +1267,6 @@ class TestPipelineDiagnostics:
         assert diag["sizing_passed"] == diag["trades_executed"]
         # Raw signals = executed + rejected: nothing is dropped silently.
         assert sum(diag["rejections"].values()) + diag["trades_executed"] == diag["core_signals_detected"]
-        assert diag["trades_executed"] >= res["num_trades"]   # a position still open is not a closed trade
 
     def test_rejection_log_has_the_requested_format(self):
         res = run_backtest(self._series(), self._diag_cfg())
