@@ -14,7 +14,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-from config import BotConfig
+from config import BotConfig, resolve_min_bars_between_trades
 from exchange_client import (
     MAX_DAYS,
     MIN_PAUSE_SEC,
@@ -26,7 +26,7 @@ from exchange_client import (
     to_frame,
 )
 from risk_manager import RiskManager
-from strategy import Signal, add_indicators, generate_signal
+from strategy import DEBOUNCE_REASON, Signal, add_indicators, generate_signal
 
 log = logging.getLogger("backtest")
 
@@ -51,6 +51,8 @@ def _rejection_reason(rule: str, stages: dict) -> str:
     """Human sentence for the stage that blocked an otherwise-valid signal."""
     if rule == "fib_zone":
         return stages.get("fib_reason") or "Price outside the Fibonacci zone"
+    if rule == "signal_debounce":
+        return stages.get("debounce_reason") or DEBOUNCE_REASON
     if rule == "risk_gate":
         return stages.get("risk_reason") or "Risk manager blocked new entries"
     if rule == "position_sizing":
@@ -92,6 +94,10 @@ def format_pipeline_report(results: dict) -> str:
         f"misses: {_fmt_counts(diag.get('core_misses', {}))}",
         f"Stage 2 Fibonacci filter : {diag.get('fib_filter_passed', 0):,} passed, "
         f"{diag.get('fib_filter_blocked', 0):,} blocked",
+        f"Stage 2b entry debounce  : {diag.get('debounce_blocked', 0):,} suppressed "
+        f"({diag.get('min_bars_between_trades', 0)} bar(s) required between trades; "
+        f"tightest gap actually taken: "
+        f"{results.get('min_entry_gap_bars') if results.get('min_entry_gap_bars') is not None else 'n/a'})",
         f"Stage 3 capital / sizing : {diag.get('sizing_passed', 0):,} passed, "
         f"{diag.get('sizing_blocked', 0):,} blocked",
         f"Signals rejected         : {_fmt_counts(diag.get('rejections', {}))}",
@@ -123,10 +129,12 @@ def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int) -> 
              f"{diag['candles_evaluated']:,}", f"{diag['core_signals_detected']:,}",
              f"{sum(diag['rejections'].values()):,}", _fmt_counts(diag["rejections"]),
              f"{diag['trades_executed']:,}")
-    log.info("Backtest stages: fib filter %s (%s passed / %s blocked), sizing %s passed / %s blocked, "
-             "no-signal candles by rule: %s",
+    log.info("Backtest stages: fib filter %s (%s passed / %s blocked), debounce %s suppressed "
+             "(%s bar(s) required), sizing %s passed / %s blocked, no-signal candles by rule: %s",
              "on" if fib_filter_enabled else "off",
              f"{diag['fib_filter_passed']:,}", f"{diag['fib_filter_blocked']:,}",
+             f"{diag.get('debounce_blocked', 0):,}",
+             f"{diag.get('min_bars_between_trades', 0)}",
              f"{diag['sizing_passed']:,}", f"{diag['sizing_blocked']:,}",
              _fmt_counts(diag["core_misses"]))
 
@@ -228,20 +236,25 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     # entries are decided by the core EMA/ADX/RSI signal alone.
     strategy_id = (getattr(cfg.strategy, "strategy_name", "ema_cross_fib") or "ema_cross_fib").strip().lower()
     fib_filter_enabled = strategy_id == "ema_cross_fib" and bool(cfg.strategy.use_fib_filter)
+    # Resolved once so the loop, the report and the echoed JSON all agree on how
+    # many bars the entry debounce is actually enforcing for this grain.
+    min_bars_between_trades = resolve_min_bars_between_trades(cfg.strategy, cfg.exchange.timeframe)
 
     # Per-stage tally of the entry pipeline, so a run can explain itself:
     # stage 1 core trigger -> stage 2 Fibonacci filter -> stage 3 sizing/capital.
     diag = {
         "candles_evaluated": 0,
+        "min_bars_between_trades": min_bars_between_trades,
         "candles_in_position": 0,
         "signals_risk_blocked": 0,
         "core_signals_detected": 0,
         "fib_filter_passed": 0,
         "fib_filter_blocked": 0,
+        "debounce_blocked": 0,
         "sizing_passed": 0,
         "sizing_blocked": 0,
         "trades_executed": 0,
-        "rejections": {},          # post-trigger: fib_zone / position_sizing / risk_gate
+        "rejections": {},          # post-trigger: fib_zone / signal_debounce / position_sizing / risk_gate
         "core_misses": {},         # stage 1 False, keyed by rule
         "rejection_log": [],
         "rejection_log_truncated": False,
@@ -250,6 +263,9 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     equity_curve = []
     trades = []
     position = None
+    # Bar index of the last exit: the entry debounce measures from here, so a
+    # whipsaw cannot chain entries on adjacent candles.
+    last_exit_bar_index = None
 
     warmup = max(cfg.strategy.slow_ema, cfg.strategy.rsi_period, cfg.strategy.adx_period,
                  cfg.strategy.fib_lookback) + 2
@@ -276,7 +292,11 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
             # Evaluate the full entry pipeline every flat candle, even when the
             # risk gate is shut, so the run report can say what actually blocked.
             stages: dict = {}
-            sig = generate_signal(window, cfg.strategy, position_open=False, diagnostics=stages)
+            bars_since_last_trade = (None if last_exit_bar_index is None
+                                     else i - last_exit_bar_index)
+            sig = generate_signal(window, cfg.strategy, position_open=False, diagnostics=stages,
+                                  bars_since_last_trade=bars_since_last_trade,
+                                  timeframe=cfg.exchange.timeframe)
 
             if not stages.get("core_trigger"):
                 miss = stages.get("rejected_by")
@@ -291,6 +311,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                 if sig != Signal.BUY:
                     # Stage 2 blocked it (fib zone, or a strategy-level filter).
                     blocked_by = stages.get("rejected_by") or "fib_zone"
+                    if blocked_by == "signal_debounce":
+                        diag["debounce_blocked"] += 1
                 elif not can_trade:
                     # Stage 2 passed but the risk gate is shut for this candle.
                     diag["signals_risk_blocked"] += 1
@@ -307,7 +329,7 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                         fee = fill * size * cfg.taker_fee_pct
                         position = {"entry": fill, "size": size, "stop": stop,
                                     "target": target, "fee_paid": fee, "initial_stop": stop,
-                                    "opened_ts": row["ts"]}
+                                    "opened_ts": row["ts"], "entry_index": i}
                         diag["trades_executed"] += 1
                     else:
                         diag["sizing_blocked"] += 1
@@ -351,8 +373,12 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                     "entry": position["entry"], "exit": exit_fill, "size": position["size"],
                     "pnl": pnl, "reason": reason,
                     "stop": position["stop"], "initial_stop": position.get("initial_stop"),
+                    # Bar positions, so a run can be checked for adjacent-candle
+                    # re-entries instead of taking the debounce on faith.
+                    "entry_index": position.get("entry_index"), "exit_index": i,
                 })
                 position = None
+                last_exit_bar_index = i
 
         equity_curve.append({"ts": row["ts"], "equity": risk.state.equity})
 
@@ -371,6 +397,14 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
         getattr(cfg.risk, "trailing_stop_atr_mult", 0.0) or 0.0)
     results["trailing_arm_atr_mult"] = float(
         getattr(cfg.risk, "trailing_arm_atr_mult", 0.0) or 0.0)
+    results["min_bars_between_trades"] = min_bars_between_trades
+    results["debounce_blocked"] = diag["debounce_blocked"]
+    # Tightest spacing actually achieved between one exit and the next entry, so
+    # the debounce can be checked from the result rather than taken on faith.
+    entry_gaps = [trade["entry_index"] - previous["exit_index"]
+                  for previous, trade in zip(trades, trades[1:])
+                  if trade.get("entry_index") is not None and previous.get("exit_index") is not None]
+    results["min_entry_gap_bars"] = min(entry_gaps) if entry_gaps else None
     results["diagnostics"] = diag
     # Flat aliases so the API/UI can read the headline numbers without digging.
     results["candles_evaluated"] = diag["candles_evaluated"]

@@ -511,6 +511,47 @@ class TestTradingBot:
             if os.path.exists(cfg.kill_switch_file):
                 os.remove(cfg.kill_switch_file)
 
+    def test_entry_debounce_measures_bars_since_the_last_exit(self, sample_ohlcv):
+        """The live cooldown is a bar count derived from the exit's candle."""
+        cfg = BotConfig()
+        cfg.exchange.timeframe = "15m"                    # the fixture's bar spacing
+        bot = TradingBot(cfg)
+        df = add_indicators(sample_ohlcv, cfg.strategy)
+
+        assert bot._bars_since_last_exit(df) is None      # never traded -> nothing to debounce
+
+        bot._mark_exit(df.iloc[:-5])                      # last exit five candles back
+        assert bot._bars_since_last_exit(df) == 5
+
+        bot._mark_exit(df)                                # exited on the newest candle
+        assert bot._bars_since_last_exit(df) == 0         # inside any cooldown
+
+    def test_live_entry_is_suppressed_while_the_cooldown_runs(self, sample_ohlcv, monkeypatch):
+        """A 5m whipsaw cannot re-enter on the candle it just exited on."""
+        import strategy
+
+        monkeypatch.setattr(strategy, "_evaluate_signal",
+                            lambda df, cfg, position_open, diagnostics=None: Signal.BUY)
+        cfg = BotConfig()
+        cfg.exchange.timeframe = "15m"                    # 8-bar default for this grain
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        df = add_indicators(sample_ohlcv, cfg.strategy)
+        price = float(df["close"].iloc[-1])
+
+        bot._maybe_enter(df, price)                       # first entry is never debounced
+        assert bot.position is not None
+
+        bot.position = None
+        bot._mark_exit(df)                                # stop-out on this very candle
+        bot._maybe_enter(df, price)
+        assert bot.position is None                       # suppressed by the cooldown
+
+        # Eight candles later the setup is tradeable again.
+        bot.last_exit_ts = bot._last_bar_ts(df.iloc[:-8])
+        bot._maybe_enter(df, price)
+        assert bot.position is not None
+
     def test_manual_mode_execution(self, sample_ohlcv):
         cfg = BotConfig()
         cfg.execution_mode = "manual"
@@ -1305,8 +1346,11 @@ class TestPipelineDiagnostics:
 
         assert diag["candles_evaluated"] == 1500 - diag["candles_warmup"]
         assert diag["core_signals_detected"] == diag["fib_filter_passed"] + diag["fib_filter_blocked"]
+        # Everything that cleared the fib filter was then sized, failed sizing,
+        # hit the risk gate, or was held back by the entry debounce.
         assert diag["fib_filter_passed"] == (diag["sizing_passed"] + diag["sizing_blocked"]
-                                             + diag["signals_risk_blocked"])
+                                             + diag["signals_risk_blocked"]
+                                             + diag["debounce_blocked"])
         # A winning trade now rides the trailing stop instead of being banked on
         # the first pullback, so the final position can still be open at the end
         # of the window: entries taken >= closed trades.
@@ -1317,6 +1361,7 @@ class TestPipelineDiagnostics:
         # Every signal that fired is accounted for: executed or rejected by a named rule.
         assert diag["fib_filter_blocked"] > 0 and diag["trades_executed"] > 0
         assert diag["rejections"].get("fib_zone", 0) == diag["fib_filter_blocked"]
+        assert diag["rejections"].get("signal_debounce", 0) == diag["debounce_blocked"]
         assert diag["sizing_passed"] == diag["trades_executed"]
         # Raw signals = executed + rejected: nothing is dropped silently.
         assert sum(diag["rejections"].values()) + diag["trades_executed"] == diag["core_signals_detected"]
@@ -1625,6 +1670,153 @@ class TestATRTrailingStopOption:
         assert res["trailing_stop_enabled"] is False
         assert "trail" not in res["exit_reasons"]
         assert res["exit_reasons"].get("signal", 0) > 0
+
+
+class TestEntryDebounce:
+    """A whipsaw must not chain entries on adjacent candles.
+
+    The reported symptom was a BUY at 17:30, another at 17:35 and another at
+    17:40 on a 5m chart — one setup, paid for three times over. The gate lives
+    in `generate_signal` and is measured from the previous *exit*, so these
+    tests drive the strategy directly and then prove the backtest loop feeds it
+    the bar distance it needs.
+    """
+
+    def test_defaults_scale_with_the_grain(self):
+        """3 bars is 15 minutes on 5m but 3 hours on 1h, so the count is keyed."""
+        from config import FALLBACK_MIN_BARS_BETWEEN_TRADES, default_min_bars_between_trades
+
+        for grain in ("1m", "3m", "5m", "15m"):
+            assert default_min_bars_between_trades(grain) == 8, grain
+        for grain in ("30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"):
+            assert default_min_bars_between_trades(grain) == 3, grain
+        # Case/whitespace tolerant, and an unknown grain still debounces.
+        assert default_min_bars_between_trades(" 5M ") == 8
+        assert default_min_bars_between_trades("3d") == FALLBACK_MIN_BARS_BETWEEN_TRADES
+        assert default_min_bars_between_trades(None) == FALLBACK_MIN_BARS_BETWEEN_TRADES
+        # The shipped config leaves it unset, i.e. "derive it from the grain".
+        assert StrategyConfig().min_bars_between_trades is None
+
+    def test_resolve_prefers_an_explicit_override(self):
+        from config import resolve_min_bars_between_trades
+
+        assert resolve_min_bars_between_trades(StrategyConfig(), "5m") == 8
+        assert resolve_min_bars_between_trades(StrategyConfig(min_bars_between_trades=12), "5m") == 12
+        # An explicit 0 means "no debounce", not "fall back to the default".
+        assert resolve_min_bars_between_trades(StrategyConfig(min_bars_between_trades=0), "5m") == 0
+        assert resolve_min_bars_between_trades(StrategyConfig(min_bars_between_trades=-4), "5m") == 0
+
+    def test_a_signal_inside_the_cooldown_is_suppressed_with_the_exact_reason(self):
+        from strategy import DEBOUNCE_REASON
+
+        df = TestPipelineDiagnostics._cross()          # a candle that really is a BUY
+        cfg = StrategyConfig()
+        assert generate_signal(df, cfg, position_open=False, timeframe="1h") == Signal.BUY
+
+        for gap in (0, 1, 2):
+            stages = {}
+            sig = generate_signal(df, cfg, position_open=False, diagnostics=stages,
+                                  bars_since_last_trade=gap, timeframe="1h")
+            assert sig == Signal.HOLD, gap
+            assert stages["rejected_by"] == "signal_debounce"
+            assert DEBOUNCE_REASON == "Signal debounce: waiting for cooldown period between setups"
+            assert stages["debounce_reason"] == DEBOUNCE_REASON
+            # The core trigger still fired — the debounce is what turned it away.
+            assert stages["core_signal"] == "BUY"
+            assert stages["core_trigger"] is True
+            assert stages["debounce_bars_elapsed"] == gap
+            assert stages["debounce_bars_required"] == 3     # 1h default
+
+    def test_the_cooldown_clears_once_enough_bars_have_passed(self):
+        df = TestPipelineDiagnostics._cross()
+        cfg = StrategyConfig()
+
+        for gap in (3, 4, 50):                                # >= required
+            stages = {}
+            assert generate_signal(df, cfg, position_open=False, diagnostics=stages,
+                                   bars_since_last_trade=gap, timeframe="1h") == Signal.BUY
+            assert stages.get("rejected_by") is None
+
+        # Same candle and same distance, slower grain: 3 bars is not enough on 5m.
+        stages = {}
+        assert generate_signal(df, cfg, position_open=False, diagnostics=stages,
+                               bars_since_last_trade=3, timeframe="5m") == Signal.HOLD
+        assert stages["debounce_bars_required"] == 8
+
+        # An explicit override beats the grain table in both directions.
+        assert generate_signal(df, StrategyConfig(min_bars_between_trades=1), position_open=False,
+                               bars_since_last_trade=1, timeframe="5m") == Signal.BUY
+        assert generate_signal(df, StrategyConfig(min_bars_between_trades=20), position_open=False,
+                               bars_since_last_trade=19, timeframe="1h") == Signal.HOLD
+
+    def test_no_prior_trade_and_a_disabled_cooldown_never_block(self):
+        df = TestPipelineDiagnostics._cross()
+
+        # None = the bot has never traded, so there is nothing to debounce.
+        assert generate_signal(df, StrategyConfig(), position_open=False,
+                               bars_since_last_trade=None, timeframe="1h") == Signal.BUY
+        # 0 = explicitly off, at every distance.
+        for gap in (0, 1, 7):
+            assert generate_signal(df, StrategyConfig(min_bars_between_trades=0), position_open=False,
+                                   bars_since_last_trade=gap, timeframe="1h") == Signal.BUY
+
+    def test_managing_an_open_position_is_never_debounced(self):
+        """The cooldown gates entries; it must not touch exit management."""
+        stages = {}
+        generate_signal(TestPipelineDiagnostics._cross(), StrategyConfig(), position_open=True,
+                        diagnostics=stages, bars_since_last_trade=0, timeframe="1h")
+        assert stages.get("rejected_by") != "signal_debounce"
+
+    def test_backtest_never_re_enters_inside_the_cooldown(self):
+        """End to end: the loop counts bars from the exit, and the gap is honoured."""
+        series = TestPipelineDiagnostics._series()
+
+        # Baseline: with the debounce off, entries are allowed to crowd up.
+        off = TestPipelineDiagnostics._diag_cfg()
+        off.exchange.timeframe = "15m"
+        off.strategy.min_bars_between_trades = 0
+        base = run_backtest(series, off)
+        assert base["min_bars_between_trades"] == 0
+        assert base["debounce_blocked"] == 0
+        assert base["min_entry_gap_bars"] < 8          # the chaining we are fixing
+
+        on = TestPipelineDiagnostics._diag_cfg()
+        on.exchange.timeframe = "15m"                  # 8-bar default for this grain
+        guarded = run_backtest(series, on)
+
+        assert guarded["min_bars_between_trades"] == 8
+        assert guarded["debounce_blocked"] > 0
+        assert guarded["min_entry_gap_bars"] >= 8      # never entered inside the cooldown
+        assert guarded["min_entry_gap_bars"] > base["min_entry_gap_bars"]
+        assert guarded["diagnostics"]["rejections"]["signal_debounce"] == guarded["debounce_blocked"]
+
+        log = guarded["diagnostics"]["rejection_log"]
+        assert any("Signal debounce: waiting for cooldown period between setups" in line
+                   for line in log), log
+        assert "entry debounce" in backtester.format_pipeline_report(guarded)
+
+    def test_api_carries_the_debounce_into_the_engine(self, monkeypatch):
+        """The knob reaches run_backtest through the real handler, and is echoed."""
+        import web_server
+
+        n = 900
+        close = 50000 + np.sin(np.linspace(0, 30, n)) * 3000 + np.random.normal(0, 50, n)
+        hist = pd.DataFrame({
+            "ts": pd.date_range("2026-01-01", periods=n, freq="15min"),
+            "open": close - 20, "high": close + 100, "low": close - 100,
+            "close": close, "volume": np.random.uniform(10, 100, n),
+        })
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        def run(**kwargs):
+            return web_server.run_backtest_endpoint(web_server.BacktestRequest(
+                exchange="binance", symbol="BTC/USDT", timeframe="15m", days=30, **kwargs))["results"]
+
+        assert run(min_bars_between_trades=12)["min_bars_between_trades"] == 12
+        # Omitted -> the grain default (15m serves 8 bars) is what gets reported.
+        assert run()["min_bars_between_trades"] == 8
+        # An explicit 0 is "off", not "fall back to the default".
+        assert run(min_bars_between_trades=0)["min_bars_between_trades"] == 0
 
 
 class TestOneHourBacktestReporting:

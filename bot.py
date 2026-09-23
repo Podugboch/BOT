@@ -17,10 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
-from config import BotConfig
+from config import BotConfig, timeframe_minutes
 from exchange_client import ExchangeClient
 from risk_manager import RiskManager
-from strategy import Signal, add_indicators, generate_signal
+from strategy import DEBOUNCE_REASON, Signal, add_indicators, generate_signal
 
 log = logging.getLogger("bot")
 
@@ -74,9 +74,46 @@ class TradingBot:
         )
         self.position = None
         self.last_day = datetime.now(timezone.utc).date()
+        # Timestamp of the bar the bot last went flat on. The entry debounce is
+        # measured in candles, so we keep the bar's own timestamp and convert
+        # the gap back into a bar count — a whipsaw that exits and re-triggers
+        # within the cooldown is then suppressed instead of chained.
+        self.last_exit_ts = None
 
     def kill_switch_active(self) -> bool:
         return os.path.exists(self.cfg.kill_switch_file) or getattr(self.risk.state, "kill_switch_triggered", False)
+
+    @staticmethod
+    def _last_bar_ts(df):
+        """Bar timestamp of the newest candle, falling back to wall-clock time."""
+        try:
+            if df is not None and len(df) > 0 and "ts" in df:
+                stamp = pd.Timestamp(df["ts"].iloc[-1])
+                return stamp.tz_convert("UTC").tz_localize(None) if stamp.tzinfo else stamp
+        except Exception:
+            pass
+        return pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)
+
+    def _mark_exit(self, df=None) -> None:
+        """Remember when the bot went flat, for the next entry's debounce."""
+        self.last_exit_ts = self._last_bar_ts(df)
+
+    def _bars_since_last_exit(self, df=None):
+        """Candles since the last exit, or None when there is no prior trade.
+
+        None means "nothing to debounce" — the caller (and the strategy) treats
+        that as no restriction, which is what a first-ever entry should be.
+        """
+        if self.last_exit_ts is None:
+            return None
+        bar_minutes = timeframe_minutes(self.cfg.exchange.timeframe)
+        if bar_minutes <= 0:
+            return None
+        try:
+            gap = self._last_bar_ts(df) - self.last_exit_ts
+            return max(0, int(gap.total_seconds() // (bar_minutes * 60)))
+        except Exception:
+            return None
 
     def maybe_reset_day(self):
         today = datetime.now(timezone.utc).date()
@@ -118,7 +155,11 @@ class TradingBot:
         # In manual execution mode, monitor market and signals without auto-placing orders
         if getattr(self.cfg, "execution_mode", "auto") == "manual":
             try:
-                sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position))
+                stages: dict = {}
+                sig = generate_signal(df, self.cfg.strategy, position_open=bool(self.position),
+                                      diagnostics=stages,
+                                      bars_since_last_trade=self._bars_since_last_exit(df),
+                                      timeframe=self.cfg.exchange.timeframe)
                 rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
                 adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
                 if self.position is not None:
@@ -140,6 +181,8 @@ class TradingBot:
                 else:
                     if sig == Signal.BUY:
                         log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
+                    elif stages.get("rejected_by") == "signal_debounce":
+                        log.info("MANUAL MODE: %s (last trade closed too recently).", DEBOUNCE_REASON)
                     else:
                         log.info("MANUAL MODE [%s %s]: price=$%.2f | signal=%s | RSI=%.1f | ADX=%.1f (monitoring only)",
                                  self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, rsi_val, adx_val)
@@ -218,6 +261,7 @@ class TradingBot:
         if self.position is None:
             raise RuntimeError("No active open position to close.")
 
+        df = None
         try:
             df = self.exchange.fetch_ohlcv(limit=10)
             price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
@@ -233,6 +277,7 @@ class TradingBot:
         self.risk.record_trade_result(pnl)
         closed_position = dict(self.position)
         self.position = None
+        self._mark_exit(df)
         log.info("MANUAL SELL EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
         return {
             "success": True,
@@ -247,7 +292,9 @@ class TradingBot:
 
     def _maybe_enter(self, df, price):
         stages = {}
-        sig = generate_signal(df, self.cfg.strategy, position_open=False, diagnostics=stages)
+        sig = generate_signal(df, self.cfg.strategy, position_open=False, diagnostics=stages,
+                              bars_since_last_trade=self._bars_since_last_exit(df),
+                              timeframe=self.cfg.exchange.timeframe)
         rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
         adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
         trend = "BULLISH" if ("ema_fast" in df and "ema_slow" in df and df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]) else "BEARISH"
@@ -330,8 +377,9 @@ class TradingBot:
         self.risk.record_trade_result(pnl)
         log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f%s",
                   reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
-                  "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
+                 "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
+        self._mark_exit(df)
 
     def run(self):
         log.info("Bot starting: mode=%s symbol=%s timeframe=%s equity=%.2f",
