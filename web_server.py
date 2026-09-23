@@ -38,7 +38,7 @@ safe_load_dotenv()
 migrate_and_sanitize_env_file()
 
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
-from exchange_client import ExchangeClient
+from exchange_client import ExchangeClient, MAX_DAYS
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager, reward_risk_ratio
@@ -273,9 +273,15 @@ class BacktestRequest(BaseModel):
     exchange: str = "binance"
     symbol: str = "BTC/USDT"
     timeframe: str = "15m"
-    days: int = 30
+    days: int = 30                      # clamped to 1..MAX_DAYS (730) server-side
     starting_equity: float = 1000.0
     use_fib_filter: bool = True
+    # Dynamic (ATR-scaled) fib band: 0 restores the fixed percentage band.
+    fib_tolerance_atr_mult: float = 0.5
+    fib_tolerance_pct: float = 0.01     # floor for the band (and the fixed band)
+    fib_level_mode: str = "all"         # "all" | "deep" (0.5/0.618 only)
+    trailing_stop_enabled: bool = True
+    trailing_stop_atr_mult: float = 2.0
     risk_per_trade_pct: float = 0.01
 
     @model_validator(mode="before")
@@ -337,6 +343,7 @@ def create_bot_zip() -> str:
         "risk_manager.py",
         "strategy.py",
         "backtester.py",
+        "optimize_1h.py",
         "web_server.py",
         "auth.py",
         "secret_manager.py",
@@ -881,6 +888,8 @@ def get_status(response: Response = None):
         ),
         "risk_cooldown_note": bot.risk.cooldown_note(peek=True) if bot else "",
         "reward_risk_ratio": round(reward_risk_ratio(cfg.risk), 2),
+        "trailing_stop_enabled": bool(getattr(cfg.risk, "trailing_stop_enabled", True)),
+        "trailing_stop_atr_mult": cfg.risk.trailing_stop_atr_mult,
         "trading_halted_today": risk_state.trading_halted_today if risk_state else False,
         "kill_switch_triggered": risk_state.kill_switch_triggered if risk_state else False,
         "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
@@ -1277,13 +1286,28 @@ def get_analysis(response: Response = None, symbol: Optional[str] = None,
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _clamp_days(days) -> int:
+    """Clamp a requested lookback into 1..MAX_DAYS instead of rejecting it.
+
+    365/730 days are the point of the control: a 1h run has to be able to span
+    bull, bear and chop, which is where the two-year (730-day) cap comes from.
+    A nonsense value is capped rather than 422'd, so a stale UI cannot break a
+    perfectly runnable backtest.
+    """
+    try:
+        value = int(days)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(value, MAX_DAYS))
+
+
 @app.post("/api/backtest")
 def run_backtest_endpoint(req: BacktestRequest):
     try:
         exch = req.exchange.strip().lower()
         if exch not in ccxt.exchanges:
             raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
-        days = max(1, min(int(req.days), 730))
+        days = _clamp_days(req.days)
         starting_equity = max(1.0, float(req.starting_equity))
 
         cfg = BotConfig()
@@ -1292,6 +1316,11 @@ def run_backtest_endpoint(req: BacktestRequest):
         cfg.exchange.timeframe = req.timeframe
         cfg.starting_equity = starting_equity
         cfg.strategy.use_fib_filter = req.use_fib_filter
+        cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
+        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.01
+        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "all").strip().lower()
+        cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
+        cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
         cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
 
         df = fetch_historical(exch, req.symbol, req.timeframe, days)
@@ -2325,7 +2354,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="grid grid-cols-2 gap-2">
             <div>
               <label class="block text-slate-400 mb-1">Lookback (Days)</label>
-              <input type="number" id="bt-days" value="30" min="1" max="365" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              <input type="number" id="bt-days" value="365" min="1" max="730" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              <div class="flex gap-1 mt-1" id="bt-days-presets">
+                <button type="button" onclick="setBacktestDays(90)" class="flex-1 text-[10px] text-slate-300 bg-slate-800 hover:bg-slate-700 border border-bordercol rounded px-1.5 py-0.5 transition">90d</button>
+                <button type="button" onclick="setBacktestDays(365)" class="flex-1 text-[10px] text-slate-300 bg-slate-800 hover:bg-slate-700 border border-bordercol rounded px-1.5 py-0.5 transition">365d</button>
+                <button type="button" onclick="setBacktestDays(730)" class="flex-1 text-[10px] text-slate-300 bg-slate-800 hover:bg-slate-700 border border-bordercol rounded px-1.5 py-0.5 transition">730d</button>
+              </div>
             </div>
             <div>
               <label class="block text-slate-400 mb-1">Start Equity ($)</label>
@@ -2337,6 +2371,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <input type="checkbox" id="bt-use-fib" checked class="rounded border-bordercol bg-slate-900 text-emerald-500">
             <label for="bt-use-fib" class="text-slate-300">Enable Fibonacci Zone Filter</label>
           </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-400 mb-1">Fib Depth</label>
+              <select id="bt-fib-depth" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+                <option value="all" selected>All (0.382 / 0.5 / 0.618)</option>
+                <option value="deep">Deep only (0.5 / 0.618)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Fib Band (&times; ATR)</label>
+              <input type="number" id="bt-fib-atr" value="0.5" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Band Floor (%)</label>
+              <input type="number" id="bt-fib-floor" value="1.0" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+            </div>
+            <div></div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div class="flex items-center gap-2 pt-5">
+              <input type="checkbox" id="bt-trail" checked class="rounded border-bordercol bg-slate-900 text-emerald-500">
+              <label for="bt-trail" class="text-slate-300">ATR Trailing Stop</label>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Trail Distance (&times; ATR)</label>
+              <input type="number" id="bt-trail-atr" value="2.0" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+            </div>
+          </div>
+          <div class="text-[10px] text-slate-500">Band 0 = fixed percentage; otherwise the band is the wider of &times;ATR and the floor. 730d on 1h spans ~17,500 candles (bull, bear and chop).</div>
 
           <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
             <i class="fa-solid fa-play"></i> Run Historical Backtest
@@ -2355,7 +2420,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Sharpe (approx): <span id="bt-res-sharpe" class="font-semibold text-white">0</span></div>
             <div>Avg Win: <span id="bt-res-avgwin" class="font-semibold text-emerald-400">$0</span></div>
             <div>Avg Loss: <span id="bt-res-avgloss" class="font-semibold text-red-400">$0</span></div>
-            <div class="col-span-2">Max Drawdown: <span id="bt-res-drawdown" class="font-semibold text-amber-400">0%</span></div>
+            <div>Realized R:R: <span id="bt-res-rr" class="font-semibold text-white">0</span></div>
+            <div>Max Drawdown: <span id="bt-res-drawdown" class="font-semibold text-amber-400">0%</span></div>
+            <div class="col-span-2">Exits: <span id="bt-res-exits" class="font-semibold text-slate-300">--</span></div>
           </div>
           <div class="grid grid-cols-2 gap-2 text-[11px] border-t border-bordercol/60 pt-1.5">
             <div>Candles evaluated: <span id="bt-res-candles" class="font-semibold text-white">0</span></div>
@@ -4237,6 +4304,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function setBacktestDays(days) {
+      const el = document.getElementById('bt-days');
+      if (el) el.value = days;
+    }
+
     async function executeBacktest(e) {
       e.preventDefault();
       const btn = document.getElementById('btn-run-bt');
@@ -4250,6 +4322,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         days: parseInt(document.getElementById('bt-days').value),
         starting_equity: parseFloat(document.getElementById('bt-equity').value),
         use_fib_filter: document.getElementById('bt-use-fib').checked,
+        fib_level_mode: document.getElementById('bt-fib-depth').value,
+        fib_tolerance_atr_mult: parseFloat(document.getElementById('bt-fib-atr').value),
+        fib_tolerance_pct: parseFloat(document.getElementById('bt-fib-floor').value) / 100,
+        trailing_stop_enabled: document.getElementById('bt-trail').checked,
+        trailing_stop_atr_mult: parseFloat(document.getElementById('bt-trail-atr').value),
         risk_per_trade_pct: 0.01
       };
 
@@ -4275,6 +4352,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('bt-res-avgwin').innerText = '$' + r.avg_win;
         document.getElementById('bt-res-avgloss').innerText = '$' + r.avg_loss;
         document.getElementById('bt-res-drawdown').innerText = r.max_drawdown_pct + '%';
+        setIf('bt-res-rr', (r.realized_rr ?? 0) + ' : 1');
+        const exits = r.exit_reasons || {};
+        setIf('bt-res-exits', Object.keys(exits).length
+          ? Object.entries(exits).map(([k, v]) => k + '=' + v).join(', ')
+          : '--');
         const fibNote = document.getElementById('bt-res-fib-note');
         const diag = r.diagnostics || {};
         const setIf = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
@@ -4289,11 +4371,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const reportEl = document.getElementById('bt-res-report');
         if (reportEl) reportEl.value = diag.report || 'No pipeline diagnostics returned for this run.';
         if (fibNote) {
+          const atrMult = r.fib_tolerance_atr_mult ?? 0;
+          const band = r.fib_filter_enabled
+            ? (atrMult > 0 ? `band \u00b1${atrMult}\u00d7ATR (never tighter than the fixed %)`
+                           : 'fixed percentage band')
+            : '';
+          const mode = (r.fib_level_mode || 'all');
+          const levels = mode === 'deep' ? '0.5/0.618 only' : '0.382/0.5/0.618';
+          const trail = r.trailing_stop_enabled
+            ? `Trailing stop: ON, ${r.trailing_stop_atr_mult}\u00d7ATR behind the peak high.`
+            : 'Trailing stop: OFF (fixed stop, reversal-signal exits).';
           if (r.fib_filter_enabled) {
             fibNote.innerText = 'Fibonacci Zone Filter: ON — ' + (r.fib_blocked_signals || 0) +
-              ' core signal(s) skipped because price was not near a fib level.';
+              ' core signal(s) skipped because price was not near a fib level. Levels: ' + levels +
+              ', ' + band + '. ' + trail;
           } else {
-            fibNote.innerText = 'Fibonacci Zone Filter: OFF — entries taken on the core EMA/ADX/RSI signal alone.';
+            fibNote.innerText = 'Fibonacci Zone Filter: OFF — entries taken on the core EMA/ADX/RSI signal alone. ' + trail;
           }
         }
       } catch (err) {

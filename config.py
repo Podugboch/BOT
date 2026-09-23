@@ -56,6 +56,16 @@ class StrategyConfig:
     # ever line up with a fresh crossover; tune within ~1.0%-1.5% (0.01-0.015)
     # to trade pullbacks without forcing a perfect touch.
     fib_tolerance_pct: float = 0.01
+    # Dynamic band: instead of a rigid percentage the tolerance scales with
+    # volatility — a bar whose close is within `fib_tolerance_atr_mult * ATR`
+    # of a level (0.5 * ATR by default) counts as a pullback. The percentage
+    # above stays as the floor (and the fallback when ATR is missing), so a calm
+    # tape cannot starve the strategy down to a handful of trades. 0 = fixed band.
+    fib_tolerance_atr_mult: float = 0.5
+    # Which levels count as confluence: "all" = 0.382/0.5/0.618, "deep" =
+    # 0.5/0.618 only. Deeper pullbacks are what a trend edge is really buying,
+    # so the two are kept switchable and can be measured against each other.
+    fib_level_mode: str = "all"
     fib_touch_window: int = 3       # bars back that may hold the pullback touch
     # Bars back that may hold the EMA crossover: 1 reproduces the old strict
     # "cross on this candle" rule, 3 lets a fresh trend stay entry-eligible
@@ -80,9 +90,12 @@ class RiskConfig:
     min_reward_risk_ratio: float = 2.0   # never accept a setup worse than 1:2
     # Let winners run instead of banking them on the first wobble: once the
     # trade is +1 ATR in profit the stop moves to break-even, then trails
-    # 1.5 ATR behind the best price (never back into a loss).
+    # `trailing_stop_atr_mult` ATR behind the highest high since entry (never
+    # back into a loss). Turn it off to fall back to the fixed ATR stop with
+    # reversal-signal exits.
+    trailing_stop_enabled: bool = True
     trailing_arm_atr_mult: float = 1.0
-    trailing_stop_atr_mult: float = 1.5
+    trailing_stop_atr_mult: float = 2.0
     max_daily_loss_pct: float = 0.03     # circuit breaker: halt for the day
     max_drawdown_pct: float = 0.15       # kill switch: halt the bot entirely
     # A 4-loss streak is ordinary in trend trading and used to starve the

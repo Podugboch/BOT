@@ -123,7 +123,8 @@ class TradingBot:
                 adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
                 if self.position is not None:
                     atr_now = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
-                    self.risk.update_trailing_stop(self.position, price, atr_now, "BUY")
+                    bar_high = float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price
+                    self.risk.update_trailing_stop(self.position, price, atr_now, "BUY", peak_price=bar_high)
                     hit_stop = price <= self.position["stop"]
                     hit_target = price >= self.position["target"]
                     pnl_approx = (price - self.position["entry"]) * self.position["size"]
@@ -293,18 +294,20 @@ class TradingBot:
 
     def _maybe_exit(self, df, price):
         atr_val = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
+        bar_high = float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price
 
         # Ratchet the trailing stop before testing it: a trade that has already
         # run is protected at a profit rather than handed back to the entry stop.
+        # The bar's high feeds the trail, so it follows the highest high since entry.
         previous_stop = self.position["stop"]
-        self.risk.update_trailing_stop(self.position, price, atr_val, "BUY")
+        self.risk.update_trailing_stop(self.position, price, atr_val, "BUY", peak_price=bar_high)
         if self.position["stop"] > previous_stop:
             log.info("TRAILING STOP raised to %.2f (peak %.2f, entry %.2f) — letting the winner run",
                      self.position["stop"], self.position.get("peak", price), self.position["entry"])
 
         hit_stop = price <= self.position["stop"]
         hit_target = price >= self.position["target"]
-        running = self.risk.is_running(self.position, price, atr_val, "BUY")
+        running = self.risk.is_running(self.position, self.position.get("peak", price), atr_val, "BUY")
         sig = generate_signal(df, self.cfg.strategy, position_open=True)
         # Once the trade is in profit far enough for the trail to be armed, a
         # reversal signal no longer closes it early — the trail manages the exit,

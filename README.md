@@ -151,15 +151,30 @@ the window stops pulling the levels around — nothing is pinned to the start of
 the data.
 
 A BUY signal fires when the core EMA/ADX/RSI setup is also at a pullback: price
-must sit inside a **percentage band** of `fib_tolerance_pct` (1.0% by default;
-tune it between roughly 1.0% and 1.5%) around one of those levels, or have
-tagged one within the last `fib_touch_window` bars (3 by default; set it to 1
-for the old same-bar-only behaviour). The crossover itself is likewise allowed
+must sit inside the **band** around one of the selected levels, or have tagged
+one within the last `fib_touch_window` bars (3 by default; set it to 1 for the
+old same-bar-only behaviour). The crossover itself is likewise allowed
 to stay fresh for `ema_cross_window` bars (3 by default) as long as EMA fast is
 still above EMA slow — set it to 1 for the old "cross on this exact candle"
 rule. Requiring both the tag *and* the crossover on one single bar is what used
-to starve the strategy. A zero/negative tolerance falls back to the default
-band instead of degenerating into an impossible exact price match.
+to starve the strategy.
+
+Two knobs shape that band, both live in the backtester panel and in `config.py`:
+
+- **Dynamic band (`fib_tolerance_atr_mult`, 0.5 by default).** Instead of a
+  rigid percentage the tolerance scales with volatility: a bar within
+  `0.5 × ATR` of a level counts as a pullback, so a 1h candle with a 1.5% ATR
+  is not judged by a calm-market yardstick. `fib_tolerance_pct` stays as the
+  **floor**, and as the fallback when ATR is missing or zero, so a quiet tape
+  can never shrink the band toward an impossible exact-price match and starve
+  the sample. Set the multiplier to 0 for the old fixed-band behaviour, or set
+  the floor low (0.1%) for a near-pure ATR band.
+- **Level depth (`fib_level_mode`).** `all` uses 0.382/0.5/0.618; `deep` uses
+  only 0.5/0.618. Deep pullbacks are the ones a trend edge is really buying, so
+  the two are kept switchable — see the sweep below.
+
+A zero/negative tolerance falls back to the default band instead of degenerating
+into an exact price match.
 
 Turn the filter off with the **"Enable Fibonacci Zone Filter"** checkbox in the
 backtester (or `use_fib_filter = False` in `config.py` / the settings panel) to
@@ -199,6 +214,32 @@ All parameters live in `config.py` — strategy periods, risk-per-trade %,
 stop/target ATR multiples, drawdown and daily-loss limits, symbol, timeframe,
 fee/slippage assumptions. Change them there; nothing else needs editing.
 
+### Tuning the 1h edge
+
+The backtester's **Lookback (Days)** control goes to 730 (with 90/365/730
+one-click presets), so a 1h run can span ~8,700–17,500 candles — full bull,
+bear and consolidation regimes rather than a single friendly stretch. On 1h the
+strategy-relevant axes are the Fibonacci band/depth and the trailing stop, so
+`optimize_1h.py` sweeps them over one window and prints a comparison table:
+
+```bash
+python optimize_1h.py --source exchange --symbol BTC/USDT --days 730   # real candles
+python optimize_1h.py --source synthetic --candles 17520               # offline harness check
+```
+
+It reports trades, win rate, realized R:R, return, max drawdown and the fib
+rejection count per configuration, plus the exit mix (`stop`/`target`/`trail`/
+`signal`). The two axes are kept separable — the fib knobs only change the
+entry, the trailing knobs only change the exit — and `--fib-atr-mult 0` restores
+the fixed percentage band as the control. The same knobs are exposed in the
+backtester panel, and every run echoes them back in its JSON (`fib_level_mode`,
+`fib_tolerance_atr_mult`, `trailing_stop_enabled`, `trailing_stop_atr_mult`), so
+a result is self-describing.
+
+The synthetic source exists so the harness can be exercised without exchange
+access; it is a regime-switching stand-in, **not** a market replica. Any number
+that matters has to come from the `--source exchange` run against real candles.
+
 ### Risk model: sizing first, then expectancy
 
 Size comes from the stop, not a fixed bet: each trade risks
@@ -210,9 +251,12 @@ set for a sub-50% win rate, where a winner has to be worth several losers:
   `min_reward_risk_ratio` (2.0) of risk, so a 30-45% win rate can still pay.
 - **Trailing stop** — once a trade is `trailing_arm_atr_mult` (1 ATR) in
   profit the stop ratchets to break-even and then trails
-  `trailing_stop_atr_mult` (1.5 ATR) behind the best price, never back below
-  entry. While the trail is armed a reversal signal no longer closes the trade,
-  so winners run instead of being banked for about what a loser costs.
+  `trailing_stop_atr_mult` (2.0 ATR) behind the **highest high since entry**,
+  never back below entry. While the trail is armed a reversal signal no longer
+  closes the trade, so winners run instead of being banked for about what a
+  loser costs. It is optional — `trailing_stop_enabled = False` (or the
+  backtester checkbox) falls back to the fixed ATR stop with reversal-signal
+  exits.
 - **Circuit breakers that recover** — the daily-loss and drawdown switches stay
   hard halts; the losing-streak breaker (`max_consecutive_losses = 8`, raised
   from 4 because a normal run of losses used to starve the strategy) instead

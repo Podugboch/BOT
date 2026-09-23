@@ -76,7 +76,11 @@ def add_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
 
 FIB_LEVEL_COLUMNS = ("fib_382", "fib_500", "fib_618")
 FIB_LEVEL_LABELS = {"fib_382": "0.382", "fib_500": "0.5", "fib_618": "0.618"}
+# Deeper retracements only — the pullbacks that matter in an established trend.
+FIB_DEEP_LEVEL_COLUMNS = ("fib_500", "fib_618")
+_FIB_DEEP_ALIASES = ("deep", "deep_only", "deep-only", "0.5/0.618", "05_618", "0.5_0.618")
 DEFAULT_FIB_TOLERANCE_PCT = 0.01
+DEFAULT_FIB_TOLERANCE_ATR_MULT = 0.5
 
 
 def _record(diagnostics: Optional[Dict[str, Any]], **stages) -> None:
@@ -166,6 +170,52 @@ def _fib_tolerance_pct(cfg: StrategyConfig) -> float:
     return tolerance if tolerance > 0 else DEFAULT_FIB_TOLERANCE_PCT
 
 
+def _fib_tolerance_atr_mult(cfg: StrategyConfig) -> float:
+    """ATR multiple for the dynamic band; 0 (or nonsense) disables it."""
+    try:
+        mult = float(getattr(cfg, "fib_tolerance_atr_mult", DEFAULT_FIB_TOLERANCE_ATR_MULT))
+    except (TypeError, ValueError):
+        return 0.0
+    return mult if mult > 0 else 0.0
+
+
+def _fib_level_columns(cfg: StrategyConfig) -> tuple:
+    """Which retracement columns count as confluence for this config."""
+    mode = str(getattr(cfg, "fib_level_mode", "all") or "all").strip().lower()
+    return FIB_DEEP_LEVEL_COLUMNS if mode in _FIB_DEEP_ALIASES else FIB_LEVEL_COLUMNS
+
+
+def _fib_band_pct(row: pd.Series, cfg: StrategyConfig) -> float:
+    """Effective half-band around a fib level, as a fraction of price.
+
+    The band scales with volatility — `fib_tolerance_atr_mult * ATR / price` —
+    instead of being a rigid percentage, so a 1h candle with a 1.5% ATR is not
+    judged by a calm-market yardstick. It is *floored* at `fib_tolerance_pct`
+    (and falls back to it whenever ATR is missing, NaN or zero) so a quiet tape
+    can never shrink the band toward an impossible exact-price match.
+    """
+    band = _fib_tolerance_pct(cfg)
+    mult = _fib_tolerance_atr_mult(cfg)
+    if mult <= 0:
+        return band
+    try:
+        price = float(row["close"])
+        atr_value = float(row["atr"])
+    except (KeyError, TypeError, ValueError):
+        return band
+    if not (math.isfinite(price) and math.isfinite(atr_value)) or price <= 0 or atr_value <= 0:
+        return band
+    return max(band, mult * atr_value / price)
+
+
+def _fib_band_text(band: float, cfg: StrategyConfig) -> str:
+    """Human note for the run report: say when the band is ATR-driven."""
+    mult = _fib_tolerance_atr_mult(cfg)
+    if mult > 0 and band > _fib_tolerance_pct(cfg) + 1e-12:
+        return f"band \u00b1{band * 100:.2f}% ({mult:g}\u00d7ATR)"
+    return f"band \u00b1{band * 100:.2f}%"
+
+
 def _fib_levels_available(rows: pd.DataFrame) -> bool:
     """False while the rolling swing window has not warmed up yet (no fib data)."""
     return any(col in rows.columns and pd.notna(rows[col]).any() for col in FIB_LEVEL_COLUMNS)
@@ -175,7 +225,7 @@ def _bar_at_fib_level(row: pd.Series, cfg: StrategyConfig) -> bool:
     """True if this bar's close sits inside the percentage band around any of
     the 38.2/50/61.8% levels — a zone, never an exact-match requirement."""
     nearest = _nearest_fib_level(row, cfg)
-    return nearest is not None and nearest[2] <= _fib_tolerance_pct(cfg)
+    return nearest is not None and nearest[2] <= _fib_band_pct(row, cfg)
 
 
 def _nearest_fib_level(row: pd.Series, cfg: StrategyConfig):
@@ -188,7 +238,7 @@ def _nearest_fib_level(row: pd.Series, cfg: StrategyConfig):
         return None
 
     nearest = None
-    for col in FIB_LEVEL_COLUMNS:
+    for col in _fib_level_columns(cfg):
         level = row.get(col)
         if level is None:
             continue
@@ -225,7 +275,6 @@ def _fib_pullback_detail(df: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any
     """Stage-2 verdict: did price reach a fib zone, and if not, exactly why."""
     window = max(1, int(getattr(cfg, "fib_touch_window", 1) or 1))
     rows = df.tail(window)
-    band_pct = _fib_tolerance_pct(cfg) * 100
 
     if not _fib_levels_available(rows):
         return {"pass": True, "level": None, "distance_pct": None,
@@ -238,22 +287,27 @@ def _fib_pullback_detail(df: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any
             continue
         if nearest is None or candidate[2] < nearest[2]:
             nearest = candidate
-        if candidate[2] * 100 <= band_pct:
-            hits.append(candidate)
+        # The band is per-bar: it widens with that bar's ATR.
+        band = _fib_band_pct(row, cfg)
+        if candidate[2] <= band:
+            hits.append((candidate, band))
 
     if hits:
-        label, value, distance_pct = min(hits, key=lambda hit: hit[2])
+        (label, value, distance_pct), band = min(hits, key=lambda hit: hit[0][2])
         return {"pass": True, "level": label, "distance_pct": distance_pct,
                 "reason": f"price tagged the Fibonacci {label} zone "
-                          f"(${value:,.2f}, {distance_pct * 100:.2f}% away, band \u00b1{band_pct:.2f}%)"}
+                          f"(${value:,.2f}, {distance_pct * 100:.2f}% away, "
+                          f"{_fib_band_text(band, cfg)})"}
     if nearest is None:
         return {"pass": False, "level": None, "distance_pct": None,
                 "reason": "no Fibonacci levels available for this window"}
 
     label, value, distance_pct = nearest
+    band = _fib_band_pct(rows.iloc[-1], cfg)
     return {"pass": False, "level": label, "distance_pct": distance_pct,
             "reason": f"Price outside the Fibonacci {label} zone "
-                      f"(nearest level ${value:,.2f} is {distance_pct * 100:.2f}% away, band \u00b1{band_pct:.2f}%)"}
+                      f"(nearest level ${value:,.2f} is {distance_pct * 100:.2f}% away, "
+                      f"{_fib_band_text(band, cfg)})"}
 
 
 def generate_signal(

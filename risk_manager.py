@@ -116,6 +116,10 @@ class RiskManager:
         return stop, target
 
     # -- trailing stop -----------------------------------------------------
+    def trailing_enabled(self) -> bool:
+        """Is the ATR trailing stop in play at all for this config?"""
+        return bool(getattr(self.cfg, "trailing_stop_enabled", True))
+
     def is_running(self, position: dict, price: float, atr_value: float, side: str = "BUY") -> bool:
         """True once the trade is in profit past the trailing arm threshold.
 
@@ -123,6 +127,8 @@ class RiskManager:
         enough to close the trade, because the trailing stop (which by then sits
         above the entry) is what protects the gain.
         """
+        if not self.trailing_enabled():
+            return False
         arm_mult = float(getattr(self.cfg, "trailing_arm_atr_mult", 1.0) or 0.0)
         if arm_mult <= 0 or atr_value <= 0 or not position:
             return False
@@ -132,27 +138,38 @@ class RiskManager:
         return (entry - price) >= arm_mult * atr_value
 
     def update_trailing_stop(self, position: dict, price: float, atr_value: float,
-                             side: str = "BUY") -> float:
+                             side: str = "BUY", peak_price: Optional[float] = None) -> float:
         """Ratchet the stop behind the best price once the trade is in profit.
 
         The stop only ever moves in the trade's favour (to break-even first, then
         behind the peak), so a winner can run past the fixed target without
         handing the gain back, while noise below the arm threshold cannot stop
         the trade out early.
+
+        `peak_price` is the bar's extreme (high on a long) so the trail follows
+        the *highest high since entry* rather than the close; callers that have
+        no candle handy can omit it and the close is used. Returns the current
+        stop unchanged when the trailing stop is disabled.
         """
         if not position:
             return 0.0
-        trail_mult = float(getattr(self.cfg, "trailing_stop_atr_mult", 1.5) or 0.0)
+        if not self.trailing_enabled():
+            return float(position.get("stop", 0.0))
+        trail_mult = float(getattr(self.cfg, "trailing_stop_atr_mult", 2.0) or 0.0)
         if trail_mult <= 0 or atr_value <= 0:
             return float(position.get("stop", 0.0))
 
         entry = float(position.get("entry", price))
+        try:
+            extreme = float(peak_price) if peak_price is not None else float(price)
+        except (TypeError, ValueError):
+            extreme = float(price)
 
         # Once armed the stop first moves to break-even, then trails the best
         # price. It never dips below break-even: a trail that tightens the stop
         # into a smaller loss just converts winners into losers.
         if str(side).upper() == "BUY":
-            peak = max(float(position.get("peak", entry)), price)
+            peak = max(float(position.get("peak", entry)), float(price), extreme)
             position["peak"] = peak
             if not self.is_running(position, peak, atr_value, side):
                 return float(position["stop"])
@@ -162,7 +179,7 @@ class RiskManager:
                 position["trail_armed"] = True
             return float(position["stop"])
 
-        trough = min(float(position.get("trough", entry)), price)
+        trough = min(float(position.get("trough", entry)), float(price), extreme)
         position["trough"] = trough
         if not self.is_running(position, trough, atr_value, side):
             return float(position["stop"])

@@ -352,11 +352,11 @@ class TestRewardRiskBalance:
         assert risk.update_trailing_stop(position, 104.0, 4.0) == pytest.approx(100.0)
         assert risk.is_running(position, 104.0, 4.0) is True
 
-        # ...then it trails 1.5 ATR behind the best price.
-        assert risk.update_trailing_stop(position, 120.0, 4.0) == pytest.approx(114.0)
+        # ...then it trails 2.0 ATR behind the best price.
+        assert risk.update_trailing_stop(position, 120.0, 4.0) == pytest.approx(112.0)
         assert position["peak"] == 120.0
         # A pullback never loosens the stop again.
-        assert risk.update_trailing_stop(position, 112.0, 4.0) == pytest.approx(114.0)
+        assert risk.update_trailing_stop(position, 108.0, 4.0) == pytest.approx(112.0)
         assert position["trail_armed"] is True
 
     def test_backtest_lets_winners_run_and_reports_realized_rr(self):
@@ -925,6 +925,31 @@ class TestFibZoneFilter:
         assert on["results"]["fib_filter_enabled"] is True
         assert on["results"]["num_trades"] <= off["results"]["num_trades"]
 
+    def test_backtest_endpoint_carries_the_1h_tuning_knobs(self, monkeypatch):
+        """Deep-level mode, the ATR band and the trail toggle must all reach the
+        engine through the real handler — not just exist as request fields."""
+        import web_server
+
+        n = 800
+        close = 50000 + np.sin(np.linspace(0, 30, n)) * 3000 + np.random.normal(0, 50, n)
+        hist = pd.DataFrame({
+            "ts": pd.date_range("2026-01-01", periods=n, freq="1h"),
+            "open": close - 20, "high": close + 100, "low": close - 100,
+            "close": close, "volume": np.random.uniform(10, 100, n),
+        })
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        res = web_server.run_backtest_endpoint(web_server.BacktestRequest(
+            exchange="binance", symbol="BTC/USDT", timeframe="1h", days=730,
+            use_fib_filter=True, fib_level_mode="deep", fib_tolerance_atr_mult=0.5,
+            fib_tolerance_pct=0.001, trailing_stop_enabled=False,
+            trailing_stop_atr_mult=2.0))["results"]
+
+        assert res["fib_level_mode"] == "deep"
+        assert res["fib_tolerance_atr_mult"] == pytest.approx(0.5)
+        assert res["trailing_stop_enabled"] is False
+        assert res["trailing_stop_atr_mult"] == pytest.approx(2.0)
+        assert "trail" not in res["exit_reasons"]      # the toggle really applied
 
     def test_endpoint_accepts_enable_fib_filter_alias(self, monkeypatch):
         """The UI checkbox is labelled 'Enable Fibonacci Zone Filter', so the
@@ -1324,3 +1349,236 @@ class TestPipelineDiagnostics:
         assert diag["trades_executed"] == 0
         assert diag["rejections"]["risk_gate"] == diag["core_signals_detected"]
         assert any("depleted" in line for line in diag["rejection_log"])
+
+
+# ============================================================================
+# 1H TUNING — EXTENDED LOOKBACK, DYNAMIC FIB BAND, ATR TRAILING STOP
+# ============================================================================
+class TestExtendedLookback:
+    """A 1h run has to be able to span ~2 years of bull, bear and chop."""
+
+    def test_request_accepts_a_two_year_lookback(self):
+        from web_server import BacktestRequest, MAX_DAYS
+
+        assert BacktestRequest(days=365).days == 365
+        assert BacktestRequest(days=730).days == 730
+        assert MAX_DAYS == 730
+
+    def test_endpoint_clamps_a_bad_lookback_instead_of_failing(self):
+        from web_server import _clamp_days
+
+        assert _clamp_days(730) == 730
+        assert _clamp_days(365) == 365
+        assert _clamp_days(9_999) == 730          # capped, not rejected
+        assert _clamp_days(0) == 1
+        assert _clamp_days(-5) == 1
+
+    def test_ui_offers_the_two_year_window(self):
+        html = web_server_dashboard_html()
+
+        assert 'id="bt-days"' in html
+        assert 'max="730"' in html
+        # 365/730 must be reachable in one click, not typed by hand.
+        assert "setBacktestDays(730)" in html
+        assert "setBacktestDays(365)" in html
+
+
+class TestDynamicFibBand:
+    """The fib tolerance scales with ATR instead of being a rigid percentage."""
+
+    @staticmethod
+    def _row(close, level, atr=None):
+        row = {"close": close, "fib_382": level, "fib_500": level, "fib_618": level}
+        if atr is not None:
+            row["atr"] = atr
+        return pd.Series(row)
+
+    def test_band_widens_with_atr_beyond_the_percentage_floor(self):
+        cfg = StrategyConfig(fib_tolerance_pct=0.01, fib_tolerance_atr_mult=0.5)
+        # Price 1.4% away from the level: outside the 1% floor...
+        far = self._row(100.0, 101.4, atr=6.0)     # 0.5 * 6 / 100 = 3% band
+        assert _near_fib_support(far, cfg) is True
+        # ...and outside the ATR band too when the ATR is small.
+        calm = self._row(100.0, 101.4, atr=0.5)    # band stays at the 1% floor
+        assert _near_fib_support(calm, cfg) is False
+
+    def test_band_never_goes_tighter_than_the_fixed_floor(self):
+        """A tiny ATR must not shrink the band toward an exact-price match."""
+        cfg = StrategyConfig(fib_tolerance_pct=0.01, fib_tolerance_atr_mult=0.5)
+        tight = self._row(100.0, 100.4, atr=0.01)   # 0.5*0.01/100 = 0.005%
+        assert _near_fib_support(tight, cfg) is True
+
+    def test_zero_multiplier_restores_the_fixed_percentage_band(self):
+        cfg = StrategyConfig(fib_tolerance_pct=0.01, fib_tolerance_atr_mult=0.0)
+        assert _near_fib_support(self._row(100.0, 101.4, atr=6.0), cfg) is False
+
+    def test_missing_atr_falls_back_to_the_percentage_band(self):
+        cfg = StrategyConfig(fib_tolerance_pct=0.01, fib_tolerance_atr_mult=0.5)
+        assert _near_fib_support(self._row(100.0, 100.4), cfg) is True     # no atr key
+        assert _near_fib_support(self._row(100.0, 101.4), cfg) is False
+        # A NaN ATR (warmup) must not raise or silently widen the band.
+        assert _near_fib_support(self._row(100.0, 100.4, atr=np.nan), cfg) is True
+
+    def test_reason_text_says_when_the_band_is_atr_driven(self):
+        from strategy import _fib_pullback_detail
+
+        # 0.618 is the nearest level (3% away) and a 4% ATR band admits it.
+        df = pd.DataFrame([{"close": 100.0, "atr": 8.0, "fib_382": 110.0,
+                            "fib_500": 105.0, "fib_618": 103.0}])
+        detail = _fib_pullback_detail(df, StrategyConfig(fib_tolerance_pct=0.01,
+                                                         fib_tolerance_atr_mult=0.5))
+        assert detail["pass"] is True
+        assert "0.618" in detail["reason"]
+        assert "\u00d7ATR" in detail["reason"]      # the wider ATR band is named
+
+
+class TestFibLevelSelection:
+    """Deep-level mode focuses entries on the 0.5/0.618 pullbacks."""
+
+    def test_deep_mode_ignores_the_shallow_0_382_level(self):
+        cfg_deep = StrategyConfig(fib_level_mode="deep", fib_tolerance_atr_mult=0.0)
+        cfg_all = StrategyConfig(fib_level_mode="all", fib_tolerance_atr_mult=0.0)
+        row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 120.0, "fib_618": 130.0})
+
+        assert _near_fib_support(row, cfg_all) is True    # 0.382 is close enough
+        assert _near_fib_support(row, cfg_deep) is False  # ...but not in deep mode
+        # The deep levels still count.
+        deep_row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 100.3, "fib_618": 130.0})
+        assert _near_fib_support(deep_row, cfg_deep) is True
+
+    def test_default_mode_is_unchanged(self):
+        assert StrategyConfig().fib_level_mode == "all"
+
+    def test_unknown_mode_does_not_silently_disable_the_filter(self):
+        cfg = StrategyConfig(fib_level_mode="nonsense", fib_tolerance_atr_mult=0.0)
+        row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 120.0, "fib_618": 130.0})
+        assert _near_fib_support(row, cfg) is True
+
+
+class TestATRTrailingStopOption:
+    """The trailing stop is optional and follows the highest high since entry."""
+
+    @staticmethod
+    def _risk(**overrides):
+        return RiskManager(RiskConfig(**overrides), starting_equity=1000.0)
+
+    def test_default_trail_distance_is_two_atr(self):
+        assert RiskConfig().trailing_stop_atr_mult == 2.0
+        assert RiskConfig().trailing_stop_enabled is True
+
+    def test_trail_follows_the_bar_high_not_just_the_close(self):
+        risk = self._risk()
+        position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+        # The bar wicked to 125 but closed at 118: the trail must use the high.
+        stop = risk.update_trailing_stop(position, 118.0, 4.0, "BUY", peak_price=125.0)
+        assert position["peak"] == 125.0
+        assert stop == pytest.approx(125.0 - 2.0 * 4.0)
+
+    def test_disabling_the_trail_leaves_the_fixed_stop_alone(self):
+        risk = self._risk(trailing_stop_enabled=False)
+        position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+
+        assert risk.update_trailing_stop(position, 130.0, 4.0, "BUY", peak_price=132.0) == 94.0
+        assert risk.is_running(position, 130.0, 4.0) is False
+        assert "peak" not in position
+
+    def test_disabled_trail_lets_a_reversal_signal_close_the_trade(self):
+        """With no trail, the reversal exit is the only thing protecting a winner."""
+        cfg = TestPipelineDiagnostics._diag_cfg()
+        cfg.risk.trailing_stop_enabled = False
+        res = run_backtest(TestPipelineDiagnostics._series(), cfg)
+
+        assert res["trailing_stop_enabled"] is False
+        assert "trail" not in res["exit_reasons"]
+        assert res["exit_reasons"].get("signal", 0) > 0
+
+
+class TestOneHourBacktestReporting:
+    """A 1h run reports the knobs it was measured with, for sweep comparisons."""
+
+    @staticmethod
+    def _series(candles=4_000, seed=11):
+        rng = np.random.default_rng(seed)
+        t = np.arange(candles)
+        close = 30000 * np.exp(np.cumsum(0.0002 + 0.0004 * np.sin(t / 400.0)
+                                          + rng.normal(0, 0.010, candles)))
+        return pd.DataFrame({
+            "ts": pd.date_range("2024-01-01", periods=candles, freq="1h"),
+            "open": np.concatenate([[close[0]], close[:-1]]),
+            "high": close * (1 + np.abs(rng.normal(0, 0.006, candles))),
+            "low": close * (1 - np.abs(rng.normal(0, 0.006, candles))),
+            "close": close, "volume": rng.uniform(50, 500, candles),
+        })
+
+    @staticmethod
+    def _cfg(**strategy_overrides):
+        cfg = BotConfig()
+        cfg.exchange.timeframe = "1h"
+        cfg.strategy.adx_trend_threshold = 12
+        cfg.strategy.fib_touch_window = 2
+        for key, value in strategy_overrides.items():
+            setattr(cfg.strategy, key, value)
+        return cfg
+
+    def test_run_echoes_the_fib_and_trail_settings(self):
+        res = run_backtest(self._series(), self._cfg(fib_level_mode="deep"))
+
+        assert res["fib_level_mode"] == "deep"
+        assert res["fib_tolerance_atr_mult"] == pytest.approx(0.5)
+        assert res["trailing_stop_enabled"] is True
+        assert res["trailing_stop_atr_mult"] == pytest.approx(2.0)
+
+    def test_deep_levels_keep_a_real_sample_and_the_trail_exits_are_used(self):
+        res = run_backtest(self._series(), self._cfg(fib_level_mode="deep"))
+
+        assert res["num_trades"] >= 5            # the sample is not eliminated
+        assert res["exit_reasons"].get("trail", 0) > 0
+        assert res["realized_rr"] > 1.0
+
+    def test_atr_scaled_band_and_fixed_band_are_both_measurable(self):
+        """The sweep compares them, so each must be independently runnable."""
+        dynamic = run_backtest(self._series(), self._cfg(fib_tolerance_atr_mult=0.5))
+        fixed = run_backtest(self._series(), self._cfg(fib_tolerance_atr_mult=0.0))
+
+        assert dynamic["fib_tolerance_atr_mult"] == pytest.approx(0.5)
+        assert fixed["fib_tolerance_atr_mult"] == 0.0
+        # The ATR band can only ever admit at least as many entries as the floor.
+        assert dynamic["fib_blocked_signals"] <= fixed["fib_blocked_signals"]
+
+
+class TestBacktestControlWiring:
+    """The new 1h controls must exist AND be sent, or the UI silently lies."""
+
+    def test_new_controls_exist_in_the_form(self):
+        html = web_server_dashboard_html()
+
+        for control in ('id="bt-fib-depth"', 'id="bt-fib-atr"', 'id="bt-fib-floor"',
+                        'id="bt-trail"', 'id="bt-trail-atr"', 'id="bt-res-rr"'):
+            assert control in html, control
+        assert '<option value="deep"' in html
+        assert "0.5 / 0.618" in html
+
+    def test_controls_are_sent_in_the_backtest_payload(self):
+        html = web_server_dashboard_html()
+
+        for field in ("fib_level_mode:", "fib_tolerance_atr_mult:", "fib_tolerance_pct:",
+                      "trailing_stop_enabled:", "trailing_stop_atr_mult:"):
+            assert field in html, field
+        # The floor is typed in percent, the API wants a fraction.
+        assert "/ 100" in html
+
+    def test_request_defaults_match_the_documented_1h_tuning(self):
+        from web_server import BacktestRequest
+
+        req = BacktestRequest()
+        assert req.fib_tolerance_atr_mult == 0.5
+        assert req.fib_level_mode == "all"
+        assert req.trailing_stop_enabled is True
+        assert req.trailing_stop_atr_mult == 2.0
+
+    def test_results_panel_reports_realized_rr_and_exits(self):
+        html = web_server_dashboard_html()
+
+        assert "Realized R:R" in html
+        assert "bt-res-exits" in html
+        assert "bt-res-rr" in html
