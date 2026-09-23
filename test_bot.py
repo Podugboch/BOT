@@ -133,11 +133,13 @@ class TestStrategy:
         assert sig == Signal.SELL
 
     def test_fib_support_filter(self):
+        # Golden-zone mode (the default): a pullback *into* 0.382-0.618 counts.
         cfg = StrategyConfig(fib_tolerance_pct=0.01)
         curr_matching = pd.Series({"close": 100.0, "fib_382": 100.5, "fib_500": 95.0, "fib_618": 90.0})
         assert _near_fib_support(curr_matching, cfg) is True
 
-        curr_far = pd.Series({"close": 100.0, "fib_382": 110.0, "fib_500": 90.0, "fib_618": 80.0})
+        # Above the 0.382 level = still at the breakout, no pullback yet.
+        curr_far = pd.Series({"close": 120.0, "fib_382": 110.0, "fib_500": 90.0, "fib_618": 80.0})
         assert _near_fib_support(curr_far, cfg) is False
 
 
@@ -347,19 +349,19 @@ class TestRewardRiskBalance:
         risk = self._risk()
         position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
 
-        # Not in profit enough to arm: the original stop stands.
-        assert risk.update_trailing_stop(position, 102.0, 4.0) == 94.0
-        assert risk.is_running(position, 102.0, 4.0) is False
+        # +1 ATR of profit is NOT enough any more: the original stop stands.
+        assert risk.update_trailing_stop(position, 104.0, 4.0) == 94.0
+        assert risk.is_running(position, 104.0, 4.0) is False
 
-        # +1 ATR arms the trail and pulls the stop up to break-even...
-        assert risk.update_trailing_stop(position, 104.0, 4.0) == pytest.approx(100.0)
-        assert risk.is_running(position, 104.0, 4.0) is True
+        # +1.5 ATR arms the trail and pulls the stop up to break-even...
+        assert risk.update_trailing_stop(position, 106.0, 4.0) == pytest.approx(100.0)
+        assert risk.is_running(position, 106.0, 4.0) is True
 
-        # ...then it trails 2.0 ATR behind the best price.
-        assert risk.update_trailing_stop(position, 120.0, 4.0) == pytest.approx(112.0)
+        # ...then it trails 3.5 ATR behind the best price.
+        assert risk.update_trailing_stop(position, 120.0, 4.0) == pytest.approx(106.0)
         assert position["peak"] == 120.0
         # A pullback never loosens the stop again.
-        assert risk.update_trailing_stop(position, 108.0, 4.0) == pytest.approx(112.0)
+        assert risk.update_trailing_stop(position, 108.0, 4.0) == pytest.approx(106.0)
         assert position["trail_armed"] is True
 
     def test_backtest_lets_winners_run_and_reports_realized_rr(self):
@@ -739,7 +741,8 @@ class TestFibZoneFilter:
         assert fib["swing_high"].dropna().equals(expected.dropna())
 
     def test_fib_levels_accept_a_percentage_band_not_exact_match(self):
-        cfg = StrategyConfig()               # fib_tolerance_pct = 0.01 (1%)
+        # Band semantics are tested in level mode; zone mode measures a range.
+        cfg = StrategyConfig(fib_level_mode="all")   # fib_tolerance_pct = 0.01 (1%)
         # Price 0.4% away from the 38.2% level is inside the band.
         assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 100.4,
                                             "fib_500": 95.0, "fib_618": 90.0}), cfg) is True
@@ -756,11 +759,12 @@ class TestFibZoneFilter:
         cfg = StrategyConfig()
         assert cfg.fib_tolerance_pct == pytest.approx(0.01)
 
+        level = {"fib_level_mode": "all"}
         inside = pd.Series({"close": 100.0, "fib_382": 100.9, "fib_500": 95.0, "fib_618": 90.0})
         outside = pd.Series({"close": 100.0, "fib_382": 101.4, "fib_500": 95.0, "fib_618": 90.0})
-        assert _near_fib_support(inside, cfg) is True
-        assert _near_fib_support(outside, cfg) is False
-        assert _near_fib_support(outside, StrategyConfig(fib_tolerance_pct=0.015)) is True
+        assert _near_fib_support(inside, StrategyConfig(**level)) is True
+        assert _near_fib_support(outside, StrategyConfig(**level)) is False
+        assert _near_fib_support(outside, StrategyConfig(fib_tolerance_pct=0.015, **level)) is True
         # A nonsense tolerance never degrades back into an exact-price match.
         assert _near_fib_support(inside, StrategyConfig(fib_tolerance_pct=-1.0)) is True
 
@@ -952,6 +956,9 @@ class TestFibZoneFilter:
         assert res["fib_tolerance_atr_mult"] == pytest.approx(0.5)
         assert res["trailing_stop_enabled"] is False
         assert res["trailing_stop_atr_mult"] == pytest.approx(2.0)
+        # The arm threshold rides along in the result too, so a run says when the
+        # trail was allowed to start tightening (the shipped default is +1.5 ATR).
+        assert res["trailing_arm_atr_mult"] == pytest.approx(1.5)
         assert "trail" not in res["exit_reasons"]      # the toggle really applied
 
     def test_endpoint_accepts_enable_fib_filter_alias(self, monkeypatch):
@@ -1270,14 +1277,27 @@ class TestPipelineDiagnostics:
         assert stages["fib_evaluated"] is True
         assert stages["fib_pass"] is False
         assert stages["rejected_by"] == "fib_zone"
-        assert "outside the Fibonacci 0.618 zone" in stages["fib_reason"]
+        # Price is below the whole zone, and the reason says which side missed.
+        assert "pullback zone" in stages["fib_reason"]
+        assert "0.382" in stages["fib_reason"]
+        assert "too deep" in stages["fib_reason"]
+
+    def test_stage2_rejects_an_entry_above_the_zone(self):
+        """The crossover candle itself is above 0.382 — buying there is the bug."""
+        df = self._cross({"close": 108.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
+        stages = {}
+        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert stages["core_trigger"] is True
+        assert stages["fib_pass"] is False
+        assert "no pullback yet" in stages["fib_reason"]
 
     def test_stage2_records_the_zone_when_it_passes(self):
         df = self._cross({"close": 102.0, "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0})
         stages = {}
         assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.BUY
         assert stages["fib_pass"] is True
-        assert "Fibonacci 0.382 zone" in stages["fib_reason"]
+        assert "pulled back into the Fibonacci" in stages["fib_reason"]
+        assert "0.618-0.382" in stages["fib_reason"]
 
     def test_backtest_counts_every_stage(self):
         res = run_backtest(self._series(), self._diag_cfg())
@@ -1433,7 +1453,8 @@ class TestDynamicFibBand:
         # 0.618 is the nearest level (3% away) and a 4% ATR band admits it.
         df = pd.DataFrame([{"close": 100.0, "atr": 8.0, "fib_382": 110.0,
                             "fib_500": 105.0, "fib_618": 103.0}])
-        detail = _fib_pullback_detail(df, StrategyConfig(fib_tolerance_pct=0.01,
+        detail = _fib_pullback_detail(df, StrategyConfig(fib_level_mode="all",
+                                                         fib_tolerance_pct=0.01,
                                                          fib_tolerance_atr_mult=0.5))
         assert detail["pass"] is True
         assert "0.618" in detail["reason"]
@@ -1454,13 +1475,114 @@ class TestFibLevelSelection:
         deep_row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 100.3, "fib_618": 130.0})
         assert _near_fib_support(deep_row, cfg_deep) is True
 
-    def test_default_mode_is_unchanged(self):
-        assert StrategyConfig().fib_level_mode == "all"
+    def test_default_mode_restricts_entries_to_the_pullback_zone(self):
+        """The whole point: no buying at the top of the crossover candle."""
+        assert StrategyConfig().fib_level_mode == "zone"
+        # Above the zone -> no entry; inside it -> entry.
+        above = pd.Series({"close": 108.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
+        inside = pd.Series({"close": 96.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
+        assert _near_fib_support(above, StrategyConfig()) is False
+        assert _near_fib_support(inside, StrategyConfig()) is True
+
+    def test_zone_mode_is_alias_tolerant(self):
+        for alias in ("zone", "golden", "golden_zone", "0.382-0.618", "pocket"):
+            cfg = StrategyConfig(fib_level_mode=alias)
+            above = pd.Series({"close": 108.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
+            assert _near_fib_support(above, cfg) is False, alias
 
     def test_unknown_mode_does_not_silently_disable_the_filter(self):
         cfg = StrategyConfig(fib_level_mode="nonsense", fib_tolerance_atr_mult=0.0)
         row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 120.0, "fib_618": 130.0})
         assert _near_fib_support(row, cfg) is True
+
+
+class TestPrematureStopOut:
+    """A trail that arms at +1 ATR and hugs 2 ATR back stops good trades out.
+
+    The fix is two-sided: arm later (+1.5 ATR, so an ordinary pullback on the
+    way up is just noise) and trail wider (3.5 ATR, so the primary target stays
+    reachable instead of being clipped into a micro-gain).
+    """
+
+    @staticmethod
+    def _risk(**overrides):
+        return RiskManager(RiskConfig(**overrides), starting_equity=1000.0)
+
+    def test_stop_does_not_move_at_all_before_the_arm_threshold(self):
+        risk = self._risk()
+        position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+
+        # +1.4 ATR of profit is still not enough to arm (1.5 ATR required).
+        for price in (100.0, 102.0, 104.0, 105.6):
+            assert risk.update_trailing_stop(position, price, 4.0) == 94.0, price
+            assert risk.is_running(position, price, 4.0) is False, price
+        assert "trail_armed" not in position
+
+    def test_a_wide_trail_keeps_the_target_reachable(self):
+        """At +3 ATR with a 3.5 ATR trail the stop is still only break-even."""
+        risk = self._risk()
+        position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+        stop = risk.update_trailing_stop(position, 112.0, 4.0)     # +3 ATR
+
+        assert stop == pytest.approx(100.0)                        # not tightened
+        # Only past +3.5 ATR does the trail lock in profit...
+        assert risk.update_trailing_stop(position, 115.0, 4.0) == pytest.approx(101.0)
+        # ...and it is still below the 4 ATR primary target (116.0).
+        assert position["stop"] < 100.0 + 4.0 * 4.0
+
+    def test_an_old_style_trail_would_have_clipped_the_same_trade(self):
+        """Same path, previous 1.0 ATR arm / 2.0 ATR trail: stopped out early."""
+        old = self._risk(trailing_arm_atr_mult=1.0, trailing_stop_atr_mult=2.0)
+        new = self._risk()
+        path = [104.0, 108.0, 110.0]
+        pullback = 101.0                       # an ordinary wobble on the way up
+
+        old_position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+        new_position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
+        for price in path:
+            old.stop = old.update_trailing_stop(old_position, price, 4.0)
+            new.stop = new.update_trailing_stop(new_position, price, 4.0)
+
+        # Old: peak 110 - 2*4 -> stop at 102, hit by a pullback to 101.
+        assert old_position["stop"] == pytest.approx(102.0)
+        assert pullback <= old_position["stop"]
+        # New: still at break-even, so the same pullback leaves the trade alone.
+        assert new_position["stop"] == pytest.approx(100.0)
+        assert pullback > new_position["stop"]
+
+    def test_take_profit_cannot_be_configured_below_two_and_a_half_atr(self):
+        from risk_manager import MIN_TAKE_PROFIT_ATR_MULT, reward_risk_atr_mult
+
+        assert MIN_TAKE_PROFIT_ATR_MULT == 2.5
+        # Even a deliberately thin target is lifted to the floor.
+        thin = RiskConfig(take_profit_atr_mult=1.0, min_reward_risk_ratio=0.0)
+        assert reward_risk_atr_mult(thin) == pytest.approx(2.5)
+
+        risk = RiskManager(thin, starting_equity=1000.0)
+        stop, target = risk.stop_and_target(entry_price=100.0, atr_value=4.0, side="BUY")
+        assert target - 100.0 >= 2.5 * 4.0
+
+    def test_shipped_defaults_target_at_least_two_and_a_half_atr(self):
+        from risk_manager import reward_risk_atr_mult
+
+        cfg = RiskConfig()
+        atr = 4.0
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        _stop, target = risk.stop_and_target(entry_price=100.0, atr_value=atr, side="BUY")
+
+        assert reward_risk_atr_mult(cfg) >= 2.5
+        assert target - 100.0 >= 2.5 * atr
+
+    def test_default_backtest_reaches_targets_and_arms_late(self):
+        """End to end: winners get to targets, and losses are not the trail."""
+        cfg = TestPipelineDiagnostics._diag_cfg()
+        res = run_backtest(TestPipelineDiagnostics._series(), cfg)
+
+        exits = res["exit_reasons"]
+        assert exits.get("target", 0) > 0            # targets are reached
+        # A late, wide trail must not be the dominant exit reason any more.
+        assert exits.get("trail", 0) <= exits.get("target", 0) + exits.get("stop", 0)
+        assert res["realized_rr"] > 1.5
 
 
 class TestATRTrailingStopOption:
@@ -1470,17 +1592,21 @@ class TestATRTrailingStopOption:
     def _risk(**overrides):
         return RiskManager(RiskConfig(**overrides), starting_equity=1000.0)
 
-    def test_default_trail_distance_is_two_atr(self):
-        assert RiskConfig().trailing_stop_atr_mult == 2.0
+    def test_default_trail_arms_late_and_trails_wide(self):
+        """A 1 ATR arm / 2 ATR trail stopped ordinary noise out of good trades."""
+        cfg = RiskConfig()
+        assert cfg.trailing_arm_atr_mult == 1.5
+        assert cfg.trailing_stop_atr_mult == 3.5
         assert RiskConfig().trailing_stop_enabled is True
 
     def test_trail_follows_the_bar_high_not_just_the_close(self):
         risk = self._risk()
         position = {"entry": 100.0, "stop": 94.0, "initial_stop": 94.0}
-        # The bar wicked to 125 but closed at 118: the trail must use the high.
+        # The bar wicked to 125 but closed at 118: the trail must use the high,
+        # and 3.5 ATR behind that is 111 after the +1.5 ATR arm.
         stop = risk.update_trailing_stop(position, 118.0, 4.0, "BUY", peak_price=125.0)
         assert position["peak"] == 125.0
-        assert stop == pytest.approx(125.0 - 2.0 * 4.0)
+        assert stop == pytest.approx(125.0 - 3.5 * 4.0)
 
     def test_disabling_the_trail_leaves_the_fixed_stop_alone(self):
         risk = self._risk(trailing_stop_enabled=False)
@@ -1534,7 +1660,7 @@ class TestOneHourBacktestReporting:
         assert res["fib_level_mode"] == "deep"
         assert res["fib_tolerance_atr_mult"] == pytest.approx(0.5)
         assert res["trailing_stop_enabled"] is True
-        assert res["trailing_stop_atr_mult"] == pytest.approx(2.0)
+        assert res["trailing_stop_atr_mult"] == pytest.approx(3.5)
 
     def test_deep_levels_keep_a_real_sample_and_the_trail_exits_are_used(self):
         res = run_backtest(self._series(), self._cfg(fib_level_mode="deep"))
@@ -1580,9 +1706,9 @@ class TestBacktestControlWiring:
 
         req = BacktestRequest()
         assert req.fib_tolerance_atr_mult == 0.5
-        assert req.fib_level_mode == "all"
+        assert req.fib_level_mode == "zone"
         assert req.trailing_stop_enabled is True
-        assert req.trailing_stop_atr_mult == 2.0
+        assert req.trailing_stop_atr_mult == 3.5
 
     def test_results_panel_reports_realized_rr_and_exits(self):
         html = web_server_dashboard_html()
@@ -1590,6 +1716,16 @@ class TestBacktestControlWiring:
         assert "Realized R:R" in html
         assert "bt-res-exits" in html
         assert "bt-res-rr" in html
+
+    def test_served_pages_are_never_cached(self):
+        """A cached dashboard keeps serving the previous JS — including a fixed
+        bug. The HTML must arrive uncacheable so a deploy actually takes effect."""
+        import web_server
+
+        for response in (web_server.get_dashboard(), web_server.activate_page(token="x")):
+            cache_control = response.headers.get("Cache-Control", "")
+            assert "no-store" in cache_control, cache_control
+            assert response.headers.get("Pragma") == "no-cache"
 
 
 # ============================================================================

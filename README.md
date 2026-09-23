@@ -169,9 +169,18 @@ Two knobs shape that band, both live in the backtester panel and in `config.py`:
   can never shrink the band toward an impossible exact-price match and starve
   the sample. Set the multiplier to 0 for the old fixed-band behaviour, or set
   the floor low (0.1%) for a near-pure ATR band.
-- **Level depth (`fib_level_mode`).** `all` uses 0.382/0.5/0.618; `deep` uses
-  only 0.5/0.618. Deep pullbacks are the ones a trend edge is really buying, so
-  the two are kept switchable — see the sweep below.
+- **Where the entry has to be (`fib_level_mode`).**
+  - `zone` (the default) — price must retrace **into the 0.382-0.618 golden
+    pocket**. Buying on the crossover candle itself means buying *above* the
+    0.382 level, i.e. the breakout rather than the pullback; zone mode waits for
+    the retracement. The ATR band still softens the two edges so a wick that
+    just pokes out is not disqualified, and the rejection reason says which side
+    was missed (`no pullback yet` vs `too deep`).
+  - `deep` — within the band of the 0.5 or 0.618 level.
+  - `all` — within the band of any of 0.382/0.5/0.618.
+
+  Switchable in the backtester's **Fib Depth** select and via
+  `fib_level_mode` — see the sweep below.
 
 A zero/negative tolerance falls back to the default band instead of degenerating
 into an exact price match.
@@ -266,11 +275,14 @@ python optimize_1h.py --source synthetic --candles 17520               # offline
 It reports trades, win rate, realized R:R, return, max drawdown and the fib
 rejection count per configuration, plus the exit mix (`stop`/`target`/`trail`/
 `signal`). The two axes are kept separable — the fib knobs only change the
-entry, the trailing knobs only change the exit — and `--fib-atr-mult 0` restores
-the fixed percentage band as the control. The same knobs are exposed in the
-backtester panel, and every run echoes them back in its JSON (`fib_level_mode`,
-`fib_tolerance_atr_mult`, `trailing_stop_enabled`, `trailing_stop_atr_mult`), so
-a result is self-describing.
+entry, the trailing knobs only change the exit — and `backtester.py
+--fib-atr-mult 0` restores the fixed percentage band as the control. The same
+single run can be driven from that CLI instead: `--fib-mode zone|all|deep`
+selects the entry rule, `--no-fib` drops the filter, and `--trail-atr` /
+`--trail-arm-atr` set the exit (or `--no-trail` disables it). The knobs are also
+exposed in the backtester panel, and every run echoes them back in its JSON
+(`fib_level_mode`, `fib_tolerance_atr_mult`, `trailing_stop_enabled`,
+`trailing_stop_atr_mult`), so a result is self-describing.
 
 The synthetic source exists so the harness can be exercised without exchange
 access; it is a regime-switching stand-in, **not** a market replica. Any number
@@ -283,16 +295,20 @@ Size comes from the stop, not a fixed bet: each trade risks
 set for a sub-50% win rate, where a winner has to be worth several losers:
 
 - **Tight stop, far target** — `stop_loss_atr_mult = 1.5` with
-  `take_profit_atr_mult = 4.0` (~2.7R), and no setup is taken below
-  `min_reward_risk_ratio` (2.0) of risk, so a 30-45% win rate can still pay.
-- **Trailing stop** — once a trade is `trailing_arm_atr_mult` (1 ATR) in
-  profit the stop ratchets to break-even and then trails
-  `trailing_stop_atr_mult` (2.0 ATR) behind the **highest high since entry**,
-  never back below entry. While the trail is armed a reversal signal no longer
-  closes the trade, so winners run instead of being banked for about what a
-  loser costs. It is optional — `trailing_stop_enabled = False` (or the
-  backtester checkbox) falls back to the fixed ATR stop with reversal-signal
-  exits.
+  `take_profit_atr_mult = 4.0` (~2.7R). The target is floored at
+  `MIN_TAKE_PROFIT_ATR_MULT` (2.5 ATR) and at `min_reward_risk_ratio` (2.0) of
+  risk, so no combination of settings can shrink the primary target into a
+  micro-gain.
+- **Trailing stop: arm late, trail wide** — the trail does nothing until the
+  trade is `trailing_arm_atr_mult` (1.5 ATR) in profit; before that the original
+  ATR stop stands, so an ordinary pullback on the way up is just noise. Once
+  armed it moves to break-even and then trails `trailing_stop_atr_mult` (3.5
+  ATR) behind the **highest high since entry**, never back below entry. With a
+  3.5 ATR trail and a 4 ATR target the stop is still at break-even at +3 ATR, so
+  the target stays reachable instead of being clipped into a micro-gain. While
+  the trail is armed a reversal signal no longer closes the trade. It is
+  optional — `trailing_stop_enabled = False` (or the backtester checkbox) falls
+  back to the fixed ATR stop with reversal-signal exits.
 - **Circuit breakers that recover** — the daily-loss and drawdown switches stay
   hard halts; the losing-streak breaker (`max_consecutive_losses = 8`, raised
   from 4 because a normal run of losses used to starve the strategy) instead

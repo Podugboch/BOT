@@ -61,7 +61,7 @@ def synthetic_1h_series(candles: int = 17_520, seed: int = 7, start: float = 30_
 
 
 def _config(label: str, use_fib: bool, atr_mult: float, level_mode: str, trail: bool,
-            trail_atr: float = 2.0, floor_pct: float = 0.01) -> tuple:
+            trail_atr: float = 3.5, floor_pct: float = 0.01, arm_atr: float = 1.5) -> tuple:
     cfg = BotConfig()
     cfg.exchange.timeframe = "1h"
     cfg.strategy.use_fib_filter = use_fib
@@ -70,20 +70,23 @@ def _config(label: str, use_fib: bool, atr_mult: float, level_mode: str, trail: 
     cfg.strategy.fib_level_mode = level_mode
     cfg.risk.trailing_stop_enabled = trail
     cfg.risk.trailing_stop_atr_mult = trail_atr
+    cfg.risk.trailing_arm_atr_mult = arm_atr
     return label, cfg
 
 
 def sweep_configs() -> list:
-    """The A/B matrix: the filter only ever changes the *entry*; the trail only
-    ever changes the *exit*, so the two effects stay separable."""
+    """The A/B matrix: the fib knobs only ever change the *entry* and the trail
+    knobs only ever change the *exit*, so the two effects stay separable. The
+    first row is the shipped default (golden zone, arm +1.5 ATR, trail 3.5 ATR)."""
     return [
-        _config("fib OFF (core signal)",        False, 0.0, "all",  True),
-        _config("fib fixed 1% band, all",       True,  0.0, "all",  True),
-        _config("fib 0.5xATR, all levels",      True,  0.5, "all",  True),
-        _config("fib 0.5xATR, deep 0.5/0.618",  True,  0.5, "deep", True),
-        _config("fib 1.0xATR, deep 0.5/0.618",  True,  1.0, "deep", True),
-        _config("fib 0.5xATR deep (strict)",    True,  0.5, "deep", True, floor_pct=0.001),
-        _config("fib 0.5xATR, deep, no trail",  True,  0.5, "deep", False),
+        _config("DEFAULT zone/0.5xATR/3.5",         True,  0.5, "zone", True),
+        _config("zone, old trail (2.0, arm 1.0)",   True,  0.5, "zone", True, trail_atr=2.0, arm_atr=1.0),
+        _config("zone, no trail",                   True,  0.5, "zone", False),
+        _config("fib OFF (core signal)",            False, 0.0, "all",  True),
+        _config("fib fixed 1% band, all",           True,  0.0, "all",  True),
+        _config("fib 0.5xATR, all levels",          True,  0.5, "all",  True),
+        _config("fib 0.5xATR, deep 0.5/0.618",      True,  0.5, "deep", True),
+        _config("zone 3.0 ATR trail",               True,  0.5, "zone", True, trail_atr=3.0),
     ]
 
 

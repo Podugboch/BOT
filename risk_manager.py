@@ -35,6 +35,9 @@ def _as_utc(now=None) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+MIN_TAKE_PROFIT_ATR_MULT = 2.5   # a winner must be able to reach this far
+
+
 def _fmt_until(when: datetime) -> str:
     return _as_utc(when).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -46,13 +49,20 @@ def _fmt_span(start: datetime, end: datetime) -> str:
 
 
 def reward_risk_atr_mult(cfg) -> float:
-    """Target size in ATR multiples, never below `min_reward_risk_ratio` of risk."""
+    """Target size in ATR multiples for this config.
+
+    Floored three ways: the configured `take_profit_atr_mult`,
+    `MIN_TAKE_PROFIT_ATR_MULT` (a winner has to be able to run at least 2.5 ATR
+    or a trailing stop has nothing to protect), and `min_reward_risk_ratio` x the
+    stop distance. Whichever is widest wins, so no combination of settings can
+    quietly shrink the primary target into a micro-gain.
+    """
     target_mult = float(getattr(cfg, "take_profit_atr_mult", 4.0) or 0.0)
     stop_mult = max(0.0, float(getattr(cfg, "stop_loss_atr_mult", 1.5) or 0.0))
     min_rr = float(getattr(cfg, "min_reward_risk_ratio", 2.0) or 0.0)
     # Never accept a payoff below `min_rr` x risk: with a sub-50% win rate a
     # 1:1 setup loses money even when the signal itself is decent.
-    return max(target_mult, min_rr * stop_mult)
+    return max(target_mult, MIN_TAKE_PROFIT_ATR_MULT, min_rr * stop_mult)
 
 
 def reward_risk_ratio(cfg) -> float:
