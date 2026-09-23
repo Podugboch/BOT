@@ -113,6 +113,24 @@ Raw signals always reconcile: `executed + rejected == stage 1 triggers`, so a
 run can never silently drop a signal. Rejection detail is capped
 (`REJECTION_LOG_LIMIT`) so a 72,000-candle run cannot flood the log.
 
+### When the exchange refuses the request
+
+Failures are reported inside the dashboard, not by a browser `alert()`. A
+blocked region, for instance, says exactly this — a title and two short
+sentences, nothing more:
+
+```
+Binance is not available in this region
+This server sits in a restricted region, so Binance refuses the request.
+Try Kraken, Bybit, KuCoin or OKX instead.
+```
+
+The raw exchange text (HTTP status, ccxt message, JSON body) stays behind a
+**Technical detail** toggle on the same card, so the reason is always one tap
+away instead of shoved in your face. Rate limits, unsupported pairs,
+unreachable venues and a too-deep lookback each get their own one-sentence
+explanation.
+
 ## 2. Paper trade
 
 `config.py` defaults to `mode = "paper"`. Just run:
