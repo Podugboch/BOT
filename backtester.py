@@ -303,11 +303,12 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
 
             # Trail first, then test the exit against the ratcheted stop, so a
             # winner that has already run is protected at a profit instead of
-            # being given back to the original ATR stop.
-            risk.update_trailing_stop(position, price, atr_val, "BUY")
+            # being given back to the original ATR stop. The bar's high feeds
+            # the trail, so the stop follows the highest high since entry.
+            risk.update_trailing_stop(position, price, atr_val, "BUY", peak_price=row["high"])
             hit_stop = price <= position["stop"]
             hit_target = price >= position["target"]
-            running = risk.is_running(position, price, atr_val, "BUY")
+            running = risk.is_running(position, position.get("peak", price), atr_val, "BUY")
             sig = generate_signal(window, cfg.strategy, position_open=True)
             # "Let it run": once the trailing stop is armed the trade is in
             # profit, so a reversal signal no longer closes it early — the trail
@@ -338,6 +339,14 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     results = summarize(trades, equity_curve, cfg.starting_equity, cfg.exchange.timeframe)
     results["fib_filter_enabled"] = fib_filter_enabled
     results["fib_blocked_signals"] = diag["fib_filter_blocked"]
+    # Echo the knobs the run was measured with, so a sweep of configs is
+    # self-describing without having to keep the request alongside the result.
+    results["fib_tolerance_atr_mult"] = float(
+        getattr(cfg.strategy, "fib_tolerance_atr_mult", 0.0) or 0.0)
+    results["fib_level_mode"] = str(getattr(cfg.strategy, "fib_level_mode", "all") or "all")
+    results["trailing_stop_enabled"] = risk.trailing_enabled()
+    results["trailing_stop_atr_mult"] = float(
+        getattr(cfg.risk, "trailing_stop_atr_mult", 0.0) or 0.0)
     results["diagnostics"] = diag
     # Flat aliases so the API/UI can read the headline numbers without digging.
     results["candles_evaluated"] = diag["candles_evaluated"]
@@ -410,12 +419,29 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default="BTC/USDT")
     parser.add_argument("--timeframe", default="15m")
     parser.add_argument("--days", type=int, default=180)
+    parser.add_argument("--no-fib", action="store_true",
+                        help="trade the core EMA/ADX/RSI signal alone")
+    parser.add_argument("--fib-mode", choices=("all", "deep"), default=None,
+                        help="fib confluence levels: all (0.382/0.5/0.618) or deep (0.5/0.618)")
+    parser.add_argument("--fib-atr-mult", type=float, default=None,
+                        help="dynamic fib band as a multiple of ATR (0 = fixed percentage band)")
+    parser.add_argument("--no-trail", action="store_true", help="disable the ATR trailing stop")
+    parser.add_argument("--trail-atr", type=float, default=None,
+                        help="trailing-stop distance in ATRs (default 2.0)")
     args = parser.parse_args()
 
     cfg = BotConfig()
     cfg.exchange.exchange_id = args.exchange
     cfg.exchange.symbol = args.symbol
     cfg.exchange.timeframe = args.timeframe
+    cfg.strategy.use_fib_filter = not args.no_fib
+    if args.fib_mode is not None:
+        cfg.strategy.fib_level_mode = args.fib_mode
+    if args.fib_atr_mult is not None:
+        cfg.strategy.fib_tolerance_atr_mult = args.fib_atr_mult
+    cfg.risk.trailing_stop_enabled = not args.no_trail
+    if args.trail_atr is not None:
+        cfg.risk.trailing_stop_atr_mult = args.trail_atr
 
     hist = fetch_historical(args.exchange, args.symbol, args.timeframe, args.days)
     if hist.empty:
