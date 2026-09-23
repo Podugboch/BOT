@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
-from config import StrategyConfig
+from config import StrategyConfig, resolve_min_bars_between_trades
 from indicators import adx, atr, ema, fib_retracement_levels, rsi, bollinger_bands, macd
 
 
@@ -405,13 +405,18 @@ def _fib_zone_detail(rows: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any]:
                       f"${last_price:,.2f} is {side}"}
 
 
-def generate_signal(
+def _evaluate_signal(
     df: pd.DataFrame,
     cfg: StrategyConfig,
     position_open: bool,
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Signal:
     """
+    Raw per-candle decision — the indicator rules only, no trade bookkeeping.
+
+    `generate_signal` wraps this with the entry debounce; call this directly only
+    when you want the untouched core decision.
+
     df must already have indicators (see add_indicators) and at least 2 rows.
 
     Pass a `diagnostics` dict to have the entry pipeline stages recorded in it,
@@ -581,3 +586,55 @@ def generate_signal(
         if bearish_cross or curr["rsi"] > cfg.rsi_overbought + 10:
             return Signal.SELL
         return Signal.HOLD
+
+
+#: Exact wording of the entry-debounce rejection, shared by every caller so the
+#: backtest report, the API payload and the live log all read the same.
+DEBOUNCE_REASON = "Signal debounce: waiting for cooldown period between setups"
+
+
+def generate_signal(
+    df: pd.DataFrame,
+    cfg: StrategyConfig,
+    position_open: bool,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    bars_since_last_trade: Optional[int] = None,
+    timeframe: Optional[str] = None,
+) -> Signal:
+    """The strategy's decision for the last candle in `df`, debounce included.
+
+    Identical to `_evaluate_signal` except for one entry-level rule: a BUY is
+    suppressed when fewer than `min_bars_between_trades` candles have elapsed
+    since the previous trade *exit*. Without it a fast EMA whipsaw re-triggers
+    on adjacent bars (17:30, 17:35, 17:40), so one setup is paid for three times
+    in fees and stop-outs.
+
+    `bars_since_last_trade` is the caller's job to know — it is the distance in
+    candles between this bar and the last exit, and `None` (no previous trade,
+    e.g. a one-shot probe) means there is nothing to debounce. `timeframe`
+    supplies the default when `cfg.min_bars_between_trades` is None; pass None
+    for both to skip the check entirely. Exits are never debounced.
+    """
+    sig = _evaluate_signal(df, cfg, position_open, diagnostics)
+    if sig != Signal.BUY or position_open:
+        return sig
+
+    required = resolve_min_bars_between_trades(cfg, timeframe)
+    if required <= 0 or bars_since_last_trade is None:
+        return sig
+    try:
+        elapsed = int(bars_since_last_trade)
+    except (TypeError, ValueError):
+        return sig
+    if elapsed >= required:
+        return sig
+
+    # Blocked, and only now: the core trigger fired and every other filter
+    # passed, so the debounce is the one rule that turned the trade away.
+    _record(diagnostics,
+            core_signal=(diagnostics or {}).get("core_signal") or "BUY",
+            debounce_bars_elapsed=elapsed,
+            debounce_bars_required=required,
+            debounce_reason=DEBOUNCE_REASON,
+            rejected_by="signal_debounce")
+    return Signal.HOLD

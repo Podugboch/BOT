@@ -282,6 +282,9 @@ class BacktestRequest(BaseModel):
     fib_level_mode: str = "zone"        # "zone" (0.382-0.618) | "deep" | "all"
     trailing_stop_enabled: bool = True
     trailing_stop_atr_mult: float = 3.5  # matches RiskConfig: arm late, trail wide
+    # Entry debounce: candles required between one trade's exit and the next
+    # entry. None derives it from the timeframe (8 bars on 5m/15m, 3 on 1h/4h).
+    min_bars_between_trades: Optional[int] = None
     risk_per_trade_pct: float = 0.01
 
     @model_validator(mode="before")
@@ -1334,6 +1337,9 @@ def run_backtest_endpoint(req: BacktestRequest):
         cfg.strategy.fib_level_mode = str(req.fib_level_mode or "zone").strip().lower()
         cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
         cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
+        # None keeps the timeframe-derived default; an explicit 0 disables it.
+        cfg.strategy.min_bars_between_trades = (None if req.min_bars_between_trades is None
+                                                else max(0, int(req.min_bars_between_trades)))
         cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
 
         df = fetch_historical(exch, req.symbol, req.timeframe, days)
@@ -4445,12 +4451,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const trail = r.trailing_stop_enabled
             ? `Trailing stop: ON, ${r.trailing_stop_atr_mult}\u00d7ATR behind the peak high.`
             : 'Trailing stop: OFF (fixed stop, reversal-signal exits).';
+          const bars = r.min_bars_between_trades ?? 0;
+          const debounce = bars > 0
+            ? `Entry debounce: ${bars} bar(s) between trades` +
+              ((r.debounce_blocked || 0) > 0
+                ? ` \u2014 ${(r.debounce_blocked || 0).toLocaleString()} re-trigger(s) held back.`
+                : '.')
+            : 'Entry debounce: OFF (adjacent candles may re-enter).';
           if (r.fib_filter_enabled) {
             fibNote.innerText = 'Fibonacci Zone Filter: ON — ' + (r.fib_blocked_signals || 0) +
               ' core signal(s) skipped because price was not near a fib level. Levels: ' + levels +
-              ', ' + band + '. ' + trail;
+              ', ' + band + '. ' + trail + ' ' + debounce;
           } else {
-            fibNote.innerText = 'Fibonacci Zone Filter: OFF — entries taken on the core EMA/ADX/RSI signal alone. ' + trail;
+            fibNote.innerText = 'Fibonacci Zone Filter: OFF — entries taken on the core EMA/ADX/RSI signal alone. ' +
+              trail + ' ' + debounce;
           }
         }
       } catch (err) {

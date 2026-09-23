@@ -85,10 +85,10 @@ Fetched 72,000 candles across 250 days for BTC/USDT (5m) in 144 page(s) of up to
 ### Why no trades? Every signal explains itself
 
 The backtest walks the entry pipeline stage by stage — core indicator trigger,
-Fibonacci filter, capital/position sizing — and tallies what happened at each
-one. Whenever a core signal fires but no trade happens, the exact reason is
-written to the activity log (`bot.log`, i.e. the dashboard's Live Bot Activity
-Logs) and kept in the run report:
+Fibonacci filter, entry debounce, capital/position sizing — and tallies what
+happened at each one. Whenever a core signal fires but no trade happens, the
+exact reason is written to the activity log (`bot.log`, i.e. the dashboard's
+Live Bot Activity Logs) and kept in the run report:
 
 ```
 Timestamp: 2026-03-14 12:00 | Core signal triggered: BUY | Rejected by: Price outside the Fibonacci 0.618 zone (nearest level $46,800.00 is 0.91% away, band ±0.50%)
@@ -192,6 +192,30 @@ results panel reports whether it ran and how many core signals it skipped. The
 checkbox is sent to `POST /api/backtest` as `use_fib_filter` (the alias
 `enable_fib_filter` is accepted too) and overrides `config.py` for that run.
 
+### Entry debounce: never re-enter on adjacent candles
+
+A fast moving-average whipsaw used to chain entries on consecutive candles — a
+BUY at 17:30, another at 17:35, another at 17:40 — which is one setup billed
+three times over in fees and stop-outs. The strategy therefore enforces a
+cool-off measured from the **exit** of the previous trade:
+
+- **`min_bars_between_trades`** (strategy config / `min_bars_between_trades` in
+  the backtest request) is the number of candles that must pass after an exit
+  before a new BUY is allowed. Left unset — the default — it derives from the
+  timeframe, because three bars is 15 minutes on 5m but three hours on 1h:
+  **8 bars on 1m/5m/15m, 3 bars on 30m and slower**. Set an int to pin it, `0`
+  to turn it off.
+- A blocked setup is reported, never silently dropped: the core signal still
+  counts as triggered, and the rejection reads `Signal debounce: waiting for
+  cooldown period between setups` in the run's rejection log and in the live
+  bot's cycle log. The run also echoes `min_bars_between_trades` (the resolved
+  count), `debounce_blocked` (re-triggers held back) and `min_entry_gap_bars`
+  (the tightest spacing actually taken), so the rule is checkable from the
+  result instead of taken on faith.
+- It gates **entries** only. Exit management — stop, target, trailing stop and
+  the reversal signal — is never debounced, and the first trade after a restart
+  or an empty history is never blocked.
+
 ## Reading a backtest result
 
 Every run returns, alongside the P&L summary, the data window it was measured
@@ -200,8 +224,9 @@ on and a stage-by-stage account of the signal pipeline:
 - `candles_tested` / `date_range` — how many candles were fetched and the first
   and last timestamp covered (e.g. 72,000 candles over 250 days on 5m).
 - `diagnostics.report` — total candles evaluated, raw signals detected,
-  rejections per filter rule (fib zone, sizing, risk gate, circuit breaker),
-  and final trades executed, with the headline numbers echoed to the activity log.
+  rejections per filter rule (fib zone, entry debounce, sizing, risk gate,
+  circuit breaker), and final trades executed, with the headline numbers echoed
+  to the activity log.
 - `diagnostics.rejection_log` — for each blocked signal:
   `Timestamp: 2026-03-14 12:00 | Core signal triggered: BUY | Rejected by: ...`
   so a run with no trades explains itself instead of just reporting zero.

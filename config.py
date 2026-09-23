@@ -8,6 +8,7 @@ Copy .env.example to .env and fill it in, or export the vars directly.
 import os
 import socket
 from dataclasses import dataclass, field
+from typing import Optional
 from secret_manager import safe_load_dotenv
 
 # Safely load non-sensitive environment variables from .env
@@ -76,10 +77,60 @@ class StrategyConfig:
     # while price works its way back into the fib zone.
     ema_cross_window: int = 3
 
+    # Entry debounce: candles that must separate the exit of one trade from the
+    # entry of the next. A fast EMA whipsaw used to chain entries on adjacent
+    # bars (17:30, 17:35, 17:40 — each one a "fresh" crossover), which is a
+    # single setup charged three times in fees and stop-outs. Set an int to pin
+    # it, or leave None to derive it from the timeframe (8 bars on 5m/15m, 3 on
+    # 1h/4h — see `default_min_bars_between_trades`), so the gap means roughly
+    # the same amount of time on a fast grain as on a slow one. 0 disables it.
+    min_bars_between_trades: Optional[int] = None
+
     # Volatility & Momentum indicator parameters
     bb_period: int = 20
     bb_std: float = 2.0
     macd_signal_period: int = 9
+
+
+# --- entry debounce defaults ------------------------------------------------
+# Bars that must pass between the exit of one trade and the next entry. Three
+# bars is 15 minutes on 5m but three hours on 1h, so the count is keyed to the
+# grain: fast charts get a longer count to buy the same amount of cool-off.
+DEFAULT_MIN_BARS_BETWEEN_TRADES = {
+    "1m": 8, "3m": 8, "5m": 8, "15m": 8,          # <= 15m: 8 bars
+    "30m": 3, "1h": 3, "2h": 3, "4h": 3,          # >= 30m: 3 bars
+    "6h": 3, "12h": 3, "1d": 3, "1w": 3,
+}
+FALLBACK_MIN_BARS_BETWEEN_TRADES = 3
+
+# Bar length per grain, in minutes. Used to translate a debounce *count* into
+# elapsed market time (live bot) and back again.
+TIMEFRAME_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120,
+    "4h": 240, "6h": 360, "12h": 720, "1d": 1440, "1w": 10080,
+}
+
+
+def timeframe_minutes(timeframe: str) -> float:
+    """Bar length in minutes; 0.0 for a grain we do not know."""
+    return float(TIMEFRAME_MINUTES.get(str(timeframe or "").strip().lower(), 0))
+
+
+def default_min_bars_between_trades(timeframe: str) -> int:
+    """Debounce length for a grain: 8 bars at/under 15m, 3 bars at/over 30m."""
+    key = str(timeframe or "").strip().lower()
+    return DEFAULT_MIN_BARS_BETWEEN_TRADES.get(key, FALLBACK_MIN_BARS_BETWEEN_TRADES)
+
+
+def resolve_min_bars_between_trades(strategy_cfg, timeframe: str = None) -> int:
+    """Effective debounce length: an explicit override, else the grain default."""
+    raw = getattr(strategy_cfg, "min_bars_between_trades", None)
+    if raw is None:
+        return default_min_bars_between_trades(timeframe)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return default_min_bars_between_trades(timeframe)
 
 
 @dataclass
