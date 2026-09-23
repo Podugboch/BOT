@@ -4312,6 +4312,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function executeBacktest(e) {
       e.preventDefault();
       const btn = document.getElementById('btn-run-bt');
+      // Helpers are declared before their first use on purpose: a `const` arrow
+      // function referenced above its own declaration sits in the temporal dead
+      // zone, and the resulting ReferenceError aborted the entire results render
+      // (the user saw "Backtest error: Cannot access 'setIf' before initialization").
+      const setIf = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running Backtest...';
 
@@ -4359,7 +4364,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           : '--');
         const fibNote = document.getElementById('bt-res-fib-note');
         const diag = r.diagnostics || {};
-        const setIf = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
         setIf('bt-res-candles', (r.candles_tested ?? r.candles_evaluated ?? diag.candles_evaluated ?? 0).toLocaleString());
         const range = (r.date_range || []).filter(Boolean);
         setIf('bt-res-window', range.length === 2
