@@ -3,8 +3,11 @@ Comprehensive test suite for Crypto Trading Bot.
 Covers indicators, strategy signals, risk management, execution, and backtesting.
 """
 import os
+import re
 import shutil
+import subprocess
 import tempfile
+import json
 from datetime import datetime, timedelta, timezone
 
 import ccxt
@@ -1582,3 +1585,204 @@ class TestBacktestControlWiring:
         assert "Realized R:R" in html
         assert "bt-res-exits" in html
         assert "bt-res-rr" in html
+
+
+# ============================================================================
+# DASHBOARD JAVASCRIPT — REAL ENGINE, NOT GREP
+# ============================================================================
+def _dashboard_script() -> str:
+    """The dashboard's main inline <script>, exactly as served."""
+    import web_server
+
+    scripts = re.findall(r"<script>(.*?)</script>", web_server.DASHBOARD_HTML, re.S)
+    return max(scripts, key=len)
+
+
+def _dashboard_function(name: str) -> str:
+    """Source of one declared function from the dashboard script.
+
+    Brace-matched from the signature; enough to lift a handler out of the page
+    and run it on its own.
+    """
+    src = _dashboard_script()
+    match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", src)
+    assert match, f"{name} is not declared in the dashboard script"
+    start = match.start()          # keep the `async` keyword, or `await` is illegal
+    open_brace = src.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(src)):
+        if src[index] == "{":
+            depth += 1
+        elif src[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:index + 1]
+    raise AssertionError(f"unbalanced braces while extracting {name}")
+
+
+# Runs the extracted handler in a real engine with a stubbed DOM and fetch, so
+# "cannot access X before initialization" and friends fail the test instead of
+# only surfacing as a browser alert on the deployed dashboard.
+_JS_BACKTEST_HARNESS = r"""
+const fs = require('fs');
+const [fnPath, formPath, apiPath] = process.argv.slice(2);
+const form = JSON.parse(fs.readFileSync(formPath, 'utf8'));
+const apiPayload = JSON.parse(fs.readFileSync(apiPath, 'utf8'));
+
+const elements = {};
+function makeEl(id) {
+  const classes = new Set(['hidden']);
+  let text = '';
+  return {
+    id,
+    // A real DOM stringifies innerText; the stub does too, so the assertions
+    // see what a browser would show.
+    get innerText() { return text; },
+    set innerText(v) { text = String(v); },
+    innerHTML: '', value: '', checked: false,
+    disabled: false, className: '',
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+    },
+  };
+}
+const el = (id) => (elements[id] = elements[id] || makeEl(id));
+
+globalThis.document = { getElementById: el, createElement: () => makeEl('x') };
+globalThis.alert = (m) => { throw new Error('alert(): ' + m); };
+globalThis.fetch = async (url, opts) => {
+  globalThis.__posted = JSON.parse(opts.body);
+  return { ok: true, status: 200, json: async () => apiPayload };
+};
+
+for (const [id, val] of Object.entries(form)) {
+  if (typeof val === 'boolean') el(id).checked = val;
+  else el(id).value = val;
+}
+
+const executeBacktest = new Function(
+  fs.readFileSync(fnPath, 'utf8') + '\nreturn executeBacktest;')();
+
+executeBacktest({ preventDefault() {} }).then(() => {
+  console.log(JSON.stringify({
+    posted: globalThis.__posted,
+    rr: el('bt-res-rr').innerText,
+    winrate: el('bt-res-winrate').innerText,
+    trades: el('bt-res-trades').innerText,
+    fibNote: el('bt-res-fib-note').innerText,
+    resultsHidden: el('bt-results-box').classList.contains('hidden'),
+    buttonDisabled: el('btn-run-bt').disabled,
+  }));
+}).catch((err) => {
+  console.log('FAILED: ' + err.name + ': ' + err.message);
+  process.exit(1);
+});
+"""
+
+_BACKTEST_API_PAYLOAD = {
+    "success": True,
+    "results": {
+        "total_return_pct": 5.43, "num_trades": 145, "win_rate_pct": 34.48,
+        "final_equity": 1054.3, "sharpe_approx": 0.9, "avg_win": 32.1,
+        "avg_loss": -15.5, "max_drawdown_pct": -10.99, "realized_rr": 2.07,
+        "exit_reasons": {"trail": 73, "stop": 32, "target": 17, "signal": 23},
+        "candles_tested": 17_520, "date_range": ["2023-09-01", "2025-08-30"],
+        "raw_signals": 120, "fib_filter_enabled": True, "fib_blocked_signals": 60,
+        "fib_level_mode": "deep", "fib_tolerance_atr_mult": 0.5,
+        "trailing_stop_enabled": True, "trailing_stop_atr_mult": 2.0,
+        "diagnostics": {"report": "--- pipeline report ---", "fib_filter_blocked": 60,
+                        "sizing_blocked": 0, "signals_risk_blocked": 3,
+                        "candles_evaluated": 17_520},
+    },
+}
+
+_BACKTEST_FORM_VALUES = {
+    "bt-exchange": "binance", "bt-symbol": "BTC/USDT", "bt-timeframe": "1h",
+    "bt-days": "730", "bt-equity": "1000",
+    "bt-use-fib": True, "bt-fib-depth": "deep", "bt-fib-atr": "0.5",
+    "bt-fib-floor": "0.1", "bt-trail": True, "bt-trail-atr": "2.0",
+}
+
+
+class TestDashboardBacktestRuntime:
+    """executeBacktest must actually run in a JS engine, not merely exist.
+
+    The whole results panel is rendered by this one handler, so a single
+    use-before-declaration error (a `const` helper in the temporal dead zone)
+    silently kills every field on the panel behind an alert().
+    """
+
+    @staticmethod
+    def _run_harness(tmp_path, function_name="executeBacktest"):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; JS runtime check skipped")
+        (tmp_path / "fn.js").write_text(_dashboard_function(function_name))
+        (tmp_path / "form.json").write_text(json.dumps(_BACKTEST_FORM_VALUES))
+        (tmp_path / "api.json").write_text(json.dumps(_BACKTEST_API_PAYLOAD))
+        (tmp_path / "harness.js").write_text(_JS_BACKTEST_HARNESS)
+        proc = subprocess.run(
+            [node, str(tmp_path / "harness.js"), str(tmp_path / "fn.js"),
+             str(tmp_path / "form.json"), str(tmp_path / "api.json")],
+            capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"node failed:\n{proc.stdout}\n{proc.stderr}"
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_handler_runs_without_a_reference_error(self, tmp_path):
+        out = self._run_harness(tmp_path)
+
+        # The results box is revealed and every headline field was written.
+        assert out["resultsHidden"] is False
+        assert out["rr"] == "2.07 : 1"
+        assert out["winrate"] == "34.48%"
+        assert out["trades"] == "145"
+        assert "trail=73" in out["fibNote"] or "Fibonacci Zone Filter" in out["fibNote"]
+        assert out["buttonDisabled"] is False        # the button is re-enabled
+
+    def test_handler_posts_every_form_field_cleanly(self, tmp_path):
+        """Item 3: the payload must gather and post all form values."""
+        posted = self._run_harness(tmp_path)["posted"]
+
+        assert posted["exchange"] == "binance"
+        assert posted["symbol"] == "BTC/USDT"
+        assert posted["timeframe"] == "1h"
+        assert posted["days"] == 730                 # lookback reaches two years
+        assert posted["starting_equity"] == 1000.0
+        assert posted["use_fib_filter"] is True
+        assert posted["fib_level_mode"] == "deep"
+        assert posted["fib_tolerance_atr_mult"] == 0.5
+        assert posted["fib_tolerance_pct"] == pytest.approx(0.001)   # 0.1% typed
+        assert posted["trailing_stop_enabled"] is True
+        assert posted["trailing_stop_atr_mult"] == 2.0
+        # Numbers must arrive as numbers, not strings, or pydantic 422s.
+        for key in ("days", "starting_equity", "fib_tolerance_atr_mult",
+                    "fib_tolerance_pct", "trailing_stop_atr_mult", "risk_per_trade_pct"):
+            assert isinstance(posted[key], (int, float)), key
+
+    def test_no_setter_is_referenced_before_its_declaration(self):
+        """A `const`/`let` used above its own declaration is a TDZ ReferenceError."""
+        src = _dashboard_function("executeBacktest")
+        declared = set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", src))
+
+        for name in declared:
+            first_decl = src.index(name)
+            # Skip the declaration itself: look for a use strictly before it.
+            for match in re.finditer(rf"\b{re.escape(name)}\b", src):
+                if match.start() < first_decl:
+                    raise AssertionError(f"{name} is used before it is declared")
+        # The helper that used to break the panel is declared, and early.
+        assert "const setIf" in src
+        assert src.index("const setIf") < src.index("setIf('bt-res-rr'")
+
+    def test_every_referenced_element_id_exists_or_is_guarded(self):
+        """A getElementById typo silently no-ops; catch the real ones."""
+        import web_server
+
+        declared = set(re.findall(r'id="([^"]+)"', web_server.DASHBOARD_HTML))
+        used = set(re.findall(r"getElementById\(\s*'([^']+)'\s*\)", _dashboard_script()))
+        # Checked with `||` fallbacks / null guards inside the script.
+        guarded = {"configured-keys-list"}
+
+        assert used - declared - guarded == set()
