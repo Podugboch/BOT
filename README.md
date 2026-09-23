@@ -208,6 +208,42 @@ continuous, de-duplicated series, and the run logs the tally, e.g.
 `Fetched 72,000 candles across 250 days for BTC/USDT (5m) in 144 page(s) of up
 to 500`.
 
+### Granularity limits: how far back each timeframe really goes
+
+Exchanges do not store every grain equally deep, and asking for more than they
+keep is **not** an error — MEXC answers a `since` older than its stored range
+with an **empty page**, so a 365-day 5m request (≈105,000 candles) comes back
+with nothing at all rather than a short series. `exchange_client.py` therefore
+carries a per-grain table of what venues actually serve:
+
+| Timeframe | Realistic lookback | Notes |
+|-----------|--------------------|-------|
+| `1m` | ~7 days | shortest retention |
+| `5m` | ~60 days | the classic trap: 365d returns an empty list |
+| `15m` | ~90 days | |
+| `30m` | ~120 days | |
+| `1h` / `4h` / `1d` | up to 730 days | years of candles; use these for long runs |
+
+Three things follow from that:
+
+1. **Deep starts fall back instead of failing.** If a window returns nothing at
+   all, the start is pulled back to the grain's known limit, and failing that the
+   earliest candle the venue actually serves is *found by bisection*
+   (`find_earliest_available`, ~12 requests) rather than guessed. The run then
+   reports the window it really covered, e.g.
+   `Venue stores no 5m candles before 2026-07-25 04:00 UTC — covered 60 of the
+   365 day(s) requested.`
+2. **An empty venue is explained, not silent.** When nothing can be fetched the
+   log says why and what to do (`lookback_limit_note`), and `POST /api/backtest`
+   returns that sentence in its 400 `detail` instead of a bare
+   "insufficient bars".
+3. **The dashboard warns and caps.** The backtester panel injects the same
+   limits table, so choosing `5m` bounds Lookback (Days) to 60 and shows
+   `5m on this venue stores ~60 days; the run will be capped to 60.` Clicking a
+   quick-pick button (90d/365d/730d) on a short-retention grain lands on that
+   grain's limit, and the request is capped before it is posted rather than sent
+   off to return nothing.
+
 ## Tuning
 
 All parameters live in `config.py` — strategy periods, risk-per-trade %,

@@ -20,7 +20,9 @@ from exchange_client import (
     MIN_PAUSE_SEC,
     MS_PER_DAY,
     chunk_limit,
-    paginate_ohlcv,
+    clamp_lookback_days,
+    fetch_ohlcv_window,
+    lookback_limit_note,
     to_frame,
 )
 from risk_manager import RiskManager
@@ -141,7 +143,14 @@ def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
     `client` takes a pre-built ccxt exchange (used by tests); otherwise one is
     built from `exchange_id`.
     """
-    days = max(1, min(int(days), MAX_DAYS))
+    requested_days = max(1, min(int(days), MAX_DAYS))
+    # Grains differ in how far back venues store candles: asking MEXC for 365
+    # days of 5m (~105,000 candles) answers with an empty page, not more data.
+    days = clamp_lookback_days(requested_days, timeframe)
+    if days != requested_days:
+        log.warning("Lookback %s day(s) exceeds what %s stores for %s — requesting %s day(s) "
+                    "instead. %s", requested_days, exchange_id, timeframe, days,
+                    lookback_limit_note(timeframe))
 
     if client is None:
         ex_clean = str(exchange_id).strip().lower()
@@ -174,21 +183,34 @@ def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
              symbol, timeframe, getattr(exchange, "id", exchange_id), days,
              f"{expected:,}", limit, pause)
 
-    rows, pages, largest_page = paginate_ohlcv(exchange, symbol, timeframe, since_ms, end_ms,
-                                               limit, pause, max_chunks)
+    rows, pages, largest_page, effective_since = fetch_ohlcv_window(
+        exchange, symbol, timeframe, since_ms, end_ms, limit, pause, max_chunks)
 
     df = to_frame(rows)
     if df.empty:
-        log.warning("No candles returned for %s %s over the last %s day(s)", symbol, timeframe, days)
+        # Not silent: say why, and what to do about it, rather than returning a
+        # bare empty frame that the caller can only report as "insufficient bars".
+        log.error("No %s candles returned for %s from %s. %s",
+                  timeframe, symbol, getattr(exchange, "id", exchange_id),
+                  lookback_limit_note(timeframe))
         return df
 
-    coverage = len(df) / expected * 100 if expected else 0.0
+    # Compare against the window actually served, not the one requested, so a
+    # graceful deep-start fallback does not masquerade as missing pages.
+    served_days = (end_ms - effective_since) / MS_PER_DAY if effective_since else days
+    expected_served = max(1, int(served_days * MS_PER_DAY // ms_per_bar))
+    coverage = len(df) / expected_served * 100 if expected_served else 0.0
+    if effective_since and effective_since > since_ms:
+        log.warning("Venue stores no %s candles before %s — covered %.0f of the %s day(s) "
+                    "requested. %s", timeframe,
+                    df["ts"].iloc[0].strftime("%Y-%m-%d %H:%M UTC"), served_days, days,
+                    lookback_limit_note(timeframe))
     # Report the page size actually served, not just the one we asked for:
     # venues like MEXC advertise 1000 and hand back 500.
     log.info("Fetched %s candles across %s days for %s (%s) in %d page(s) of up to %d — %s to %s UTC (%.0f%% of the nominal %s)",
-             f"{len(df):,}", days, symbol, timeframe, pages, largest_page,
+             f"{len(df):,}", f"{served_days:.0f}", symbol, timeframe, pages, largest_page,
              df["ts"].iloc[0].strftime("%Y-%m-%d %H:%M"), df["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M"),
-             coverage, f"{expected:,}")
+             coverage, f"{expected_served:,}")
     if coverage < 80:
         log.warning("Only %.0f%% of the expected candles came back for %s — the exchange may "
                     "not list this symbol that far back, or pages were skipped", coverage, symbol)
