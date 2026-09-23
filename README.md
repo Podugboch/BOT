@@ -165,19 +165,26 @@ Two knobs shape that band, both live in the backtester panel and in `config.py`:
   rigid percentage the tolerance scales with volatility: a bar within
   `0.5 × ATR` of a level counts as a pullback, so a 1h candle with a 1.5% ATR
   is not judged by a calm-market yardstick. `fib_tolerance_pct` stays as the
-  **floor**, and as the fallback when ATR is missing or zero, so a quiet tape
-  can never shrink the band toward an impossible exact-price match and starve
-  the sample. Set the multiplier to 0 for the old fixed-band behaviour, or set
-  the floor low (0.1%) for a near-pure ATR band.
-- **Where the entry has to be (`fib_level_mode`).**
-  - `zone` (the default) — price must retrace **into the 0.382-0.618 golden
-    pocket**. Buying on the crossover candle itself means buying *above* the
-    0.382 level, i.e. the breakout rather than the pullback; zone mode waits for
-    the retracement. The ATR band still softens the two edges so a wick that
-    just pokes out is not disqualified, and the rejection reason says which side
-    was missed (`no pullback yet` vs `too deep`).
-  - `deep` — within the band of the 0.5 or 0.618 level.
-  - `all` — within the band of any of 0.382/0.5/0.618.
+  **floor** (0.3% by default, was 1%), and as the fallback when ATR is missing
+  or zero, so a quiet tape can never shrink the band toward an impossible
+  exact-price match. Set the multiplier to 0 for the old fixed-band behaviour.
+
+  The floor is the *smaller* of the two levers: with a 0.5 × ATR band the floor
+  rarely binds, because an ATR band is usually wider than 0.3%. Lowering it
+  from 1% therefore changes little on its own — what actually makes the filter
+  bite is which levels count (below).
+- **Which levels count (`fib_level_mode`).** This is the knob that decides
+  whether the filter filters at all.
+  - `deep` (the default) — price must come within the band of the **0.5 or
+    0.618** level, the retracements a pullback actually turns on. Measured over
+    a 1h window this turned away 3 of 8 core signals and cut 6 trades to 5,
+    which is a filter doing its job.
+  - `zone` — anywhere inside the **0.382-0.618 pocket**. Measured against real
+    signals this accepted ~96% of them (`Fib blocked: 0`): the pocket already
+    spans much of the swing range, and the band on top of it covers nearly the
+    rest, so it is a filter in name only. Kept for comparison — see the sweep.
+  - `all` — within the band of any of 0.382/0.5/0.618 (loosest, it also accepts
+    the shallow 0.382 level).
 
   Switchable in the backtester's **Fib Depth** select and via
   `fib_level_mode` — see the sweep below.

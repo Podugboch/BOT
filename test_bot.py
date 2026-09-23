@@ -133,14 +133,15 @@ class TestStrategy:
         assert sig == Signal.SELL
 
     def test_fib_support_filter(self):
-        # Golden-zone mode (the default): a pullback *into* 0.382-0.618 counts.
-        cfg = StrategyConfig(fib_tolerance_pct=0.01)
-        curr_matching = pd.Series({"close": 100.0, "fib_382": 100.5, "fib_500": 95.0, "fib_618": 90.0})
-        assert _near_fib_support(curr_matching, cfg) is True
+        # The default asks for a real test of the 0.5/0.618 pullback levels.
+        cfg = StrategyConfig()
+        at_500 = pd.Series({"close": 95.05, "fib_382": 110.0, "fib_500": 95.0, "fib_618": 85.0})
+        at_382_only = pd.Series({"close": 100.0, "fib_382": 100.5, "fib_500": 90.0, "fib_618": 80.0})
+        above = pd.Series({"close": 120.0, "fib_382": 110.0, "fib_500": 90.0, "fib_618": 80.0})
 
-        # Above the 0.382 level = still at the breakout, no pullback yet.
-        curr_far = pd.Series({"close": 120.0, "fib_382": 110.0, "fib_500": 90.0, "fib_618": 80.0})
-        assert _near_fib_support(curr_far, cfg) is False
+        assert _near_fib_support(at_500, cfg) is True
+        assert _near_fib_support(at_382_only, cfg) is False   # 0.382 alone is not a pullback level
+        assert _near_fib_support(above, cfg) is False         # breakout, no pullback yet
 
 
 # ============================================================================
@@ -295,7 +296,9 @@ class TestLossStreakCooldown:
 
     def test_backtest_rejections_carry_the_cooldown_expiry(self):
         """The run report must say when trading resumes, not just 'circuit breaker'."""
-        res = run_backtest(TestPipelineDiagnostics._series(), TestPipelineDiagnostics._diag_cfg())
+        cfg = TestPipelineDiagnostics._diag_cfg()
+        cfg.strategy.use_fib_filter = False      # isolate the risk gate from the fib filter
+        res = run_backtest(TestPipelineDiagnostics._series(), cfg)
         lines = res["diagnostics"]["rejection_log"]
 
         assert any("Circuit breaker" in line and "resume" in line for line in lines)
@@ -303,6 +306,7 @@ class TestLossStreakCooldown:
     def test_backtest_resumes_after_the_cooldown_mid_run(self):
         """More trades than the old 4-loss hard halt would ever allow."""
         cfg = TestPipelineDiagnostics._diag_cfg()
+        cfg.strategy.use_fib_filter = False      # isolate the risk gate from the fib filter
         res = run_backtest(TestPipelineDiagnostics._series(), cfg)
         diag = res["diagnostics"]
 
@@ -367,6 +371,7 @@ class TestRewardRiskBalance:
     def test_backtest_lets_winners_run_and_reports_realized_rr(self):
         """Realised R:R must beat the ~1.1 the fix was written for."""
         cfg = TestPipelineDiagnostics._diag_cfg()
+        cfg.strategy.use_fib_filter = False      # this is about the trail, not the filter
         res = run_backtest(TestPipelineDiagnostics._series(), cfg)
 
         assert res["num_trades"] > 5
@@ -783,7 +788,7 @@ class TestFibZoneFilter:
 
     def test_fib_levels_accept_a_percentage_band_not_exact_match(self):
         # Band semantics are tested in level mode; zone mode measures a range.
-        cfg = StrategyConfig(fib_level_mode="all")   # fib_tolerance_pct = 0.01 (1%)
+        cfg = StrategyConfig(fib_level_mode="all", fib_tolerance_pct=0.01)   # a 1% band
         # Price 0.4% away from the 38.2% level is inside the band.
         assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 100.4,
                                             "fib_500": 95.0, "fib_618": 90.0}), cfg) is True
@@ -794,25 +799,29 @@ class TestFibZoneFilter:
         assert _near_fib_support(pd.Series({"close": 50000.0, "fib_382": 50200.0,
                                             "fib_500": 49000.0, "fib_618": 48000.0}), cfg) is True
 
-    def test_default_tolerance_is_widened_and_tunable(self):
-        """0.5% starved the strategy — the default band is now 1.0% and can be
-        opened up to ~1.5% for choppier books."""
+    def test_default_tolerance_is_tight_and_tunable(self):
+        """A 1% floor accepted nearly every core signal, so the shipped band is
+        0.3% and price has to actually test the retracement line."""
+        from strategy import DEFAULT_FIB_TOLERANCE_PCT
+
         cfg = StrategyConfig()
-        assert cfg.fib_tolerance_pct == pytest.approx(0.01)
+        assert cfg.fib_tolerance_pct == pytest.approx(0.003)
+        assert DEFAULT_FIB_TOLERANCE_PCT == pytest.approx(0.003)
 
         level = {"fib_level_mode": "all"}
-        inside = pd.Series({"close": 100.0, "fib_382": 100.9, "fib_500": 95.0, "fib_618": 90.0})
-        outside = pd.Series({"close": 100.0, "fib_382": 101.4, "fib_500": 95.0, "fib_618": 90.0})
+        inside = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0})
+        outside = pd.Series({"close": 100.0, "fib_382": 100.9, "fib_500": 95.0, "fib_618": 90.0})
         assert _near_fib_support(inside, StrategyConfig(**level)) is True
         assert _near_fib_support(outside, StrategyConfig(**level)) is False
-        assert _near_fib_support(outside, StrategyConfig(fib_tolerance_pct=0.015, **level)) is True
+        # Still tunable: a 1% band re-admits the bar the default turned away.
+        assert _near_fib_support(outside, StrategyConfig(fib_tolerance_pct=0.01, **level)) is True
         # A nonsense tolerance never degrades back into an exact-price match.
-        assert _near_fib_support(inside, StrategyConfig(fib_tolerance_pct=-1.0)) is True
+        assert _near_fib_support(inside, StrategyConfig(fib_tolerance_pct=-1.0, **level)) is True
 
     def test_zero_tolerance_does_not_degrade_to_exact_match(self):
         cfg = StrategyConfig(fib_tolerance_pct=0.0)
-        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 100.4,
-                                            "fib_500": 90.0, "fib_618": 80.0}), cfg) is True
+        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 110.0,
+                                            "fib_500": 100.2, "fib_618": 90.0}), cfg) is True
 
     def test_missing_or_nan_fib_levels_never_block(self):
         cfg = StrategyConfig()
@@ -826,7 +835,7 @@ class TestFibZoneFilter:
         assert sig == Signal.BUY
 
     def test_recent_pullback_touch_satisfies_the_window(self):
-        far, near = 130.0, 100.0
+        far, near = 130.0, 95.2      # near tags the 0.5 level (95.0) on the default set
         rows = [
             {"close": far, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},
             {"close": near, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},  # tagged 2 bars back
@@ -842,16 +851,16 @@ class TestFibZoneFilter:
 
     @staticmethod
     def _pullback_frame():
-        """Cross 2 bars back, EMA trend still intact, price back in the fib zone."""
+        """Cross 2 bars back, EMA trend intact, price back at the 0.5 fib level."""
         return pd.DataFrame([
             {"close": 101.0, "ema_fast": 100.0, "ema_slow": 100.0, "rsi": 50.0, "adx": 25.0,
-             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+             "fib_382": 110.0, "fib_500": 101.9, "fib_618": 95.0},
             {"close": 102.0, "ema_fast": 102.0, "ema_slow": 100.5, "rsi": 55.0, "adx": 26.0,
-             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+             "fib_382": 110.0, "fib_500": 101.9, "fib_618": 95.0},
             {"close": 103.0, "ema_fast": 103.0, "ema_slow": 101.0, "rsi": 56.0, "adx": 27.0,
-             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+             "fib_382": 110.0, "fib_500": 101.9, "fib_618": 95.0},
             {"close": 102.0, "ema_fast": 104.0, "ema_slow": 102.0, "rsi": 55.0, "adx": 26.0,
-             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+             "fib_382": 110.0, "fib_500": 101.9, "fib_618": 95.0},
         ])
 
     def test_cross_stays_entry_eligible_across_recent_bars(self):
@@ -1313,7 +1322,8 @@ class TestPipelineDiagnostics:
     def test_stage2_reports_which_fib_zone_rejected(self):
         df = self._cross({"close": 102.0, "fib_382": 130.0, "fib_500": 120.0, "fib_618": 110.0})
         stages = {}
-        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert generate_signal(df, StrategyConfig(fib_level_mode="zone"), position_open=False,
+                               diagnostics=stages) == Signal.HOLD
         assert stages["core_trigger"] is True
         assert stages["fib_evaluated"] is True
         assert stages["fib_pass"] is False
@@ -1327,7 +1337,8 @@ class TestPipelineDiagnostics:
         """The crossover candle itself is above 0.382 — buying there is the bug."""
         df = self._cross({"close": 108.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
         stages = {}
-        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert generate_signal(df, StrategyConfig(fib_level_mode="zone"), position_open=False,
+                               diagnostics=stages) == Signal.HOLD
         assert stages["core_trigger"] is True
         assert stages["fib_pass"] is False
         assert "no pullback yet" in stages["fib_reason"]
@@ -1335,7 +1346,8 @@ class TestPipelineDiagnostics:
     def test_stage2_records_the_zone_when_it_passes(self):
         df = self._cross({"close": 102.0, "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0})
         stages = {}
-        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.BUY
+        assert generate_signal(df, StrategyConfig(fib_level_mode="zone"), position_open=False,
+                               diagnostics=stages) == Signal.BUY
         assert stages["fib_pass"] is True
         assert "pulled back into the Fibonacci" in stages["fib_reason"]
         assert "0.618-0.382" in stages["fib_reason"]
@@ -1520,14 +1532,22 @@ class TestFibLevelSelection:
         deep_row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 100.3, "fib_618": 130.0})
         assert _near_fib_support(deep_row, cfg_deep) is True
 
-    def test_default_mode_restricts_entries_to_the_pullback_zone(self):
-        """The whole point: no buying at the top of the crossover candle."""
-        assert StrategyConfig().fib_level_mode == "zone"
-        # Above the zone -> no entry; inside it -> entry.
+    def test_default_mode_is_the_key_levels_not_the_blanket_zone(self):
+        """The whole point: a real test of 0.5/0.618, not "anywhere near the pocket"."""
+        assert StrategyConfig().fib_level_mode == "deep"
+        cfg = StrategyConfig()
+
+        # Only the 0.382 level is nearby — the shallow breakout level the zone
+        # mode used to accept, and exactly what this filter is meant to refuse.
+        at_382_only = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 90.0, "fib_618": 85.0})
+        at_500 = pd.Series({"close": 91.9, "fib_382": 100.0, "fib_500": 92.0, "fib_618": 85.0})
+        at_618 = pd.Series({"close": 85.1, "fib_382": 100.0, "fib_500": 93.0, "fib_618": 85.0})
         above = pd.Series({"close": 108.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
-        inside = pd.Series({"close": 96.0, "fib_382": 100.0, "fib_500": 95.0, "fib_618": 90.0})
-        assert _near_fib_support(above, StrategyConfig()) is False
-        assert _near_fib_support(inside, StrategyConfig()) is True
+
+        assert _near_fib_support(at_382_only, cfg) is False
+        assert _near_fib_support(at_500, cfg) is True
+        assert _near_fib_support(at_618, cfg) is True
+        assert _near_fib_support(above, cfg) is False
 
     def test_zone_mode_is_alias_tolerant(self):
         for alias in ("zone", "golden", "golden_zone", "0.382-0.618", "pocket"):
@@ -1539,6 +1559,94 @@ class TestFibLevelSelection:
         cfg = StrategyConfig(fib_level_mode="nonsense", fib_tolerance_atr_mult=0.0)
         row = pd.Series({"close": 100.0, "fib_382": 100.2, "fib_500": 120.0, "fib_618": 130.0})
         assert _near_fib_support(row, cfg) is True
+
+
+class TestFibFilterBlocksSignals:
+    """A filter that blocks nothing is not a filter.
+
+    The shipped default used to be the 0.382-0.618 pocket with a 1% floor, which
+    measured against real signals accepted essentially all of them (`Fib
+    blocked: 0`) — the pocket covers a large part of the swing range and the
+    band on top of it covered the rest. The default is now a tight test of the
+    0.5/0.618 levels, and these tests pin the *effect*, not just the settings.
+    """
+
+    @staticmethod
+    def _series():
+        return TestOneHourBacktestReporting._series()
+
+    _runs: dict = {}
+
+    @classmethod
+    def _run(cls, **overrides):
+        """One shared 1h backtest per config — a run of this fixture is ~3s."""
+        key = tuple(sorted(overrides.items()))
+        if key not in cls._runs:
+            cfg = BotConfig()
+            cfg.exchange.timeframe = "1h"
+            for name, value in overrides.items():
+                setattr(cfg.strategy, name, value)
+            cls._runs[key] = run_backtest(cls._series(), cfg)
+        return cls._runs[key]
+
+    def test_shipped_defaults_are_the_tight_key_levels(self):
+        assert StrategyConfig().fib_level_mode == "deep"
+        assert StrategyConfig().fib_tolerance_pct == pytest.approx(0.003)
+        from web_server import BacktestRequest
+
+        assert BacktestRequest().fib_level_mode == "deep"
+        assert BacktestRequest().fib_tolerance_pct == pytest.approx(0.003)
+
+    def test_the_old_blanket_zone_blocked_nothing(self):
+        """Reproduces the reported symptom, so the fix has something to beat."""
+        unfiltered = self._run(use_fib_filter=False)
+        old = self._run(fib_level_mode="zone", fib_tolerance_pct=0.01)
+
+        assert old["fib_blocked_signals"] == 0
+        assert old["num_trades"] == unfiltered["num_trades"]     # a filter in name only
+
+    def test_one_hour_run_with_the_filter_on_actually_filters(self):
+        """The acceptance check: 1h, filter ON -> 'Fib blocked > 0', fewer trades."""
+        unfiltered = self._run(use_fib_filter=False)
+        filtered = self._run()                                   # shipped defaults
+
+        assert filtered["fib_filter_enabled"] is True
+        assert filtered["fib_level_mode"] == "deep"
+        assert filtered["fib_blocked_signals"] > 0
+        assert filtered["num_trades"] < unfiltered["num_trades"]  # a smaller, chosen subset
+        # The stage-2 tally and the rejection log agree with the headline number.
+        diag = filtered["diagnostics"]
+        assert diag["fib_filter_blocked"] == filtered["fib_blocked_signals"]
+        assert diag["rejections"].get("fib_zone", 0) == diag["fib_filter_blocked"]
+        assert any("Fibonacci" in line for line in diag["rejection_log"])
+        assert "Stage 2 Fibonacci filter" in backtester.format_pipeline_report(filtered)
+
+    def test_deep_mode_blocks_more_than_the_blanket_zone(self):
+        """The whole fix in one comparison: same window, only the level set differs."""
+        zone = self._run(fib_level_mode="zone", fib_tolerance_pct=0.003)
+        deep = self._run(fib_level_mode="deep", fib_tolerance_pct=0.003)
+        broad = self._run(fib_level_mode="all", fib_tolerance_pct=0.003)
+
+        assert deep["fib_blocked_signals"] > zone["fib_blocked_signals"]
+        assert deep["num_trades"] < zone["num_trades"]
+        # "all" is the loosest of the three: it also accepts the 0.382 level.
+        assert broad["fib_blocked_signals"] <= deep["fib_blocked_signals"]
+
+    def test_a_half_percent_miss_is_no_longer_a_touch(self):
+        """0.5% away from the level: inside the old 1% floor, outside the new 0.3%."""
+        from strategy import _fib_pullback_detail
+
+        row = pd.Series({"close": 100.0, "atr": 0.0, "fib_382": 120.0,
+                         "fib_500": 100.5, "fib_618": 80.0})
+        frame = pd.DataFrame([row])
+
+        tight = _fib_pullback_detail(frame, StrategyConfig(fib_tolerance_atr_mult=0.0))
+        loose = _fib_pullback_detail(frame, StrategyConfig(fib_tolerance_pct=0.01,
+                                                           fib_tolerance_atr_mult=0.0))
+
+        assert tight["pass"] is False
+        assert "outside" in tight["reason"].lower()
+        assert loose["pass"] is True
 
 
 class TestPrematureStopOut:
@@ -1898,7 +2006,8 @@ class TestBacktestControlWiring:
 
         req = BacktestRequest()
         assert req.fib_tolerance_atr_mult == 0.5
-        assert req.fib_level_mode == "zone"
+        assert req.fib_level_mode == "deep"                 # 0.5 / 0.618, not the blanket zone
+        assert req.fib_tolerance_pct == pytest.approx(0.003)  # tight floor, not 1%
         assert req.trailing_stop_enabled is True
         assert req.trailing_stop_atr_mult == 3.5
 

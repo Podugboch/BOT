@@ -82,7 +82,10 @@ _FIB_DEEP_ALIASES = ("deep", "deep_only", "deep-only", "0.5/0.618", "05_618", "0
 # The golden pocket: price has to be *between* the 0.382 and 0.618 retracements,
 # not merely within a band of one of them.
 FIB_ZONE_ALIASES = ("zone", "golden", "golden_zone", "golden-zone", "pocket", "0.382-0.618")
-DEFAULT_FIB_TOLERANCE_PCT = 0.01
+# Fallback half-band around a fib level when the config asks for 0 (or sends
+# nonsense). Kept in step with `StrategyConfig.fib_tolerance_pct`: a floor of
+# 1% accepted almost every core signal, which is the bug this value fixes.
+DEFAULT_FIB_TOLERANCE_PCT = 0.003
 DEFAULT_FIB_TOLERANCE_ATR_MULT = 0.5
 
 
@@ -184,7 +187,7 @@ def _fib_tolerance_atr_mult(cfg: StrategyConfig) -> float:
 
 def _fib_mode(cfg: StrategyConfig) -> str:
     """Normalised fib mode: 'zone', 'deep' or 'all'."""
-    mode = str(getattr(cfg, "fib_level_mode", "all") or "all").strip().lower()
+    mode = str(getattr(cfg, "fib_level_mode", "deep") or "deep").strip().lower()
     if mode in FIB_ZONE_ALIASES:
         return "zone"
     return "deep" if mode in _FIB_DEEP_ALIASES else "all"
@@ -305,8 +308,8 @@ def _nearest_fib_level(row: pd.Series, cfg: StrategyConfig):
 
 
 def _near_fib_support(curr: pd.Series, cfg: StrategyConfig) -> bool:
-    """True if price is within tolerance of the 38.2/50/61.8% retracement
-    of the recent swing — i.e. a real pullback, not a random entry point."""
+    """True if price is within tolerance of the levels selected by `fib_level_mode`
+    (0.5/0.618 by default) — i.e. a real pullback, not a random entry point."""
     return _bar_at_fib_level(curr, cfg)
 
 

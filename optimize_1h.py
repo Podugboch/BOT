@@ -1,11 +1,13 @@
 """
 Parameter sweep for the 1h edge.
 
-Runs the same backtest engine over one data window while varying only the
-Fibonacci filter (off / fixed band / ATR-scaled band, all vs deep levels) and
-the ATR trailing stop, then prints one comparison table. The point is to answer
+Runs the same backtest engine over one data window while varying the Fibonacci
+filter (off / level set / fixed vs ATR-scaled band) and the entry debounce and
+ATR trailing stop, then prints one comparison table. The point is to answer
 "does filtering entries near the 0.5/0.618 pullback beat the core signal's win
-rate *without* emptying the trade sample" with numbers instead of opinion.
+rate *without* emptying the trade sample" with numbers instead of opinion —
+and, just as importantly, "is the filter blocking anything at all": a level set
+that blocks ~none of the signals is a filter in name only.
 
 Real data (needs exchange access):
 
@@ -61,7 +63,7 @@ def synthetic_1h_series(candles: int = 17_520, seed: int = 7, start: float = 30_
 
 
 def _config(label: str, use_fib: bool, atr_mult: float, level_mode: str, trail: bool,
-            trail_atr: float = 3.5, floor_pct: float = 0.01, arm_atr: float = 1.5,
+            trail_atr: float = 3.5, floor_pct: float = 0.003, arm_atr: float = 1.5,
             debounce: int = None) -> tuple:
     cfg = BotConfig()
     cfg.exchange.timeframe = "1h"
@@ -79,17 +81,18 @@ def _config(label: str, use_fib: bool, atr_mult: float, level_mode: str, trail: 
 def sweep_configs() -> list:
     """The A/B matrix: the fib knobs only ever change the *entry* and the trail
     knobs only ever change the *exit*, so the two effects stay separable. The
-    first row is the shipped default (golden zone, arm +1.5 ATR, trail 3.5 ATR)."""
+    first row is the shipped default: the 0.5/0.618 levels, an ATR band floored
+    at 0.3%, arm +1.5 ATR, trail 3.5 ATR, 3-bar entry debounce."""
     return [
-        _config("DEFAULT zone/0.5xATR/3.5/3bar",    True,  0.5, "zone", True),
-        _config("defaults, no debounce (0 bars)",   True,  0.5, "zone", True, debounce=0),
-        _config("zone, old trail (2.0, arm 1.0)",   True,  0.5, "zone", True, trail_atr=2.0, arm_atr=1.0),
-        _config("zone, no trail",                   True,  0.5, "zone", False),
-        _config("fib OFF (core signal)",            False, 0.0, "all",  True),
-        _config("fib fixed 1% band, all",           True,  0.0, "all",  True),
-        _config("fib 0.5xATR, all levels",          True,  0.5, "all",  True),
-        _config("fib 0.5xATR, deep 0.5/0.618",      True,  0.5, "deep", True),
-        _config("zone 3.0 ATR trail",               True,  0.5, "zone", True, trail_atr=3.0),
+        _config("DEFAULT deep/0.5xATR/0.3%/3bar",   True,  0.5,  "deep", True),
+        _config("fib OFF (core signal)",            False, 0.0,  "all",  True),
+        _config("zone blanket (old default)",       True,  0.5,  "zone", True),
+        _config("all levels (loosest)",             True,  0.5,  "all",  True),
+        _config("deep, old 1% floor",               True,  0.5,  "deep", True, floor_pct=0.01),
+        _config("deep, 0.25xATR band",              True,  0.25, "deep", True),
+        _config("deep, fixed 0.3% band",            True,  0.0,  "deep", True),
+        _config("defaults, no debounce (0 bars)",   True,  0.5,  "deep", True, debounce=0),
+        _config("defaults, old trail 2.0/arm 1.0",  True,  0.5,  "deep", True, trail_atr=2.0, arm_atr=1.0),
     ]
 
 
