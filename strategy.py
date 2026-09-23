@@ -79,6 +79,9 @@ FIB_LEVEL_LABELS = {"fib_382": "0.382", "fib_500": "0.5", "fib_618": "0.618"}
 # Deeper retracements only — the pullbacks that matter in an established trend.
 FIB_DEEP_LEVEL_COLUMNS = ("fib_500", "fib_618")
 _FIB_DEEP_ALIASES = ("deep", "deep_only", "deep-only", "0.5/0.618", "05_618", "0.5_0.618")
+# The golden pocket: price has to be *between* the 0.382 and 0.618 retracements,
+# not merely within a band of one of them.
+FIB_ZONE_ALIASES = ("zone", "golden", "golden_zone", "golden-zone", "pocket", "0.382-0.618")
 DEFAULT_FIB_TOLERANCE_PCT = 0.01
 DEFAULT_FIB_TOLERANCE_ATR_MULT = 0.5
 
@@ -179,10 +182,17 @@ def _fib_tolerance_atr_mult(cfg: StrategyConfig) -> float:
     return mult if mult > 0 else 0.0
 
 
+def _fib_mode(cfg: StrategyConfig) -> str:
+    """Normalised fib mode: 'zone', 'deep' or 'all'."""
+    mode = str(getattr(cfg, "fib_level_mode", "all") or "all").strip().lower()
+    if mode in FIB_ZONE_ALIASES:
+        return "zone"
+    return "deep" if mode in _FIB_DEEP_ALIASES else "all"
+
+
 def _fib_level_columns(cfg: StrategyConfig) -> tuple:
     """Which retracement columns count as confluence for this config."""
-    mode = str(getattr(cfg, "fib_level_mode", "all") or "all").strip().lower()
-    return FIB_DEEP_LEVEL_COLUMNS if mode in _FIB_DEEP_ALIASES else FIB_LEVEL_COLUMNS
+    return FIB_DEEP_LEVEL_COLUMNS if _fib_mode(cfg) == "deep" else FIB_LEVEL_COLUMNS
 
 
 def _fib_band_pct(row: pd.Series, cfg: StrategyConfig) -> float:
@@ -216,6 +226,44 @@ def _fib_band_text(band: float, cfg: StrategyConfig) -> str:
     return f"band \u00b1{band * 100:.2f}%"
 
 
+def _fib_zone_bounds(row: pd.Series):
+    """(lower, upper) prices of the 0.382-0.618 retracement zone, or None.
+
+    Levels are measured down from the swing high, so the 0.618 level sits below
+    the 0.382 level: the zone is [fib_618, fib_382].
+    """
+    try:
+        upper = float(row["fib_382"])
+        lower = float(row["fib_618"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(upper) and math.isfinite(lower)) or lower <= 0 or upper <= 0:
+        return None
+    return (lower, upper) if lower <= upper else (upper, lower)
+
+
+def _in_fib_zone(row: pd.Series, cfg: StrategyConfig) -> bool:
+    """True when price has pulled back *into* the 0.382-0.618 zone.
+
+    This is what stops entries at the top of the crossover candle: sitting near
+    the 0.382 level is a pullback, being above it is buying the breakout. The
+    ATR band still softens the two edges so a wick that just pokes out is not
+    disqualified.
+    """
+    bounds = _fib_zone_bounds(row)
+    if bounds is None:
+        return False
+    try:
+        price = float(row["close"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not math.isfinite(price) or price <= 0:
+        return False
+    lower, upper = bounds
+    band = _fib_band_pct(row, cfg) * price       # band as an absolute price
+    return (lower - band) <= price <= (upper + band)
+
+
 def _fib_levels_available(rows: pd.DataFrame) -> bool:
     """False while the rolling swing window has not warmed up yet (no fib data)."""
     return any(col in rows.columns and pd.notna(rows[col]).any() for col in FIB_LEVEL_COLUMNS)
@@ -224,6 +272,8 @@ def _fib_levels_available(rows: pd.DataFrame) -> bool:
 def _bar_at_fib_level(row: pd.Series, cfg: StrategyConfig) -> bool:
     """True if this bar's close sits inside the percentage band around any of
     the 38.2/50/61.8% levels — a zone, never an exact-match requirement."""
+    if _fib_mode(cfg) == "zone":
+        return _in_fib_zone(row, cfg)
     nearest = _nearest_fib_level(row, cfg)
     return nearest is not None and nearest[2] <= _fib_band_pct(row, cfg)
 
@@ -280,6 +330,9 @@ def _fib_pullback_detail(df: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any
         return {"pass": True, "level": None, "distance_pct": None,
                 "reason": "no Fibonacci levels available yet (rolling swing not warmed up)"}
 
+    if _fib_mode(cfg) == "zone":
+        return _fib_zone_detail(rows, cfg)
+
     hits, nearest = [], None
     for _, row in rows.iterrows():
         candidate = _nearest_fib_level(row, cfg)
@@ -308,6 +361,48 @@ def _fib_pullback_detail(df: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any
             "reason": f"Price outside the Fibonacci {label} zone "
                       f"(nearest level ${value:,.2f} is {distance_pct * 100:.2f}% away, "
                       f"{_fib_band_text(band, cfg)})"}
+
+
+def _fib_zone_detail(rows: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any]:
+    """Verdict for golden-pocket mode: price must be inside 0.382-0.618.
+
+    Buying *at* the crossover candle means buying above the 0.382 level — the
+    breakout, not the pullback. Only a retracement into the zone counts, and the
+    reason string says which side of it the price missed on.
+    """
+    hit = None
+    last_bounds, last_price = None, None
+    for _, row in rows.iterrows():
+        bounds = _fib_zone_bounds(row)
+        if bounds is None:
+            continue
+        last_bounds = bounds
+        try:
+            last_price = float(row["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _in_fib_zone(row, cfg):
+            hit = (bounds, last_price)
+
+    if last_bounds is None:
+        return {"pass": False, "level": None, "distance_pct": None,
+                "reason": "no Fibonacci levels available for this window"}
+
+    lower, upper = last_bounds
+    zone_text = f"zone ${lower:,.2f}-${upper:,.2f} (0.618-0.382)"
+    if hit:
+        bounds, _price = hit
+        return {"pass": True, "level": "0.382-0.618", "distance_pct": None,
+                "reason": f"price pulled back into the Fibonacci {zone_text}"}
+
+    if last_price is None:
+        return {"pass": False, "level": None, "distance_pct": None,
+                "reason": "no Fibonacci levels available for this window"}
+    side = "above the 0.382 level (no pullback yet)" if last_price > upper \
+        else "below the 0.618 level (too deep)"
+    return {"pass": False, "level": "0.382-0.618", "distance_pct": None,
+            "reason": f"Price outside the Fibonacci pullback {zone_text} — "
+                      f"${last_price:,.2f} is {side}"}
 
 
 def generate_signal(

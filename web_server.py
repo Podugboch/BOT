@@ -279,9 +279,9 @@ class BacktestRequest(BaseModel):
     # Dynamic (ATR-scaled) fib band: 0 restores the fixed percentage band.
     fib_tolerance_atr_mult: float = 0.5
     fib_tolerance_pct: float = 0.01     # floor for the band (and the fixed band)
-    fib_level_mode: str = "all"         # "all" | "deep" (0.5/0.618 only)
+    fib_level_mode: str = "zone"        # "zone" (0.382-0.618) | "deep" | "all"
     trailing_stop_enabled: bool = True
-    trailing_stop_atr_mult: float = 2.0
+    trailing_stop_atr_mult: float = 3.5  # matches RiskConfig: arm late, trail wide
     risk_per_trade_pct: float = 0.01
 
     @model_validator(mode="before")
@@ -846,6 +846,19 @@ def _no_store(response: Response) -> None:
             response.headers[key] = value
 
 
+def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
+    """HTML that must never be cached, with the headers set for you.
+
+    The dashboard carries the frontend JavaScript, so a cached copy is how a
+    fixed page keeps showing the *old* bug (the JS error survives long after the
+    deploy), and the auth pages carry one-shot tokens, where a cached copy is a
+    leaked credential. Neither may come out of a cache.
+    """
+    response = HTMLResponse(content=content, status_code=status_code)
+    _no_store(response)
+    return response
+
+
 @app.get("/api/status")
 def get_status(response: Response = None):
     _no_store(response)
@@ -1318,7 +1331,7 @@ def run_backtest_endpoint(req: BacktestRequest):
         cfg.strategy.use_fib_filter = req.use_fib_filter
         cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
         cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.01
-        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "all").strip().lower()
+        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "zone").strip().lower()
         cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
         cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
         cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
@@ -1451,7 +1464,7 @@ def activate_page(token: str = Query(...)):
       {auto_script}
     </body>
     </html>"""
-    return HTMLResponse(content=html_content, status_code=200)
+    return _html_response(html_content)
 
 
 @app.get("/magic-login", response_class=HTMLResponse)
@@ -1511,7 +1524,7 @@ def magic_login_page(token: str = Query(...)):
       {auto_script}
     </body>
     </html>"""
-    return HTMLResponse(content=html_content, status_code=200)
+    return _html_response(html_content)
 
 
 @app.get("/reset-password", response_class=HTMLResponse)
@@ -1611,7 +1624,7 @@ def reset_password_page(token: str = Query(...)):
       </script>
     </body>
     </html>"""
-    return HTMLResponse(content=html_content, status_code=200)
+    return _html_response(html_content)
 
 
 # Main Dashboard HTML with integrated Auth & Exchange Key manager
@@ -2380,8 +2393,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>
               <label class="block text-slate-400 mb-1">Fib Depth</label>
               <select id="bt-fib-depth" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
-                <option value="all" selected>All (0.382 / 0.5 / 0.618)</option>
+                <option value="zone" selected>Golden zone (0.382 - 0.618)</option>
                 <option value="deep">Deep only (0.5 / 0.618)</option>
+                <option value="all">Any level (0.382 / 0.5 / 0.618)</option>
               </select>
             </div>
             <div>
@@ -2402,7 +2416,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div>
               <label class="block text-slate-400 mb-1">Trail Distance (&times; ATR)</label>
-              <input type="number" id="bt-trail-atr" value="2.0" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              <input type="number" id="bt-trail-atr" value="3.5" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
             </div>
           </div>
           <div class="text-[10px] text-slate-500">Band 0 = fixed percentage; otherwise the band is the wider of &times;ATR and the floor. 730d on 1h spans ~17,500 candles (bull, bear and chop).</div>
@@ -4426,7 +4440,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                            : 'fixed percentage band')
             : '';
           const mode = (r.fib_level_mode || 'all');
-          const levels = mode === 'deep' ? '0.5/0.618 only' : '0.382/0.5/0.618';
+          const levels = mode === 'zone' ? 'pullback into the 0.382-0.618 golden zone'
+            : (mode === 'deep' ? 'within the 0.5/0.618 band' : '0.382/0.5/0.618');
           const trail = r.trailing_stop_enabled
             ? `Trailing stop: ON, ${r.trailing_stop_atr_mult}\u00d7ATR behind the peak high.`
             : 'Trailing stop: OFF (fixed stop, reversal-signal exits).';
@@ -4774,7 +4789,7 @@ DASHBOARD_HTML = DASHBOARD_HTML.replace(
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def get_dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+    return _html_response(DASHBOARD_HTML)
 
 
 if __name__ == "__main__":

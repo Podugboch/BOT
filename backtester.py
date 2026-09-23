@@ -369,6 +369,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     results["trailing_stop_enabled"] = risk.trailing_enabled()
     results["trailing_stop_atr_mult"] = float(
         getattr(cfg.risk, "trailing_stop_atr_mult", 0.0) or 0.0)
+    results["trailing_arm_atr_mult"] = float(
+        getattr(cfg.risk, "trailing_arm_atr_mult", 0.0) or 0.0)
     results["diagnostics"] = diag
     # Flat aliases so the API/UI can read the headline numbers without digging.
     results["candles_evaluated"] = diag["candles_evaluated"]
@@ -443,13 +445,16 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--no-fib", action="store_true",
                         help="trade the core EMA/ADX/RSI signal alone")
-    parser.add_argument("--fib-mode", choices=("all", "deep"), default=None,
-                        help="fib confluence levels: all (0.382/0.5/0.618) or deep (0.5/0.618)")
+    parser.add_argument("--fib-mode", choices=("zone", "all", "deep"), default=None,
+                        help="fib entry rule: zone (pull back into 0.382-0.618, the default), "
+                             "all (any of 0.382/0.5/0.618) or deep (0.5/0.618)")
     parser.add_argument("--fib-atr-mult", type=float, default=None,
                         help="dynamic fib band as a multiple of ATR (0 = fixed percentage band)")
     parser.add_argument("--no-trail", action="store_true", help="disable the ATR trailing stop")
     parser.add_argument("--trail-atr", type=float, default=None,
-                        help="trailing-stop distance in ATRs (default 2.0)")
+                        help="trailing-stop distance in ATRs (default 3.5)")
+    parser.add_argument("--trail-arm-atr", type=float, default=None,
+                        help="profit in ATRs before the trailing stop arms (default 1.5)")
     args = parser.parse_args()
 
     cfg = BotConfig()
@@ -464,6 +469,8 @@ if __name__ == "__main__":
     cfg.risk.trailing_stop_enabled = not args.no_trail
     if args.trail_atr is not None:
         cfg.risk.trailing_stop_atr_mult = args.trail_atr
+    if args.trail_arm_atr is not None:
+        cfg.risk.trailing_arm_atr_mult = args.trail_arm_atr
 
     hist = fetch_historical(args.exchange, args.symbol, args.timeframe, args.days)
     if hist.empty:
