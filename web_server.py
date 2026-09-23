@@ -1912,6 +1912,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </header>
 
+  <!-- In-app notification. Browser alert() is ugly, cannot be dismissed from
+       the page, and dumps raw JSON in the reader's face; this shows the same
+       event as a short, styled card with the technical detail tucked away. -->
+  <div id="app-notice" class="hidden fixed z-[60] top-20 right-3 left-3 sm:left-auto sm:w-[24rem]"
+       role="status" aria-live="polite">
+    <div class="rounded-xl border border-bordercol bg-cardbg/95 backdrop-blur-md shadow-2xl p-3.5">
+      <div class="flex items-start gap-3">
+        <i id="app-notice-icon" class="fa-solid fa-circle-exclamation mt-0.5 text-amber-400"></i>
+        <div class="min-w-0 flex-1">
+          <p id="app-notice-title" class="text-sm font-semibold text-white"></p>
+          <p id="app-notice-body" class="text-xs text-slate-300 mt-1 leading-relaxed"></p>
+          <button type="button" id="app-notice-details-btn"
+                  onclick="toggleNoticeDetail()"
+                  class="hidden text-[11px] text-slate-500 hover:text-slate-300 mt-1.5 underline underline-offset-2">
+            Technical detail
+          </button>
+          <p id="app-notice-detail" class="hidden text-[10px] text-slate-500 mt-1 break-words"></p>
+        </div>
+        <button type="button" id="app-notice-close" aria-label="Dismiss notification"
+                onclick="hideNotice()"
+                class="text-slate-500 hover:text-white transition-colors">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Main Container -->
   <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-5 space-y-4 sm:space-y-5 pb-safe-main md:pb-6">
 
@@ -2970,6 +2997,134 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // candle fetcher uses. Asking deeper than this returns an empty page, not
     // more candles, so the lookback input is bounded by it.
     const BT_LOOKBACK_LIMITS = __BT_LOOKBACK_LIMITS__;
+
+    // --- In-app notifications ------------------------------------------------
+    // Errors are told to the user inside the page: a short, readable card with
+    // the raw exchange text behind a toggle. A browser alert() cannot be
+    // dismissed from the page and dumps unreadable JSON in the reader's face.
+    let noticeTimer = null;
+
+    function hideNotice() {
+      const panel = document.getElementById('app-notice');
+      if (panel) panel.classList.add('hidden');
+      if (noticeTimer) {
+        clearTimeout(noticeTimer);
+        noticeTimer = null;
+      }
+    }
+
+    function toggleNoticeDetail() {
+      const detail = document.getElementById('app-notice-detail');
+      if (!detail) return;
+      if (detail.classList.contains('hidden')) detail.classList.remove('hidden');
+      else detail.classList.add('hidden');
+    }
+
+    function showNotice(title, body, options) {
+      const opts = options || {};
+      const kind = opts.kind || 'error';
+      const look = {
+        error: ['fa-circle-exclamation', 'text-rose-400'],
+        warn: ['fa-triangle-exclamation', 'text-amber-400'],
+        success: ['fa-circle-check', 'text-emerald-400'],
+        info: ['fa-circle-info', 'text-sky-400'],
+      }[kind] || ['fa-circle-info', 'text-sky-400'];
+
+      const panel = document.getElementById('app-notice');
+      if (!panel) return;
+      const setText = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.innerText = text == null ? '' : String(text);
+      };
+      const icon = document.getElementById('app-notice-icon');
+      if (icon) icon.className = 'fa-solid ' + look[0] + ' mt-0.5 ' + look[1];
+      setText('app-notice-title', title);
+      setText('app-notice-body', body);
+
+      // The raw text is available, collapsed, so the card stays short.
+      const button = document.getElementById('app-notice-details-btn');
+      const detail = document.getElementById('app-notice-detail');
+      if (button && detail) {
+        setText('app-notice-detail', opts.detail || '');
+        if (opts.detail) button.classList.remove('hidden');
+        else button.classList.add('hidden');
+        detail.classList.add('hidden');
+      }
+      panel.classList.remove('hidden');
+
+      if (noticeTimer) {
+        clearTimeout(noticeTimer);
+        noticeTimer = null;
+      }
+      // Errors wait to be dismissed; anything else fades on its own.
+      const ms = opts.timeout === undefined ? (kind === 'error' ? 0 : 7000) : opts.timeout;
+      if (ms > 0) {
+        noticeTimer = setTimeout(hideNotice, ms);
+        // Never hold a Node test process open (no-op in the browser).
+        if (noticeTimer && noticeTimer.unref) noticeTimer.unref();
+      }
+    }
+
+    // Raw exchange errors are walls of JSON. Keep the first useful sentence.
+    function firstUsefulLine(text) {
+      const line = String(text == null ? '' : text)
+        .split('{')[0]
+        .split('\\n')[0]
+        .replace(/\\s+/g, ' ')
+        .replace(/^(binance|mexc|kraken|coinbase|kucoin|bybit|okx|bitget|gateio|bitfinex|cryptocom|htx)\\s+/i, '')
+        .trim();
+      return line.length > 160 ? line.slice(0, 157).trimEnd() + '…' : line;
+    }
+
+    // One short, actionable sentence per failure mode, so the card never shows
+    // a raw ccxt blob. `detail` carries that blob for the toggle.
+    function describeBacktestError(err) {
+      const raw = String((err && err.message) || 'Unknown error').trim();
+      const text = raw.toLowerCase();
+      const venue = (document.getElementById('bt-exchange') || {}).value || 'binance';
+      const name = venue.charAt(0).toUpperCase() + venue.slice(1);
+      const symbol = (document.getElementById('bt-symbol') || {}).value || 'That pair';
+      const detail = raw.length > 400 ? raw.slice(0, 400) + '…' : raw;
+
+      if (text.includes('restricted location') || text.includes('451') || text.includes('eligibility')) {
+        return { title: name + ' is not available in this region',
+                 body: 'This server sits in a restricted region, so ' + name + ' refuses the request. ' +
+                       'Try Kraken, Bybit, KuCoin or OKX instead.',
+                 detail: detail };
+      }
+      if (text.includes('rate limit') || text.includes('429') || text.includes('too many requests')) {
+        return { title: name + ' is rate-limiting this run',
+                 body: 'Too many requests in a row. Give it a minute, then run the backtest again.',
+                 detail: detail };
+      }
+      if (text.includes('insufficient historical bars')) {
+        // The server appends the venue's real storage limit after the colon.
+        const tail = raw.split(/insufficient historical bars[^:]*:\\s*/i)[1];
+        return { title: 'Not enough history for that window',
+                 body: (tail || '').trim() ||
+                       'The exchange had no candles that far back. Shorten the lookback and try again.',
+                 detail: detail };
+      }
+      if (text.includes('timeout') || text.includes('timed out') || text.includes('network') ||
+          text.includes('econn') || text.includes('getaddrinfo') || text.includes('fetch failed')) {
+        return { title: 'Could not reach ' + name,
+                 body: 'The request timed out or was blocked. Check the connection and try again.',
+                 detail: detail };
+      }
+      if (text.includes('bad symbol') || text.includes('does not have market symbol')) {
+        return { title: symbol + ' is not listed on ' + name,
+                 body: 'This exchange does not trade that pair. Choose another symbol and run the backtest again.',
+                 detail: detail };
+      }
+      if (text.includes('unsupported exchange')) {
+        return { title: 'That exchange is not supported',
+                 body: 'Pick one from the exchange list, then run the backtest again.',
+                 detail: detail };
+      }
+      return { title: 'Backtest could not run',
+               body: firstUsefulLine(raw) || 'Something went wrong on the way to the exchange.',
+               detail: detail };
+    }
 
     // --- Exchange Meta & Selection ---
     async function loadExchanges() {
@@ -4406,11 +4561,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.detail || 'Backtest failed');
+        // A proxy or gateway can answer with HTML, so a parse failure is an
+        // ordinary outcome here, not an exception to leak to the console.
+        let data = null;
+        try { data = await res.json(); } catch (parseErr) { data = null; }
+        const detail = data && data.detail;
+        if (!data || !data.success) {
+          throw new Error(typeof detail === 'string' && detail.trim()
+            ? detail
+            : `The backtest service answered HTTP ${res.status}.`);
+        }
 
         const r = data.results;
         document.getElementById('bt-results-box').classList.remove('hidden');
+        hideNotice();   // a successful run clears any error still on screen
         const retEl = document.getElementById('bt-res-return');
         retEl.innerText = (r.total_return_pct >= 0 ? '+' : '') + r.total_return_pct + '%';
         retEl.className = r.total_return_pct >= 0 ? 'font-bold text-emerald-400' : 'font-bold text-rose-400';
@@ -4468,7 +4632,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         }
       } catch (err) {
-        alert('Backtest error: ' + err.message);
+        // Say it inside the page in one short sentence; the raw exchange text
+        // stays one tap away instead of being dumped by a browser alert().
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        // Stale numbers from an earlier run must not read as this run's result.
+        const stale = document.getElementById('bt-results-box');
+        if (stale) stale.classList.add('hidden');
       } finally {
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-play"></i> Run Historical Backtest';

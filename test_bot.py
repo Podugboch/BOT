@@ -2225,7 +2225,8 @@ def _dashboard_function(name: str) -> str:
     """Source of one declared function from the dashboard script.
 
     Brace-matched from the signature; enough to lift a handler out of the page
-    and run it on its own.
+    and run it on its own. Braces inside strings, template literals and
+    comments do not count, so a handler that quotes a JSON `{` still extracts.
     """
     src = _dashboard_script()
     match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", src)
@@ -2233,13 +2234,39 @@ def _dashboard_function(name: str) -> str:
     start = match.start()          # keep the `async` keyword, or `await` is illegal
     open_brace = src.index("{", start)
     depth = 0
-    for index in range(open_brace, len(src)):
-        if src[index] == "{":
+    quote = None                   # "'", '"' or "`" while inside a literal
+    comment = None                 # "line" or "block" while inside a comment
+    index = open_brace
+    while index < len(src):
+        char = src[index]
+        nxt = src[index + 1] if index + 1 < len(src) else ""
+        if comment == "line":
+            if char == "\n":
+                comment = None
+        elif comment == "block":
+            if char == "*" and nxt == "/":
+                comment = None
+                index += 1
+        elif quote:
+            if char == "\\":
+                index += 1         # the next character is escaped
+            elif char == quote:
+                quote = None
+        elif char == "/" and nxt == "/":
+            comment = "line"
+            index += 1
+        elif char == "/" and nxt == "*":
+            comment = "block"
+            index += 1
+        elif char in "\"'`":
+            quote = char
+        elif char == "{":
             depth += 1
-        elif src[index] == "}":
+        elif char == "}":
             depth -= 1
             if depth == 0:
                 return src[start:index + 1]
+        index += 1
     raise AssertionError(f"unbalanced braces while extracting {name}")
 
 
@@ -2253,9 +2280,15 @@ def _backtest_js_source() -> str:
     assert limits, "the limits table is not in the page"
     return (
         "const BT_LOOKBACK_LIMITS = " + limits.group(1) + ";\n"
+        + "let noticeTimer = null;\n"
         + _dashboard_function("setBacktestDays") + "\n"
         + _dashboard_function("backtestDayLimit") + "\n"
         + _dashboard_function("applyTimeframeLimits") + "\n"
+        + _dashboard_function("hideNotice") + "\n"
+        + _dashboard_function("toggleNoticeDetail") + "\n"
+        + _dashboard_function("showNotice") + "\n"
+        + _dashboard_function("firstUsefulLine") + "\n"
+        + _dashboard_function("describeBacktestError") + "\n"
         + _dashboard_function("executeBacktest")
     )
 
@@ -2297,7 +2330,10 @@ globalThis.document = { getElementById: el, createElement: () => makeEl('x') };
 globalThis.alert = (m) => { throw new Error('alert(): ' + m); };
 globalThis.fetch = async (url, opts) => {
   globalThis.__posted = JSON.parse(opts.body);
-  return { ok: true, status: 200, json: async () => apiPayload };
+  // A payload can opt into a failure envelope via `__status`, so the error
+  // path runs in the same engine (and with the same stub DOM) as the happy one.
+  const status = apiPayload.__status || 200;
+  return { ok: status >= 200 && status < 300, status, json: async () => apiPayload };
 };
 
 for (const [id, val] of Object.entries(form)) {
@@ -2326,6 +2362,13 @@ executeBacktest.executeBacktest({ preventDefault() {} }).then(() => {
     daysMax: el('bt-days').max,
     resultsHidden: el('bt-results-box').classList.contains('hidden'),
     buttonDisabled: el('btn-run-bt').disabled,
+    noticeHidden: el('app-notice').classList.contains('hidden'),
+    noticeTitle: el('app-notice-title').innerText,
+    noticeBody: el('app-notice-body').innerText,
+    noticeDetail: el('app-notice-detail').innerText,
+    noticeDetailHidden: el('app-notice-detail').classList.contains('hidden'),
+    noticeDetailBtnHidden: el('app-notice-details-btn').classList.contains('hidden'),
+    noticeIcon: el('app-notice-icon').className,
   }));
 }).catch((err) => {
   console.log('FAILED: ' + err.name + ': ' + err.message);
@@ -2367,13 +2410,15 @@ class TestDashboardBacktestRuntime:
     """
 
     @staticmethod
-    def _run_harness(tmp_path, function_name="executeBacktest"):
+    def _run_harness(tmp_path, function_name="executeBacktest", payload=None,
+                     form=None):
         node = shutil.which("node")
         if not node:
             pytest.skip("node is not installed; JS runtime check skipped")
         (tmp_path / "fn.js").write_text(_backtest_js_source())
-        (tmp_path / "form.json").write_text(json.dumps(_BACKTEST_FORM_VALUES))
-        (tmp_path / "api.json").write_text(json.dumps(_BACKTEST_API_PAYLOAD))
+        (tmp_path / "form.json").write_text(json.dumps(form or _BACKTEST_FORM_VALUES))
+        (tmp_path / "api.json").write_text(json.dumps(
+            _BACKTEST_API_PAYLOAD if payload is None else payload))
         (tmp_path / "harness.js").write_text(_JS_BACKTEST_HARNESS)
         proc = subprocess.run(
             [node, str(tmp_path / "harness.js"), str(tmp_path / "fn.js"),
@@ -2438,3 +2483,117 @@ class TestDashboardBacktestRuntime:
         guarded = {"configured-keys-list"}
 
         assert used - declared - guarded == set()
+
+
+class TestInAppNotice:
+    """A failed backtest is explained inside the page, not by a browser alert().
+
+    The deployed dashboard answered a blocked exchange with
+    `alert('Backtest error: ' + err.message)`, which dumped a wall of ccxt JSON
+    into a modal the user can neither style nor dismiss from the page.
+    """
+
+    # Copied from the reported console output in the screenshot.
+    BINANCE_451 = (
+        "binance GET https://api.binance.com/api/v3/exchangeInfo 451 "
+        '{"code": 0, "msg": "Service unavailable from a restricted location '
+        "according to 'b. Eligibility' in https://www.binance.com/en/terms. "
+        'Please contact customer service if you believe you received this message '
+        'in error."}'
+    )
+
+    def test_notice_markup_is_present_and_accessible(self):
+        html = web_server_dashboard_html()
+
+        for element_id in ("app-notice", "app-notice-icon", "app-notice-title",
+                           "app-notice-body", "app-notice-detail",
+                           "app-notice-details-btn", "app-notice-close"):
+            assert f'id="{element_id}"' in html, element_id
+        assert 'role="status"' in html
+        assert 'aria-live="polite"' in html
+        # The card stays out of the way until it actually has news.
+        assert 'id="app-notice" class="hidden' in html
+
+    def test_backtest_handler_no_longer_calls_alert(self):
+        src = _dashboard_function("executeBacktest")
+        code = re.sub(r"//[^\n]*", "", src)      # comments may still say alert()
+
+        assert "alert(" not in code
+        assert "showNotice(" in src
+        assert "describeBacktestError(" in src
+
+    def test_the_whole_served_script_is_valid_javascript(self, tmp_path):
+        """One bad escape kills every handler on the page, not just its own.
+
+        The inline script is served out of a Python string, so writing a bare
+        `\n` where the page needed a literal backslash-n drops a raw newline
+        inside a string literal and the whole dashboard stops parsing.
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; JS runtime check skipped")
+        script = tmp_path / "dashboard.js"
+        script.write_text(_dashboard_script())
+        proc = subprocess.run([node, "--check", str(script)],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_blocked_region_reads_as_one_short_sentence(self, tmp_path):
+        """The 451 wall becomes a title, a suggestion, and a hidden detail."""
+        out = TestDashboardBacktestRuntime._run_harness(
+            tmp_path, payload={"__status": 500, "detail": self.BINANCE_451})
+
+        assert out["noticeHidden"] is False
+        assert out["noticeTitle"] == "Binance is not available in this region"
+        assert "Kraken" in out["noticeBody"]
+        assert "451" not in out["noticeBody"]          # no raw JSON up front
+        assert "b. Eligibility" not in out["noticeBody"]
+        assert len(out["noticeBody"]) <= 200           # a sentence, not a paragraph
+        # The raw text is kept, but collapsed behind "Technical detail".
+        assert "b. Eligibility" in out["noticeDetail"]
+        assert out["noticeDetailHidden"] is True
+        assert out["noticeDetailBtnHidden"] is False
+        assert "text-rose-400" in out["noticeIcon"]
+        # No stale numbers from an earlier run are left on screen.
+        assert out["resultsHidden"] is True
+        assert out["buttonDisabled"] is False
+
+    def test_unknown_failure_still_says_something_readable(self, tmp_path):
+        out = TestDashboardBacktestRuntime._run_harness(
+            tmp_path, payload={"__status": 502, "detail": "Bad Gateway"})
+
+        assert out["noticeHidden"] is False
+        assert out["noticeTitle"] == "Backtest could not run"
+        assert out["noticeBody"] == "Bad Gateway"
+        assert out["noticeDetail"] == "Bad Gateway"
+        assert out["resultsHidden"] is True
+
+    def test_a_good_run_clears_any_error_card(self, tmp_path):
+        """A successful run must not leave the previous failure on screen."""
+        out = TestDashboardBacktestRuntime._run_harness(tmp_path)
+
+        assert out["noticeHidden"] is True
+        assert out["resultsHidden"] is False
+
+    def test_non_json_error_page_is_still_explained(self, tmp_path):
+        """A gateway that answers with HTML must not leak a JSON parse error."""
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; JS runtime check skipped")
+        (tmp_path / "fn.js").write_text(_backtest_js_source())
+        (tmp_path / "form.json").write_text(json.dumps(_BACKTEST_FORM_VALUES))
+        (tmp_path / "api.json").write_text('"<html>502 Bad Gateway</html>"')
+        harness = _JS_BACKTEST_HARNESS.replace(
+            "json: async () => apiPayload", "json: async () => { throw new SyntaxError('Unexpected token <'); }")
+        (tmp_path / "harness.js").write_text(harness)
+        proc = subprocess.run(
+            [node, str(tmp_path / "harness.js"), str(tmp_path / "fn.js"),
+             str(tmp_path / "form.json"), str(tmp_path / "api.json")],
+            capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"node failed:\n{proc.stdout}\n{proc.stderr}"
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        assert out["noticeHidden"] is False
+        assert out["noticeTitle"] == "Backtest could not run"
+        assert "HTTP 200" in out["noticeBody"] or "Unexpected token" in out["noticeDetail"]
+        assert out["resultsHidden"] is True
