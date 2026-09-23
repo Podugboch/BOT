@@ -278,8 +278,8 @@ class BacktestRequest(BaseModel):
     use_fib_filter: bool = True
     # Dynamic (ATR-scaled) fib band: 0 restores the fixed percentage band.
     fib_tolerance_atr_mult: float = 0.5
-    fib_tolerance_pct: float = 0.01     # floor for the band (and the fixed band)
-    fib_level_mode: str = "zone"        # "zone" (0.382-0.618) | "deep" | "all"
+    fib_tolerance_pct: float = 0.003    # floor for the band (and the fixed band)
+    fib_level_mode: str = "deep"        # "deep" (0.5/0.618) | "zone" (0.382-0.618) | "all"
     trailing_stop_enabled: bool = True
     trailing_stop_atr_mult: float = 3.5  # matches RiskConfig: arm late, trail wide
     # Entry debounce: candles required between one trade's exit and the next
@@ -1333,8 +1333,8 @@ def run_backtest_endpoint(req: BacktestRequest):
         cfg.starting_equity = starting_equity
         cfg.strategy.use_fib_filter = req.use_fib_filter
         cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
-        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.01
-        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "zone").strip().lower()
+        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
+        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "deep").strip().lower()
         cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
         cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
         # None keeps the timeframe-derived default; an explicit 0 disables it.
@@ -2399,8 +2399,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>
               <label class="block text-slate-400 mb-1">Fib Depth</label>
               <select id="bt-fib-depth" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
-                <option value="zone" selected>Golden zone (0.382 - 0.618)</option>
-                <option value="deep">Deep only (0.5 / 0.618)</option>
+                <option value="deep" selected>Key levels (0.5 / 0.618)</option>
+                <option value="zone">Golden zone (0.382 - 0.618)</option>
                 <option value="all">Any level (0.382 / 0.5 / 0.618)</option>
               </select>
             </div>
@@ -2410,7 +2410,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div>
               <label class="block text-slate-400 mb-1">Band Floor (%)</label>
-              <input type="number" id="bt-fib-floor" value="1.0" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              <input type="number" id="bt-fib-floor" value="0.3" min="0" step="0.1" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
             </div>
             <div></div>
           </div>

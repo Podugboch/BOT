@@ -53,24 +53,28 @@ class StrategyConfig:
     # rolling swing highs/lows, no manual line-drawing required.
     use_fib_filter: bool = True
     fib_lookback: int = 50          # bars used to find the swing high/low
-    # Price counts as "at" a level inside this band. 0.5% proved too tight to
-    # ever line up with a fresh crossover; tune within ~1.0%-1.5% (0.01-0.015)
-    # to trade pullbacks without forcing a perfect touch.
-    fib_tolerance_pct: float = 0.01
+    # Price counts as "at" a level inside this band. 1% was measured accepting
+    # essentially every core signal — price had to miss the level by more than a
+    # full percent before the filter said no — so the floor is 0.3% and price
+    # has to actually test the retracement line.
+    fib_tolerance_pct: float = 0.003
     # Dynamic band: instead of a rigid percentage the tolerance scales with
     # volatility — a bar whose close is within `fib_tolerance_atr_mult * ATR`
     # of a level (0.5 * ATR by default) counts as a pullback. The percentage
     # above stays as the floor (and the fallback when ATR is missing), so a calm
     # tape cannot starve the strategy down to a handful of trades. 0 = fixed band.
     fib_tolerance_atr_mult: float = 0.5
-    # Where an entry has to be, relative to the retracement:
-    #   "zone" — inside the 0.382-0.618 golden pocket (the default). Buying at
-    #            the crossover candle means buying above the 0.382 level, i.e.
-    #            the breakout rather than the pullback, so the entry waits for
-    #            price to actually retrace into the zone.
-    #   "deep" — within the band of the 0.5 or 0.618 level.
-    #   "all"  — within the band of any of 0.382/0.5/0.618.
-    fib_level_mode: str = "zone"
+    # Which retracement levels an entry has to test, and therefore what the
+    # filter is really doing:
+    #   "deep" — within the band of the 0.5 or 0.618 level (the default). These
+    #            are the reversal levels a pullback actually turns on, and a
+    #            test of one of them is a tight, checkable condition.
+    #   "zone" — anywhere inside the 0.382-0.618 pocket. Measured against real
+    #            signals this accepted ~96% of them: the pocket spans a big part
+    #            of the swing range, and with the band on top it covers almost
+    #            the whole price spread, so it filters almost nothing.
+    #   "all"  — within the band of any of 0.382/0.5/0.618 (loosest).
+    fib_level_mode: str = "deep"
     fib_touch_window: int = 3       # bars back that may hold the pullback touch
     # Bars back that may hold the EMA crossover: 1 reproduces the old strict
     # "cross on this candle" rule, 3 lets a fresh trend stay entry-eligible
