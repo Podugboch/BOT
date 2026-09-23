@@ -278,6 +278,17 @@ class BacktestRequest(BaseModel):
     use_fib_filter: bool = True
     risk_per_trade_pct: float = 0.01
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_fib_filter_alias(cls, values):
+        """Accept `enable_fib_filter` (the label on the UI checkbox) as an
+        alias for `use_fib_filter`; an explicit `use_fib_filter` still wins."""
+        if isinstance(values, dict) and "use_fib_filter" not in values:
+            alias = values.get("enable_fib_filter")
+            if alias is not None:
+                values["use_fib_filter"] = alias
+        return values
+
 
 class EmailSettingsRequest(BaseModel):
     provider: Optional[str] = "gmail"
@@ -2291,6 +2302,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Avg Loss: <span id="bt-res-avgloss" class="font-semibold text-red-400">$0</span></div>
             <div class="col-span-2">Max Drawdown: <span id="bt-res-drawdown" class="font-semibold text-amber-400">0%</span></div>
           </div>
+          <div class="grid grid-cols-2 gap-2 text-[11px] border-t border-bordercol/60 pt-1.5">
+            <div>Candles evaluated: <span id="bt-res-candles" class="font-semibold text-white">0</span></div>
+            <div>Raw signals: <span id="bt-res-raw" class="font-semibold text-white">0</span></div>
+            <div>Fib blocked: <span id="bt-res-fibblocked" class="font-semibold text-amber-400">0</span></div>
+            <div>Sizing/risk blocked: <span id="bt-res-blocked" class="font-semibold text-amber-400">0</span></div>
+          </div>
+          <div id="bt-res-fib-note" class="text-[10px] text-slate-400">--</div>
+          <div id="bt-res-window" class="text-[10px] text-slate-400">Window: --</div>
+          <details class="text-[10px] text-slate-400">
+            <summary class="cursor-pointer hover:text-slate-200">Run report / rejection detail (copyable)</summary>
+            <textarea id="bt-res-report" readonly rows="7" class="w-full mt-1 bg-slate-950 border border-bordercol rounded p-1.5 text-slate-300 font-mono text-[10px]"></textarea>
+          </details>
         </div>
       </div>
     </div>
@@ -4138,6 +4161,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('bt-res-avgwin').innerText = '$' + r.avg_win;
         document.getElementById('bt-res-avgloss').innerText = '$' + r.avg_loss;
         document.getElementById('bt-res-drawdown').innerText = r.max_drawdown_pct + '%';
+        const fibNote = document.getElementById('bt-res-fib-note');
+        const diag = r.diagnostics || {};
+        const setIf = (id, value) => { const el = document.getElementById(id); if (el) el.innerText = value; };
+        setIf('bt-res-candles', (r.candles_tested ?? r.candles_evaluated ?? diag.candles_evaluated ?? 0).toLocaleString());
+        const range = (r.date_range || []).filter(Boolean);
+        setIf('bt-res-window', range.length === 2
+          ? 'Window: ' + (r.candles_tested ?? 0).toLocaleString() + ' candles ' + range[0] + ' \u2192 ' + range[1]
+          : 'Window: --');
+        setIf('bt-res-raw', (r.raw_signals ?? 0).toLocaleString());
+        setIf('bt-res-fibblocked', (diag.fib_filter_blocked || 0).toLocaleString());
+        setIf('bt-res-blocked', ((diag.sizing_blocked || 0) + (diag.signals_risk_blocked || 0)).toLocaleString());
+        const reportEl = document.getElementById('bt-res-report');
+        if (reportEl) reportEl.value = diag.report || 'No pipeline diagnostics returned for this run.';
+        if (fibNote) {
+          if (r.fib_filter_enabled) {
+            fibNote.innerText = 'Fibonacci Zone Filter: ON — ' + (r.fib_blocked_signals || 0) +
+              ' core signal(s) skipped because price was not near a fib level.';
+          } else {
+            fibNote.innerText = 'Fibonacci Zone Filter: OFF — entries taken on the core EMA/ADX/RSI signal alone.';
+          }
+        }
       } catch (err) {
         alert('Backtest error: ' + err.message);
       } finally {

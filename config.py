@@ -52,7 +52,15 @@ class StrategyConfig:
     # rolling swing highs/lows, no manual line-drawing required.
     use_fib_filter: bool = True
     fib_lookback: int = 50          # bars used to find the swing high/low
-    fib_tolerance_pct: float = 0.005  # price counts as "at" a level within 0.5%
+    # Price counts as "at" a level inside this band. 0.5% proved too tight to
+    # ever line up with a fresh crossover; tune within ~1.0%-1.5% (0.01-0.015)
+    # to trade pullbacks without forcing a perfect touch.
+    fib_tolerance_pct: float = 0.01
+    fib_touch_window: int = 3       # bars back that may hold the pullback touch
+    # Bars back that may hold the EMA crossover: 1 reproduces the old strict
+    # "cross on this candle" rule, 3 lets a fresh trend stay entry-eligible
+    # while price works its way back into the fib zone.
+    ema_cross_window: int = 3
 
     # Volatility & Momentum indicator parameters
     bb_period: int = 20
@@ -126,4 +134,3 @@ class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
-

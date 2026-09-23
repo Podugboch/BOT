@@ -6,8 +6,9 @@ Configurable multi-strategy engine with technical indicators:
 4. MACD Signal Line Crossover
 5. Bollinger Bands Volatility Breakout
 """
+import math
 from enum import Enum
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
@@ -73,18 +74,208 @@ def add_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     return pd.concat([df, fib, bb, m], axis=1)
 
 
+FIB_LEVEL_COLUMNS = ("fib_382", "fib_500", "fib_618")
+FIB_LEVEL_LABELS = {"fib_382": "0.382", "fib_500": "0.5", "fib_618": "0.618"}
+DEFAULT_FIB_TOLERANCE_PCT = 0.01
+
+
+def _record(diagnostics: Optional[Dict[str, Any]], **stages) -> None:
+    """Attach pipeline-stage detail for callers that need to explain a HOLD."""
+    if diagnostics is not None:
+        diagnostics.update(stages)
+
+
+def _num(value) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _core_reason(cross: bool, trending: bool, rsi_ok: bool, curr: pd.Series,
+                 cfg: StrategyConfig, label: str,
+                 cross_text: Optional[str] = None) -> str:
+    """Stage-1 detail: which core-indicator condition is met (or is not)."""
+    if not cross:
+        return cross_text or f"no fresh {label} trigger on this candle"
+    if not trending:
+        return f"ADX {_num(curr.get('adx'))} below the {cfg.adx_trend_threshold} trend threshold"
+    if not rsi_ok:
+        return f"RSI {_num(curr.get('rsi'))} at/above the {cfg.rsi_overbought} overbought limit"
+    return f"{label} trigger, trend strength and RSI bounds all satisfied"
+
+
+def _core_miss(cross: bool, trending: bool, rsi_ok: bool, cross_key: str) -> Optional[str]:
+    """Machine-readable stage-1 rejection key, or None when the stage passed."""
+    if not cross:
+        return cross_key
+    if not trending:
+        return "adx_filter"
+    if not rsi_ok:
+        return "rsi_overbought"
+    return None
+
+
+def _recent_bullish_cross(df: pd.DataFrame, window: int):
+    """(crossed, bars_ago) for the newest bullish EMA cross within `window` bars.
+
+    bars_ago == 0 means the cross happened on the current candle. Allowing a
+    small window is what decouples the entry from the old "the crossover bar
+    must itself touch the fib zone" rule: the trend can still be fresh a few
+    bars later while price works back into the zone.
+    """
+    window = max(1, int(window or 1))
+    rows = df.tail(window + 1)
+    if len(rows) < 2 or "ema_fast" not in rows.columns or "ema_slow" not in rows.columns:
+        return False, None
+    fast = rows["ema_fast"].to_numpy(dtype=float)
+    slow = rows["ema_slow"].to_numpy(dtype=float)
+    for offset in range(1, len(rows)):
+        index = len(rows) - offset
+        if fast[index - 1] <= slow[index - 1] and fast[index] > slow[index]:
+            return True, offset - 1
+    return False, None
+
+
+def _ema_cross_text(crossed: bool, bars_ago, still_bullish: bool, window: int) -> str:
+    if not crossed:
+        return (f"no EMA crossover in the last {window} bar(s)" if window > 1
+                else "no fresh EMA crossover on this candle")
+    if not still_bullish:
+        return "EMA fast line has fallen back below the slow line since the cross"
+    when = "on this candle" if not bars_ago else f"{bars_ago} bar(s) ago"
+    return f"EMA bullish crossover {when} (trend still active)"
+
+
+def _ema_cross_window(cfg: StrategyConfig) -> int:
+    """Bars back that may still hold the EMA crossover (1 == strict)."""
+    try:
+        window = int(getattr(cfg, "ema_cross_window", 1) or 1)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, window)
+
+
+def _fib_tolerance_pct(cfg: StrategyConfig) -> float:
+    """Zero/negative/missing tolerance would degrade the filter into an exact
+    price match (which almost never happens) — fall back to a sane band."""
+    try:
+        tolerance = float(getattr(cfg, "fib_tolerance_pct", DEFAULT_FIB_TOLERANCE_PCT))
+    except (TypeError, ValueError):
+        return DEFAULT_FIB_TOLERANCE_PCT
+    return tolerance if tolerance > 0 else DEFAULT_FIB_TOLERANCE_PCT
+
+
+def _fib_levels_available(rows: pd.DataFrame) -> bool:
+    """False while the rolling swing window has not warmed up yet (no fib data)."""
+    return any(col in rows.columns and pd.notna(rows[col]).any() for col in FIB_LEVEL_COLUMNS)
+
+
+def _bar_at_fib_level(row: pd.Series, cfg: StrategyConfig) -> bool:
+    """True if this bar's close sits inside the percentage band around any of
+    the 38.2/50/61.8% levels — a zone, never an exact-match requirement."""
+    nearest = _nearest_fib_level(row, cfg)
+    return nearest is not None and nearest[2] <= _fib_tolerance_pct(cfg)
+
+
+def _nearest_fib_level(row: pd.Series, cfg: StrategyConfig):
+    """(label, value, distance_pct) for the closest of the three fib levels."""
+    try:
+        price = float(row["close"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+
+    nearest = None
+    for col in FIB_LEVEL_COLUMNS:
+        level = row.get(col)
+        if level is None:
+            continue
+        try:
+            level = float(level)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(level):
+            continue
+        distance_pct = abs(price - level) / price
+        if nearest is None or distance_pct < nearest[2]:
+            nearest = (FIB_LEVEL_LABELS.get(col, col), level, distance_pct)
+    return nearest
+
+
 def _near_fib_support(curr: pd.Series, cfg: StrategyConfig) -> bool:
     """True if price is within tolerance of the 38.2/50/61.8% retracement
     of the recent swing — i.e. a real pullback, not a random entry point."""
-    price = curr["close"]
-    tolerance = price * cfg.fib_tolerance_pct
-    levels = (curr["fib_382"], curr["fib_500"], curr["fib_618"])
-    return any(pd.notna(level) and abs(price - level) <= tolerance for level in levels)
+    return _bar_at_fib_level(curr, cfg)
 
 
-def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) -> Signal:
+def _fib_pullback_ok(df: pd.DataFrame, cfg: StrategyConfig) -> bool:
+    """Pullback confluence over the last `fib_touch_window` bars.
+
+    A single-bar test starves the strategy: the bar that produces a fresh EMA
+    cross is rarely the same bar that tags a fib level. Allowing a recent touch
+    keeps the "pullback into support" meaning while letting the core signal
+    fire. `fib_touch_window = 1` reproduces the original single-bar behaviour.
+    """
+    return _fib_pullback_detail(df, cfg)["pass"]
+
+
+def _fib_pullback_detail(df: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any]:
+    """Stage-2 verdict: did price reach a fib zone, and if not, exactly why."""
+    window = max(1, int(getattr(cfg, "fib_touch_window", 1) or 1))
+    rows = df.tail(window)
+    band_pct = _fib_tolerance_pct(cfg) * 100
+
+    if not _fib_levels_available(rows):
+        return {"pass": True, "level": None, "distance_pct": None,
+                "reason": "no Fibonacci levels available yet (rolling swing not warmed up)"}
+
+    hits, nearest = [], None
+    for _, row in rows.iterrows():
+        candidate = _nearest_fib_level(row, cfg)
+        if candidate is None:
+            continue
+        if nearest is None or candidate[2] < nearest[2]:
+            nearest = candidate
+        if candidate[2] * 100 <= band_pct:
+            hits.append(candidate)
+
+    if hits:
+        label, value, distance_pct = min(hits, key=lambda hit: hit[2])
+        return {"pass": True, "level": label, "distance_pct": distance_pct,
+                "reason": f"price tagged the Fibonacci {label} zone "
+                          f"(${value:,.2f}, {distance_pct * 100:.2f}% away, band \u00b1{band_pct:.2f}%)"}
+    if nearest is None:
+        return {"pass": False, "level": None, "distance_pct": None,
+                "reason": "no Fibonacci levels available for this window"}
+
+    label, value, distance_pct = nearest
+    return {"pass": False, "level": label, "distance_pct": distance_pct,
+            "reason": f"Price outside the Fibonacci {label} zone "
+                      f"(nearest level ${value:,.2f} is {distance_pct * 100:.2f}% away, band \u00b1{band_pct:.2f}%)"}
+
+
+def generate_signal(
+    df: pd.DataFrame,
+    cfg: StrategyConfig,
+    position_open: bool,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Signal:
     """
     df must already have indicators (see add_indicators) and at least 2 rows.
+
+    Pass a `diagnostics` dict to have the entry pipeline stages recorded in it,
+    which is how the backtester and the live bot explain why a signal did not
+    turn into a trade. Keys set on entry evaluations:
+
+        core_signal   "BUY" when the core indicators fired, else None
+        core_trigger  stage 1: bool
+        core_reason   human-readable stage-1 detail
+        fib_evaluated stage 2 ran at all (filter enabled + core trigger)
+        fib_pass      stage 2: bool, or None when not evaluated
+        fib_reason    human-readable stage-2 detail
+        rejected_by   machine-readable rule key, or None when nothing blocked
     """
     if len(df) < 2:
         return Signal.HOLD
@@ -94,12 +285,26 @@ def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) 
 
     # 1. Pure Trend Momentum (EMA Cross without Fib requirement)
     if strat == "pure_ema_cross":
-        trending = curr["adx"] >= cfg.adx_trend_threshold
-        bullish_cross = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
+        trending = bool(curr["adx"] >= cfg.adx_trend_threshold)
+        cross_window = _ema_cross_window(cfg)
+        crossed, bars_ago = _recent_bullish_cross(df, cross_window)
+        still_bullish = bool(curr["ema_fast"] > curr["ema_slow"])
+        bullish_cross = bool(crossed and still_bullish)
+        cross_text = _ema_cross_text(crossed, bars_ago, still_bullish, cross_window)
         bearish_cross = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
 
         if not position_open:
-            if bullish_cross and trending and curr["rsi"] < cfg.rsi_overbought:
+            rsi_ok = bool(curr["rsi"] < cfg.rsi_overbought)
+            core_setup = bool(bullish_cross and trending and rsi_ok)
+            _record(diagnostics,
+                    core_signal="BUY" if core_setup else None,
+                    core_trigger=core_setup,
+                    core_reason=_core_reason(bullish_cross, trending, rsi_ok, curr, cfg, "EMA",
+                                             cross_text),
+                    ema_cross_bars_ago=bars_ago,
+                    fib_evaluated=False, fib_pass=None, fib_reason=None,
+                    rejected_by=_core_miss(bullish_cross, trending, rsi_ok, "no_ema_cross"))
+            if core_setup:
                 return Signal.BUY
             return Signal.HOLD
         if bearish_cross or curr["rsi"] > cfg.rsi_overbought + 10:
@@ -112,7 +317,15 @@ def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) 
         curr_rsi = float(curr["rsi"]) if pd.notna(curr["rsi"]) else 50.0
 
         if not position_open:
-            if (prev_rsi <= 30 and curr_rsi > prev_rsi) or curr_rsi <= 28:
+            core_setup = bool((prev_rsi <= 30 and curr_rsi > prev_rsi) or curr_rsi <= 28)
+            _record(diagnostics,
+                    core_signal="BUY" if core_setup else None,
+                    core_trigger=core_setup,
+                    core_reason=(f"RSI {curr_rsi:.1f} turning up from oversold" if core_setup
+                                 else f"RSI {curr_rsi:.1f} not oversold (needs <= 30 and rising, or <= 28)"),
+                    fib_evaluated=False, fib_pass=None, fib_reason=None,
+                    rejected_by=None if core_setup else "no_rsi_trigger")
+            if core_setup:
                 return Signal.BUY
             return Signal.HOLD
         if curr_rsi >= 70:
@@ -127,7 +340,16 @@ def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) 
         bearish_cross = prev_macd >= prev_sig and curr_macd < curr_sig
 
         if not position_open:
-            if bullish_cross and curr["rsi"] < cfg.rsi_overbought:
+            rsi_ok = bool(curr["rsi"] < cfg.rsi_overbought)
+            core_setup = bool(bullish_cross and rsi_ok)
+            _record(diagnostics,
+                    core_signal="BUY" if core_setup else None,
+                    core_trigger=core_setup,
+                    core_reason=(_core_reason(True, True, rsi_ok, curr, cfg, "MACD") if bullish_cross
+                                 else "no fresh MACD over signal-line crossover on this candle"),
+                    fib_evaluated=False, fib_pass=None, fib_reason=None,
+                    rejected_by=None if core_setup else ("rsi_overbought" if bullish_cross else "no_macd_cross"))
+            if core_setup:
                 return Signal.BUY
             return Signal.HOLD
         if bearish_cross:
@@ -138,10 +360,22 @@ def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) 
     elif strat == "bollinger_breakout":
         upper = curr.get("bb_upper", curr["close"])
         mid = curr.get("bb_mid", curr["close"])
-        trending = curr["adx"] >= cfg.adx_trend_threshold
+        trending = bool(curr["adx"] >= cfg.adx_trend_threshold)
 
         if not position_open:
-            if curr["close"] > upper and trending and curr["rsi"] < 75:
+            breakout = bool(curr["close"] > upper)
+            rsi_ok = bool(curr["rsi"] < 75)
+            core_setup = bool(breakout and trending and rsi_ok)
+            _record(diagnostics,
+                    core_signal="BUY" if core_setup else None,
+                    core_trigger=core_setup,
+                    core_reason=(_core_reason(breakout, trending, rsi_ok, curr, cfg, "Bollinger breakout")
+                                 if breakout else "close is not above the upper Bollinger Band"),
+                    fib_evaluated=False, fib_pass=None, fib_reason=None,
+                    rejected_by=(None if core_setup else
+                                 ("no_bb_breakout" if not breakout else
+                                  ("adx_filter" if not trending else "rsi_overbought"))))
+            if core_setup:
                 return Signal.BUY
             return Signal.HOLD
         if curr["close"] < mid or curr["rsi"] > 80:
@@ -150,18 +384,51 @@ def generate_signal(df: pd.DataFrame, cfg: StrategyConfig, position_open: bool) 
 
     # Default / "ema_cross_fib": Trend-following EMA Cross + RSI + ADX + Fib Retracement
     else:
-        trending = curr["adx"] >= cfg.adx_trend_threshold
-        bullish_cross = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
+        trending = bool(curr["adx"] >= cfg.adx_trend_threshold)
+        # The crossover no longer has to land on the exact bar that tags the fib
+        # zone: it stays entry-eligible for `ema_cross_window` bars as long as the
+        # EMA fast line is still above the slow line. `ema_cross_window = 1`
+        # reproduces the strict "cross on this candle" rule.
+        cross_window = _ema_cross_window(cfg)
+        crossed, bars_ago = _recent_bullish_cross(df, cross_window)
+        still_bullish = bool(curr["ema_fast"] > curr["ema_slow"])
+        bullish_cross = bool(crossed and still_bullish)
+        cross_text = _ema_cross_text(crossed, bars_ago, still_bullish, cross_window)
         bearish_cross = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
 
         if not position_open:
-            fib_ok = (not cfg.use_fib_filter) or _near_fib_support(curr, cfg)
-            if bullish_cross and trending and curr["rsi"] < cfg.rsi_overbought and fib_ok:
+            rsi_ok = bool(curr["rsi"] < cfg.rsi_overbought)
+            core_setup = bool(bullish_cross and trending and rsi_ok)
+
+            # The Fibonacci zone filter is evaluated ONLY when enabled — with the
+            # checkbox off the loop never touches fib levels at all and the trade
+            # fires on the core EMA/ADX/RSI signal alone.
+            fib_ok = True
+            fib_detail = None
+            if core_setup and getattr(cfg, "use_fib_filter", True):
+                fib_detail = _fib_pullback_detail(df, cfg)
+                fib_ok = fib_detail["pass"]
+                # No fib data yet (rolling swing not warmed up) -> do not block.
+
+            _record(diagnostics,
+                    core_signal="BUY" if core_setup else None,
+                    core_trigger=core_setup,
+                    core_reason=_core_reason(bullish_cross, trending, rsi_ok, curr, cfg, "EMA",
+                                             cross_text),
+                    ema_cross_bars_ago=bars_ago,
+                    fib_evaluated=fib_detail is not None,
+                    fib_pass=None if fib_detail is None else fib_detail["pass"],
+                    fib_reason=None if fib_detail is None else fib_detail["reason"],
+                    rejected_by=(_core_miss(bullish_cross, trending, rsi_ok, "no_ema_cross") if not core_setup
+                                 else (None if fib_ok else "fib_zone")))
+
+            if core_setup and fib_ok:
                 return Signal.BUY
+            if core_setup and not fib_ok and diagnostics is not None:
+                diagnostics["fib_blocked"] = diagnostics.get("fib_blocked", 0) + 1
             return Signal.HOLD
 
         # position open: exit on trend reversal or overheated RSI
         if bearish_cross or curr["rsi"] > cfg.rsi_overbought + 10:
             return Signal.SELL
         return Signal.HOLD
-

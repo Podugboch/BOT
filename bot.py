@@ -25,6 +25,13 @@ from strategy import Signal, add_indicators, generate_signal
 log = logging.getLogger("bot")
 
 
+def _pipeline_rejection(stages: dict) -> str:
+    """Why a fired core signal did not become a trade (stage 2 or 3)."""
+    if stages.get("fib_evaluated") and not stages.get("fib_pass"):
+        return stages.get("fib_reason") or "Price outside the Fibonacci zone"
+    return stages.get("core_reason") or "blocked after the core trigger"
+
+
 def setup_logging():
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     log_path = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
@@ -234,12 +241,24 @@ class TradingBot:
         }
 
     def _maybe_enter(self, df, price):
-        sig = generate_signal(df, self.cfg.strategy, position_open=False)
+        stages = {}
+        sig = generate_signal(df, self.cfg.strategy, position_open=False, diagnostics=stages)
         rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
         adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
         trend = "BULLISH" if ("ema_fast" in df and "ema_slow" in df and df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]) else "BEARISH"
 
         if sig != Signal.BUY:
+            if stages.get("core_trigger"):
+                # The core indicators fired — say exactly which stage ate the trade.
+                log.info("Core signal triggered: BUY | Rejected by: %s", _pipeline_rejection(stages))
+                log.info("Signal pipeline [%s %s]: core_trigger=%s | fib_filter=%s | sizing=%s",
+                         self.cfg.exchange.symbol, self.cfg.exchange.timeframe, stages.get("core_trigger"),
+                         "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")),
+                         "not reached")
+            else:
+                log.debug("Signal pipeline [%s %s]: core_trigger=False (%s)",
+                          self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
+                          stages.get("core_reason", "no core trigger"))
             log.info("Market check [%s %s]: price=$%.2f | signal=%s | trend=%s | RSI=%.1f | ADX=%.1f | equity=$%.2f",
                      self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, sig.name, trend, rsi_val, adx_val, self.risk.state.equity)
             return
@@ -248,11 +267,19 @@ class TradingBot:
         stop, target = self.risk.stop_and_target(price, atr_val, "BUY")
         size = self.risk.position_size(price, stop)
         if size <= 0:
-            log.warning("Signal is BUY at $%.2f, but position sizing calculated 0 (check equity/risk)", price)
+            log.warning("Core signal triggered: BUY | Rejected by: position sizing returned 0 "
+                        "(equity $%.2f, risk %.2f%% per trade, stop distance $%.2f)",
+                        self.risk.state.equity, self.risk.cfg.risk_per_trade_pct * 100, abs(price - stop))
+            log.info("Signal pipeline [%s %s]: core_trigger=True | fib_filter=%s | sizing=False",
+                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
+                     "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")))
             return
         fill = self.exchange.place_order("BUY", size, price)
         self.position = {"entry": fill["price"], "size": size, "stop": stop,
                           "target": target, "fee_paid": fill["fee"]}
+        log.info("Signal pipeline [%s %s]: core_trigger=True | fib_filter=%s | sizing=True -> order placed",
+                 self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
+                 "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")))
         log.info("OPENED POSITION: entry=%.2f stop=%.2f target=%.2f size=%.6f (Signal: %s)",
                   fill["price"], stop, target, size, sig.name)
 
