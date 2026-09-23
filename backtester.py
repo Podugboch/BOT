@@ -93,7 +93,11 @@ def format_pipeline_report(results: dict) -> str:
         f"Stage 3 capital / sizing : {diag.get('sizing_passed', 0):,} passed, "
         f"{diag.get('sizing_blocked', 0):,} blocked",
         f"Signals rejected         : {_fmt_counts(diag.get('rejections', {}))}",
-        f"Trades executed          : {diag.get('trades_executed', 0):,}",
+        f"Trades executed          : {diag.get('trades_executed', 0):,} "
+        f"(exits: {_fmt_counts(results.get('exit_reasons', {}))})",
+        f"Expectancy               : avg win ${results.get('avg_win', 0):,.2f} vs avg loss "
+        f"${abs(results.get('avg_loss', 0)):,.2f} -> realized R:R "
+        f"{results.get('realized_rr', 0):.2f} (win rate {results.get('win_rate_pct', 0):.1f}%)",
     ]
     rejection_log = diag.get("rejection_log") or []
     if rejection_log:
@@ -240,7 +244,10 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
             risk.reset_day()
         last_day = current_day
 
-        can_trade, risk_reason = risk.can_trade()
+        # `now` is the candle's own timestamp, so a losing-streak cooldown is
+        # measured in market time and expires mid-backtest exactly as it would
+        # live — instead of vetoing every remaining signal.
+        can_trade, risk_reason = risk.can_trade(now=row["ts"])
         diag["candles_evaluated"] += 1
 
         if position is None:
@@ -277,7 +284,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                         fill = price * (1 + cfg.slippage_pct)
                         fee = fill * size * cfg.taker_fee_pct
                         position = {"entry": fill, "size": size, "stop": stop,
-                                    "target": target, "fee_paid": fee}
+                                    "target": target, "fee_paid": fee, "initial_stop": stop,
+                                    "opened_ts": row["ts"]}
                         diag["trades_executed"] += 1
                     else:
                         diag["sizing_blocked"] += 1
@@ -291,20 +299,35 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
 
         elif position is not None:
             diag["candles_in_position"] += 1
+            atr_val = row["atr"] if (pd.notna(row["atr"]) and row["atr"] > 0) else (price * 0.02)
+
+            # Trail first, then test the exit against the ratcheted stop, so a
+            # winner that has already run is protected at a profit instead of
+            # being given back to the original ATR stop.
+            risk.update_trailing_stop(position, price, atr_val, "BUY")
             hit_stop = price <= position["stop"]
             hit_target = price >= position["target"]
+            running = risk.is_running(position, price, atr_val, "BUY")
             sig = generate_signal(window, cfg.strategy, position_open=True)
+            # "Let it run": once the trailing stop is armed the trade is in
+            # profit, so a reversal signal no longer closes it early — the trail
+            # (already above entry) manages the exit.
+            signal_exit = sig == Signal.SELL and not running
 
-            if hit_stop or hit_target or sig == Signal.SELL:
+            if hit_stop or hit_target or signal_exit:
                 exit_ref = position["stop"] if hit_stop else price
                 exit_fill = exit_ref * (1 - cfg.slippage_pct)
                 exit_fee = exit_fill * position["size"] * cfg.taker_fee_pct
                 pnl = (exit_fill - position["entry"]) * position["size"] - position["fee_paid"] - exit_fee
 
-                risk.record_trade_result(pnl)
+                reason = "stop" if hit_stop else ("target" if hit_target else "signal")
+                if hit_stop and position.get("trail_armed"):
+                    reason = "trail"
+                risk.record_trade_result(pnl, now=row["ts"])
                 trades.append({
                     "entry": position["entry"], "exit": exit_fill, "size": position["size"],
-                    "pnl": pnl, "reason": "stop" if hit_stop else ("target" if hit_target else "signal"),
+                    "pnl": pnl, "reason": reason,
+                    "stop": position["stop"], "initial_stop": position.get("initial_stop"),
                 })
                 position = None
 
@@ -355,6 +378,13 @@ def summarize(trades: list, equity_curve: list, starting_equity: float, timefram
     ann_factor = np.sqrt(bars_per_year.get(timeframe, 35040))
     sharpe = (returns.mean() / returns.std() * ann_factor) if returns.std() else 0
 
+    avg_win = abs(float(np.mean([t["pnl"] for t in wins]))) if wins else 0.0
+    avg_loss = abs(float(np.mean([t["pnl"] for t in losses]))) if losses else 0.0
+    exit_reasons: dict = {}
+    for trade in trades:
+        key = trade.get("reason", "signal")
+        exit_reasons[key] = exit_reasons.get(key, 0) + 1
+
     return {
         "starting_equity": round(starting_equity, 2),
         "final_equity": round(final_equity, 2),
@@ -363,6 +393,10 @@ def summarize(trades: list, equity_curve: list, starting_equity: float, timefram
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2) if trades else 0,
         "avg_win": round(float(np.mean([t["pnl"] for t in wins])), 2) if wins else 0,
         "avg_loss": round(float(np.mean([t["pnl"] for t in losses])), 2) if losses else 0,
+        # The number that decides whether a 30-45% win rate pays: a winner has to
+        # be worth more than a loser on average, not merely the same.
+        "realized_rr": round(avg_win / avg_loss, 2) if avg_loss > 0 else 0,
+        "exit_reasons": exit_reasons,
         "max_drawdown_pct": round(float(drawdown.min()) * 100, 2) if len(drawdown) else 0,
         "sharpe_approx": round(float(sharpe), 2),
     }

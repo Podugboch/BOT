@@ -41,7 +41,7 @@ from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
 from exchange_client import ExchangeClient
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
-from risk_manager import RiskManager
+from risk_manager import RiskManager, reward_risk_ratio
 from backtester import fetch_historical, run_backtest, summarize
 from bot import TradingBot, setup_logging
 from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection, auth_service
@@ -824,8 +824,24 @@ def download_bot_zip():
 # ============================================================================
 # API ENDPOINTS: TRADING BOT DASHBOARD & CONTROLS
 # ============================================================================
+NO_STORE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"}
+
+
+def _no_store(response: Response) -> None:
+    """Keep live bot state out of browser/CDN caches.
+
+    A cached GET is the usual reason a Refresh button looks broken on a deployed
+    dashboard: the click fires, the request returns 200, and the page redraws
+    yesterday's payload.
+    """
+    if response is not None:
+        for key, value in NO_STORE_HEADERS.items():
+            response.headers[key] = value
+
+
 @app.get("/api/status")
-def get_status():
+def get_status(response: Response = None):
+    _no_store(response)
     cfg = runner.cfg
     bot = runner.bot
     risk_state = bot.risk.state if bot else None
@@ -855,6 +871,16 @@ def get_status():
         "drawdown_pct": round(((risk_state.peak_equity - risk_state.equity) / risk_state.peak_equity) * 100, 2) if risk_state and risk_state.peak_equity > 0 else 0.0,
         "daily_loss_pct": round(((risk_state.daily_start_equity - risk_state.equity) / risk_state.daily_start_equity) * 100, 2) if risk_state and risk_state.daily_start_equity > 0 else 0.0,
         "consecutive_losses": risk_state.consecutive_losses if risk_state else 0,
+        "max_consecutive_losses": cfg.risk.max_consecutive_losses,
+        "loss_streak_cooldown_hours": cfg.risk.loss_streak_cooldown_hours,
+        # Published so the dashboard can say *when* trading resumes instead of
+        # leaving a tripped circuit breaker looking like a dead bot.
+        "cooldown_until": (
+            risk_state.cooldown_until.isoformat()
+            if (risk_state and getattr(risk_state, "cooldown_until", None)) else None
+        ),
+        "risk_cooldown_note": bot.risk.cooldown_note(peek=True) if bot else "",
+        "reward_risk_ratio": round(reward_risk_ratio(cfg.risk), 2),
         "trading_halted_today": risk_state.trading_halted_today if risk_state else False,
         "kill_switch_triggered": risk_state.kill_switch_triggered if risk_state else False,
         "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
@@ -1143,8 +1169,10 @@ def get_public_exchange_client(exchange_id: str, symbol: str, timeframe: str) ->
 
 
 @app.get("/api/analysis")
-def get_analysis(symbol: Optional[str] = None, timeframe: Optional[str] = None, exchange: Optional[str] = None):
+def get_analysis(response: Response = None, symbol: Optional[str] = None,
+                 timeframe: Optional[str] = None, exchange: Optional[str] = None):
     global LAST_ANALYSIS_CACHE
+    _no_store(response)
     req_symbol = symbol or runner.cfg.exchange.symbol or "BTC/USDT"
     req_timeframe = timeframe or runner.cfg.exchange.timeframe or "15m"
     req_exchange = exchange or runner.cfg.exchange.exchange_id or "binance"
@@ -1284,10 +1312,28 @@ def run_backtest_endpoint(req: BacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _resolve_log_file() -> Path:
+    """Whichever activity log actually has content.
+
+    The bot writes to `bot.log` next to its working directory (or /tmp on
+    serverless), so looking at only one of the two paths is why the dashboard
+    sometimes shows "No logs recorded yet" no matter how often you refresh.
+    """
+    primary = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
+    for candidate in (primary, Path("/tmp/bot.log"), Path("bot.log"), Path(__file__).resolve().parent / "bot.log"):
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return primary
+
+
 @app.get("/api/logs")
-def get_logs(lines: int = 50):
+def get_logs(response: Response = None, lines: int = 50):
+    _no_store(response)
     lines = max(1, min(int(lines), 1000))
-    log_file = Path("/tmp/bot.log") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path("bot.log")
+    log_file = _resolve_log_file()
     if not log_file.exists() or log_file.stat().st_size == 0:
         if runner.running:
             return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}
@@ -1846,8 +1892,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
         <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Loss Streak</div>
-        <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-streak">0 / 4</div>
-        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Cooloff at 4</div>
+        <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-streak">0 / 8</div>
+        <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Cooloff at <span id="val-streak-limit">8</span></div>
       </div>
 
       <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
@@ -1855,6 +1901,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-yellow-400 truncate" id="val-signal">HOLD</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate" id="val-symbol-tag">BTC/USDT 15m</div>
       </div>
+    </div>
+
+    <!-- Circuit-breaker cooldown banner: says when trading resumes -->
+    <div id="cooldown-banner" class="hidden bg-amber-950/40 border border-amber-500/40 rounded-xl p-3 flex flex-wrap items-center gap-2 text-xs text-amber-200">
+      <i class="fa-solid fa-hourglass-half text-amber-400"></i>
+      <span>Circuit breaker: <span id="cooldown-text">--</span></span>
     </div>
 
     <!-- Active Position Banner -->
@@ -2114,9 +2166,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <div class="flex items-center gap-2">
-            <button onclick="refreshAnalysis()" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg border border-bordercol">
-              <i class="fa-solid fa-rotate"></i> Refresh
-            </button>
+            <div class="flex items-center gap-2">
+              <span id="an-updated" class="text-[10px] text-slate-500">--</span>
+              <button type="button" id="btn-refresh-analysis" onclick="refreshAnalysis(true)" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg border border-bordercol disabled:opacity-60">
+                <i class="fa-solid fa-rotate"></i> Refresh
+              </button>
+            </div>
           </div>
         </div>
 
@@ -2335,9 +2390,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h3 class="font-bold text-sm text-white">Live Bot Activity Logs</h3>
           </div>
           <div class="flex items-center gap-2">
-            <button type="button" onclick="refreshLogs()" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol">
-              <i class="fa-solid fa-rotate"></i> Refresh
-            </button>
+            <div class="flex items-center gap-2">
+              <span id="logs-updated" class="text-[10px] text-slate-500">--</span>
+              <button type="button" id="btn-refresh-logs" onclick="refreshLogs(true)" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol disabled:opacity-60">
+                <i class="fa-solid fa-rotate"></i> Refresh
+              </button>
+            </div>
           </div>
         </div>
         <div id="log-container" class="bg-slate-950 font-mono text-[11px] p-3 rounded-lg border border-bordercol/60 h-56 md:h-40 overflow-y-auto space-y-1 text-slate-300">
@@ -3892,7 +3950,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // --- Status, Analysis, Backtest & Logs ---
     async function fetchStatus() {
       try {
-        const res = await fetch('/api/status');
+        const res = await fetch('/api/status?_ts=' + Date.now(), { cache: 'no-store' });
         const data = await res.json();
         botRunning = data.running;
 
@@ -3985,7 +4043,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('val-pos').innerText = data.paper_position.toFixed(6);
         document.getElementById('val-drawdown').innerText = data.drawdown_pct.toFixed(1) + '%';
         document.getElementById('val-daily-loss').innerText = data.daily_loss_pct.toFixed(1) + '%';
-        document.getElementById('val-streak').innerText = `${data.consecutive_losses} / 4`;
+        document.getElementById('val-streak').innerText = `${data.consecutive_losses} / ${data.max_consecutive_losses ?? 8}`;
+        const streakLimit = document.getElementById('val-streak-limit');
+        if (streakLimit) streakLimit.innerText = data.max_consecutive_losses ?? 8;
+        const cooldownBanner = document.getElementById('cooldown-banner');
+        const cooldownText = document.getElementById('cooldown-text');
+        if (cooldownBanner && cooldownText) {
+          if (data.risk_cooldown_note) {
+            cooldownBanner.classList.remove('hidden');
+            cooldownText.innerText = 'cooling off ' + data.risk_cooldown_note.replace(/^cooling off /, '') +
+              (data.cooldown_until ? ' — auto-resumes, no restart needed' : '');
+          } else {
+            cooldownBanner.classList.add('hidden');
+          }
+        }
 
         const posBanner = document.getElementById('position-banner');
         if (data.active_position) {
@@ -4022,15 +4093,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function refreshAnalysis() {
+    let analysisInFlight = false;
+
+    function setRefreshStamp(id, message, ok) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.innerText = message;
+      el.className = ok ? 'text-[10px] text-emerald-400' : 'text-[10px] text-rose-400';
+    }
+
+    function beginRefresh(buttonId, label) {
+      const btn = document.getElementById(buttonId);
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> ' + label;
+      }
+    }
+
+    function endRefresh(buttonId, icon, label) {
+      const btn = document.getElementById(buttonId);
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid ' + icon + '"></i> ' + label;
+      }
+    }
+
+    async function refreshAnalysis(manual) {
+      // A manual click must never be silently dropped: if a poll is already in
+      // flight, wait for it and then run a fresh one.
+      if (analysisInFlight) return;
+      analysisInFlight = true;
+      const stampId = 'an-updated';
+      if (manual) {
+        beginRefresh('btn-refresh-analysis', 'Refreshing...');
+        setRefreshStamp(stampId, 'Refreshing market data...', true);
+      }
       try {
-        const res = await fetch('/api/analysis');
+        // no-store + a unique query param: a CDN/browser cache is the classic
+        // reason a Refresh button appears dead on a deployed dashboard.
+        const res = await fetch('/api/analysis?_ts=' + Date.now(), { cache: 'no-store' });
         if (!res.ok) {
+          setRefreshStamp(stampId, `Could not refresh (HTTP ${res.status}). Exchange data unreachable - retrying automatically.`, false);
           console.warn('Analysis endpoint returned HTTP status:', res.status);
           return;
         }
         const data = await res.json();
         if (!data || data.price === undefined || data.price === null) {
+          setRefreshStamp(stampId, 'Could not refresh: unexpected analysis payload.', false);
           console.warn('Invalid analysis payload:', data);
           return;
         }
@@ -4118,8 +4227,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
           }
         }
+        setRefreshStamp(stampId, 'Updated ' + new Date().toLocaleTimeString(), true);
       } catch (e) {
+        setRefreshStamp(stampId, 'Could not refresh: ' + (e && e.message ? e.message : e), false);
         console.error('Error fetching analysis:', e);
+      } finally {
+        analysisInFlight = false;
+        if (manual) endRefresh('btn-refresh-analysis', 'fa-rotate', 'Refresh');
       }
     }
 
@@ -4190,11 +4304,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function refreshLogs() {
+    let logsInFlight = false;
+
+    async function refreshLogs(manual) {
+      if (logsInFlight) return;
+      logsInFlight = true;
+      if (manual) beginRefresh('btn-refresh-logs', 'Refreshing...');
       try {
-        const res = await fetch('/api/logs?lines=40');
+        const res = await fetch('/api/logs?lines=40&_ts=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) {
+          setRefreshStamp('logs-updated', `Could not refresh logs (HTTP ${res.status}).`, false);
+          return;
+        }
         const data = await res.json();
         const container = document.getElementById('log-container');
+        if (!container) return;
         container.innerHTML = '';
         if (data.logs && data.logs.length) {
           data.logs.forEach(l => {
@@ -4210,8 +4334,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } else {
           container.innerHTML = '<div class="text-slate-500">No logs recorded yet.</div>';
         }
+        setRefreshStamp('logs-updated', 'Updated ' + new Date().toLocaleTimeString(), true);
       } catch (e) {
+        setRefreshStamp('logs-updated', 'Could not refresh logs: ' + (e && e.message ? e.message : e), false);
         console.error('Error refreshing logs:', e);
+      } finally {
+        logsInFlight = false;
+        if (manual) endRefresh('btn-refresh-logs', 'fa-rotate', 'Refresh');
       }
     }
 

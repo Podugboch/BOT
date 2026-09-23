@@ -199,6 +199,27 @@ All parameters live in `config.py` — strategy periods, risk-per-trade %,
 stop/target ATR multiples, drawdown and daily-loss limits, symbol, timeframe,
 fee/slippage assumptions. Change them there; nothing else needs editing.
 
+### Risk model: sizing first, then expectancy
+
+Size comes from the stop, not a fixed bet: each trade risks
+`risk_per_trade_pct` of equity over the distance to its stop. The defaults are
+set for a sub-50% win rate, where a winner has to be worth several losers:
+
+- **Tight stop, far target** — `stop_loss_atr_mult = 1.5` with
+  `take_profit_atr_mult = 4.0` (~2.7R), and no setup is taken below
+  `min_reward_risk_ratio` (2.0) of risk, so a 30-45% win rate can still pay.
+- **Trailing stop** — once a trade is `trailing_arm_atr_mult` (1 ATR) in
+  profit the stop ratchets to break-even and then trails
+  `trailing_stop_atr_mult` (1.5 ATR) behind the best price, never back below
+  entry. While the trail is armed a reversal signal no longer closes the trade,
+  so winners run instead of being banked for about what a loser costs.
+- **Circuit breakers that recover** — the daily-loss and drawdown switches stay
+  hard halts; the losing-streak breaker (`max_consecutive_losses = 8`, raised
+  from 4 because a normal run of losses used to starve the strategy) instead
+  starts a rolling `loss_streak_cooldown_hours` (24h) pause that lifts on its
+  own — or early on the next winning trade — and publishes its resume time in
+  `/api/status` and the dashboard banner.
+
 ## Honest limitations
 
 - The strategy (EMA/RSI/ADX trend-following) is a reasonable, well-known

@@ -72,11 +72,24 @@ class StrategyConfig:
 class RiskConfig:
     """Risk management: sized before profit, always."""
     risk_per_trade_pct: float = 0.01     # risk 1% of equity per trade
-    stop_loss_atr_mult: float = 2.0      # stop = entry -/+ 2x ATR
-    take_profit_atr_mult: float = 4.0    # 2:1 reward:risk
+    # Asymmetrical expectancy: a 30-45% win rate only pays if each winner is
+    # worth several times each loser. Stop tight (1.5 ATR), target far (4 ATR =
+    # 2.7R), and never take a setup below `min_reward_risk_ratio` of risk.
+    stop_loss_atr_mult: float = 1.5      # stop = entry -/+ 1.5x ATR
+    take_profit_atr_mult: float = 4.0    # target = 2.7R at a 1.5 ATR stop
+    min_reward_risk_ratio: float = 2.0   # never accept a setup worse than 1:2
+    # Let winners run instead of banking them on the first wobble: once the
+    # trade is +1 ATR in profit the stop moves to break-even, then trails
+    # 1.5 ATR behind the best price (never back into a loss).
+    trailing_arm_atr_mult: float = 1.0
+    trailing_stop_atr_mult: float = 1.5
     max_daily_loss_pct: float = 0.03     # circuit breaker: halt for the day
     max_drawdown_pct: float = 0.15       # kill switch: halt the bot entirely
-    max_consecutive_losses: int = 4      # circuit breaker: cool off
+    # A 4-loss streak is ordinary in trend trading and used to starve the
+    # strategy, so the streak limit is 8 and tripping it starts a rolling
+    # cooldown that lifts on its own instead of halting forever.
+    max_consecutive_losses: int = 8
+    loss_streak_cooldown_hours: float = 24.0   # 0 = block until a winning trade
 
 
 def _get_exchange_credential(env_key: str, db_key: str) -> str:
