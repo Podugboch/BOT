@@ -1034,7 +1034,7 @@ class _FakeExchange:
     TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
     def __init__(self, advertised=1000, per_page=500, days_of_history=400, stall=False,
-                 fail_times=0, overlap=0):
+                 fail_times=0, overlap=0, empty_before_history=False):
         self.id = "fake"
         self.rateLimit = 50                     # ms, like MEXC
         self.features = {"spot": {"fetchOHLCV": {"limit": advertised}}}
@@ -1045,6 +1045,9 @@ class _FakeExchange:
         self._stall = stall
         self._fail_times = fail_times
         self._overlap = overlap
+        # MEXC answers a `since` older than its stored range with an empty list
+        # instead of snapping to the earliest candle it has.
+        self._empty_before_history = empty_before_history
         self.calls = []
 
     def market(self, symbol):
@@ -1066,6 +1069,8 @@ class _FakeExchange:
             raise ccxt.NetworkError("temporary failure")
 
         ms = self.TF_SECONDS[timeframe] * 1000
+        if self._empty_before_history and since is not None and since < self._first_ms:
+            return []
         if self._stall:
             base = self._first_ms
             return [[base + i * ms, 10.0, 11.0, 9.0, 10.5, 1.0] for i in range(self._per_page)]
@@ -1590,6 +1595,187 @@ class TestBacktestControlWiring:
 # ============================================================================
 # DASHBOARD JAVASCRIPT — REAL ENGINE, NOT GREP
 # ============================================================================
+class TestLookbackGranularityLimits:
+    """Venues store different amounts per grain; asking deeper is not more data."""
+
+    def test_limits_match_what_venues_actually_store(self):
+        from exchange_client import MAX_DAYS, max_lookback_days
+
+        assert max_lookback_days("5m") == 60
+        assert max_lookback_days("15m") == 90
+        assert max_lookback_days("1h") == 730        # years of 1h are stored
+        assert max_lookback_days("4h") == 730
+        assert max_lookback_days("1d") == 730
+        assert max_lookback_days("7m") <= 120        # unknown grain -> conservative
+
+    def test_clamp_never_exceeds_either_cap(self):
+        from exchange_client import MAX_DAYS, clamp_lookback_days
+
+        assert clamp_lookback_days(365, "5m") == 60
+        assert clamp_lookback_days(365, "15m") == 90
+        assert clamp_lookback_days(365, "1h") == 365
+        assert clamp_lookback_days(730, "1h") == 730
+        assert clamp_lookback_days(9_999, "1h") == MAX_DAYS
+        assert clamp_lookback_days(0, "1h") == 1
+        assert clamp_lookback_days(None, "1h") >= 1
+
+    def test_note_explains_the_five_minute_trap(self):
+        from exchange_client import lookback_limit_note, lookback_limits
+
+        note = lookback_limit_note("5m")
+        assert "60 days" in note
+        assert "1h" in note                          # points at a grain that works
+        assert "730" in lookback_limit_note("1h")
+        # The table the dashboard is built from must cover the UI's options.
+        limits = lookback_limits()
+        for grain in ("5m", "15m", "1h", "4h", "1d"):
+            assert limits[grain]["max_days"] >= 1
+            assert limits[grain]["note"]
+
+
+class TestDeepStartFallback:
+    """A `since` deeper than the venue's storage must degrade, never blow up."""
+
+    @staticmethod
+    def _mexc_like(days_of_history=60, per_page=500):
+        return _FakeExchange(advertised=1000, per_page=per_page,
+                             days_of_history=days_of_history, empty_before_history=True)
+
+    def test_empty_deep_page_falls_back_to_the_earliest_available(self):
+        from exchange_client import MS_PER_DAY, fetch_ohlcv_window
+
+        ex = self._mexc_like(days_of_history=60)
+        end_ms = ex.milliseconds()
+        since_ms = end_ms - 365 * MS_PER_DAY          # far deeper than stored
+
+        rows, pages, _largest, effective_since = fetch_ohlcv_window(
+            ex, "BTC/USDT", "5m", since_ms, end_ms, limit=500, pause_sec=0.0, max_chunks=40)
+
+        assert rows, "the fallback must return the history the venue does have"
+        assert effective_since is not None
+        assert effective_since > since_ms             # pulled back to real data
+        # The window served is the ~60 days the venue stores, not the 365 asked.
+        served_days = (end_ms - effective_since) / MS_PER_DAY
+        assert 55 <= served_days <= 61
+        first_candle = min(int(row[0]) for row in rows)
+        assert first_candle >= ex._first_ms
+
+    def test_fallback_is_bisected_not_guessed(self):
+        """It must converge on the boundary, not step back in fixed jumps."""
+        from exchange_client import find_earliest_available
+
+        ex = self._mexc_like(days_of_history=90)
+        end_ms = ex.milliseconds()
+        earliest = find_earliest_available(
+            ex, "BTC/USDT", "5m", end_ms - 365 * 24 * 60 * 60 * 1000, end_ms,
+            limit=500, pause_sec=0.0, probes=20)
+
+        assert earliest is not None
+        # Converged onto the venue's true first candle (a fixed step-back search
+        # would be days away), never earlier than data that actually exists.
+        assert ex._first_ms <= earliest <= ex._first_ms + 5 * 60 * 1000
+        assert len(ex.calls) <= 25                     # bounded probe cost
+
+    def test_venue_with_no_data_at_all_returns_empty_without_raising(self):
+        from exchange_client import fetch_ohlcv_window
+
+        class _Silent(_FakeExchange):
+            def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None, **kwargs):
+                self.calls.append({"symbol": symbol, "since": since, "limit": limit})
+                return []
+
+        ex = _Silent(days_of_history=1)
+        rows, pages, _largest, effective = fetch_ohlcv_window(
+            ex, "BTC/USDT", "5m", ex.milliseconds() - 86_400_000, ex.milliseconds(),
+            limit=500, pause_sec=0.0, max_chunks=5)
+
+        assert rows == []
+        assert effective is None
+
+    def test_backtester_fetch_degrades_instead_of_failing(self):
+        """The 365-day 5m request that used to come back empty now returns data."""
+        from exchange_client import MS_PER_DAY
+
+        ex = self._mexc_like(days_of_history=60)
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 365, client=ex, pause_sec=0.0)
+
+        assert not df.empty
+        covered_days = (df["ts"].iloc[-1] - df["ts"].iloc[0]).total_seconds() / 86_400
+        assert 50 <= covered_days <= 61
+        # It really did try the deep start first, then walked a shallower one.
+        assert any(call["since"] is not None for call in ex.calls)
+
+    def test_backtester_clamps_a_grain_it_knows_cannot_go_that_deep(self, caplog):
+        ex = self._mexc_like(days_of_history=60)
+        with caplog.at_level("WARNING", logger="backtest"):
+            fetch_historical("mexc", "BTC/USDT", "5m", 365, client=ex, pause_sec=0.0)
+
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "5m" in text and "60" in text           # the grain limit is explained
+
+
+class TestBacktestLookbackLimitsInUI:
+    """The dashboard must warn/cap instead of requesting data nobody stores."""
+
+    def test_limits_are_injected_as_valid_json(self):
+        import json
+        from exchange_client import lookback_limits
+
+        html = web_server_dashboard_html()
+        match = re.search(r"const BT_LOOKBACK_LIMITS = (\{.*?\});", html)
+        assert match, "the limits table was not injected into the page"
+        assert json.loads(match.group(1)) == lookback_limits()
+
+    def test_inputs_are_wired_for_the_warning(self):
+        html = web_server_dashboard_html()
+
+        assert 'id="bt-days-note"' in html
+        assert 'onchange="applyTimeframeLimits()"' in html
+        assert "setBacktestDays" in html
+
+    def test_quick_pick_buttons_respect_the_grain_limit(self, tmp_path):
+        """Clicking '730d' on 5m must land on 60, not send an impossible request."""
+        out = self._run_limits_harness(tmp_path, {
+            "bt-timeframe": "5m", "bt-days": "90", "bt-fib-depth": "all",
+            "bt-fib-atr": "0.5", "bt-fib-floor": "1.0", "bt-trail-atr": "2.0",
+            "bt-exchange": "mexc", "bt-symbol": "BTC/USDT", "bt-equity": "1000",
+            "bt-use-fib": True, "bt-trail": True,
+        }, click_days=730)
+
+        assert out["daysInput"] == "60"
+        assert "capped" in out["note"].lower() or "60" in out["note"]
+
+    def test_deep_request_is_capped_before_it_is_posted(self, tmp_path):
+        out = self._run_limits_harness(tmp_path, {
+            "bt-timeframe": "5m", "bt-days": "365", "bt-fib-depth": "deep",
+            "bt-fib-atr": "0.5", "bt-fib-floor": "1.0", "bt-trail-atr": "2.0",
+            "bt-exchange": "mexc", "bt-symbol": "BTC/USDT", "bt-equity": "1000",
+            "bt-use-fib": True, "bt-trail": True,
+        })
+
+        assert out["posted"]["days"] == 60            # capped to the grain limit
+        assert out["posted"]["timeframe"] == "5m"
+        assert "60" in out["note"]
+
+    @staticmethod
+    def _run_limits_harness(tmp_path, form, click_days=None):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; JS runtime check skipped")
+        (tmp_path / "fn.js").write_text(_backtest_js_source())
+        (tmp_path / "form.json").write_text(json.dumps(form))
+        (tmp_path / "api.json").write_text(json.dumps(_BACKTEST_API_PAYLOAD))
+        (tmp_path / "harness.js").write_text(
+            "globalThis.__CLICK_DAYS = "
+            + (str(click_days) if click_days is not None else "null") + ";\n"
+            + _JS_BACKTEST_HARNESS)
+        proc = subprocess.run(
+            [node, str(tmp_path / "harness.js"), str(tmp_path / "fn.js"),
+             str(tmp_path / "form.json"), str(tmp_path / "api.json")],
+            capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"node failed:\n{proc.stdout}\n{proc.stderr}"
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
 def _dashboard_script() -> str:
     """The dashboard's main inline <script>, exactly as served."""
     import web_server
@@ -1620,6 +1806,23 @@ def _dashboard_function(name: str) -> str:
     raise AssertionError(f"unbalanced braces while extracting {name}")
 
 
+def _backtest_js_source() -> str:
+    """The backtest handler plus every helper it calls, as one runnable script.
+
+    The limits table is lifted from the served page, so the test runs the real
+    injected values rather than a copy that can drift from the server's.
+    """
+    limits = re.search(r"const BT_LOOKBACK_LIMITS = (\{.*?\});", web_server_dashboard_html())
+    assert limits, "the limits table is not in the page"
+    return (
+        "const BT_LOOKBACK_LIMITS = " + limits.group(1) + ";\n"
+        + _dashboard_function("setBacktestDays") + "\n"
+        + _dashboard_function("backtestDayLimit") + "\n"
+        + _dashboard_function("applyTimeframeLimits") + "\n"
+        + _dashboard_function("executeBacktest")
+    )
+
+
 # Runs the extracted handler in a real engine with a stubbed DOM and fetch, so
 # "cannot access X before initialization" and friends fail the test instead of
 # only surfacing as a browser alert on the deployed dashboard.
@@ -1633,13 +1836,16 @@ const elements = {};
 function makeEl(id) {
   const classes = new Set(['hidden']);
   let text = '';
+  let val = '';
   return {
     id,
     // A real DOM stringifies innerText; the stub does too, so the assertions
     // see what a browser would show.
     get innerText() { return text; },
     set innerText(v) { text = String(v); },
-    innerHTML: '', value: '', checked: false,
+    get value() { return val; },
+    set value(v) { val = String(v); },
+    innerHTML: '', checked: false,
     disabled: false, className: '',
     classList: {
       add: (c) => classes.add(c),
@@ -1663,15 +1869,24 @@ for (const [id, val] of Object.entries(form)) {
 }
 
 const executeBacktest = new Function(
-  fs.readFileSync(fnPath, 'utf8') + '\nreturn executeBacktest;')();
+  fs.readFileSync(fnPath, 'utf8')
+  + '\nreturn { executeBacktest, setBacktestDays, applyTimeframeLimits };')();
 
-executeBacktest({ preventDefault() {} }).then(() => {
+// Optionally drive a quick-pick button (90d/365d/730d) before submitting.
+if (globalThis.__CLICK_DAYS !== null && globalThis.__CLICK_DAYS !== undefined) {
+  executeBacktest.setBacktestDays(globalThis.__CLICK_DAYS);
+}
+
+executeBacktest.executeBacktest({ preventDefault() {} }).then(() => {
   console.log(JSON.stringify({
     posted: globalThis.__posted,
     rr: el('bt-res-rr').innerText,
     winrate: el('bt-res-winrate').innerText,
     trades: el('bt-res-trades').innerText,
     fibNote: el('bt-res-fib-note').innerText,
+    note: el('bt-days-note').innerText,
+    daysInput: el('bt-days').value,
+    daysMax: el('bt-days').max,
     resultsHidden: el('bt-results-box').classList.contains('hidden'),
     buttonDisabled: el('btn-run-bt').disabled,
   }));
@@ -1719,7 +1934,7 @@ class TestDashboardBacktestRuntime:
         node = shutil.which("node")
         if not node:
             pytest.skip("node is not installed; JS runtime check skipped")
-        (tmp_path / "fn.js").write_text(_dashboard_function(function_name))
+        (tmp_path / "fn.js").write_text(_backtest_js_source())
         (tmp_path / "form.json").write_text(json.dumps(_BACKTEST_FORM_VALUES))
         (tmp_path / "api.json").write_text(json.dumps(_BACKTEST_API_PAYLOAD))
         (tmp_path / "harness.js").write_text(_JS_BACKTEST_HARNESS)

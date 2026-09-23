@@ -12,6 +12,7 @@ rate limit, and returns one continuous, de-duplicated series.
 """
 import logging
 import time
+from typing import Optional
 
 import ccxt
 import pandas as pd
@@ -34,6 +35,52 @@ BACKOFF_BASE_SEC = 1.5
 MAX_STALLS = 2                # consecutive no-progress pages before giving up
 MAX_DAYS = 730
 MS_PER_DAY = 24 * 60 * 60 * 1000
+
+# How far back venues actually *store* candles, per grain. This is a storage
+# limit, not a request limit: MEXC keeps roughly the last 60 days of 5m, so
+# asking for 365 days (105,000 candles) comes back as an empty page rather than
+# an error. Requesting deeper than this is not "more data" — it is no data.
+MAX_LOOKBACK_DAYS = {
+    "1m": 7, "3m": 30, "5m": 60, "15m": 90, "30m": 120,
+    "1h": 730, "2h": 730, "4h": 730, "6h": 730, "12h": 730, "1d": 730, "1w": 730,
+}
+DEFAULT_LOOKBACK_DAYS = 90     # unknown/unsupported grain: assume a 15m-like cap
+
+
+def max_lookback_days(timeframe: str) -> int:
+    """Deepest lookback a venue realistically serves for this grain."""
+    if not timeframe:
+        return DEFAULT_LOOKBACK_DAYS
+    return MAX_LOOKBACK_DAYS.get(str(timeframe).strip().lower(), DEFAULT_LOOKBACK_DAYS)
+
+
+def clamp_lookback_days(days, timeframe: str) -> int:
+    """Clamp to the global cap and to the grain's storage limit."""
+    try:
+        value = int(days)
+    except (TypeError, ValueError):
+        value = DEFAULT_LOOKBACK_DAYS
+    return max(1, min(value, MAX_DAYS, max_lookback_days(timeframe)))
+
+
+def lookback_limit_note(timeframe: str) -> str:
+    """Human sentence explaining what this grain can actually deliver."""
+    grain = str(timeframe or "").strip().lower() or "this timeframe"
+    limit = max_lookback_days(timeframe)
+    if limit >= MAX_DAYS:
+        return (f"{grain} can run the full {MAX_DAYS}-day window; the venue stores "
+                f"years of candles at this grain.")
+    return (f"{grain} candles are only stored for roughly the last {limit} days — a deeper "
+            f"`since` returns an empty page, not more history. Use 1h/4h/1d for 180-365+ day runs.")
+
+
+def lookback_limits() -> dict:
+    """Per-grain limits as plain data, for the API and the dashboard."""
+    grains = list(MAX_LOOKBACK_DAYS)
+    return {
+        grain: {"max_days": MAX_LOOKBACK_DAYS[grain], "note": lookback_limit_note(grain)}
+        for grain in grains
+    }
 
 
 def chunk_limit(exchange, symbol: str) -> int:
@@ -143,6 +190,83 @@ def to_frame(rows: list) -> pd.DataFrame:
     return df.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
 
 
+def find_earliest_available(exchange, symbol: str, timeframe: str, since_ms: int, end_ms: int,
+                            limit: int, pause_sec: float = MIN_PAUSE_SEC,
+                            probes: int = 12) -> Optional[int]:
+    """Bisect for the earliest timestamp the venue will actually serve.
+
+    A `since` older than the venue's stored range answers with an empty page
+    (MEXC does), and "no candles" there does not mean "no candles at all" —
+    it means the request was too deep. Data availability is monotone in `since`
+    (deep -> empty, shallow -> rows), so bisecting between the requested start
+    and now lands on the real boundary in ~12 requests instead of guessing.
+
+    Returns the timestamp of the first candle the venue returns, or None when
+    even the newest part of the window is empty.
+    """
+    try:
+        ms_per_bar = max(1, int(exchange.parse_timeframe(timeframe)) * 1000)
+    except Exception:
+        ms_per_bar = MS_PER_DAY // 24
+
+    # Sanity gate: if the venue serves nothing near the present, there is no
+    # boundary to find, and bisecting would just burn requests.
+    newest_probe = max(since_ms, end_ms - limit * ms_per_bar)
+    if not fetch_page(exchange, symbol, timeframe, newest_probe, limit):
+        return None
+
+    lo, hi, earliest = int(since_ms), int(end_ms), None
+    for _ in range(max(1, probes)):
+        if lo > hi:
+            break
+        mid = lo + (hi - lo) // 2
+        batch = fetch_page(exchange, symbol, timeframe, mid, limit)
+        time.sleep(pause_sec)
+        if batch:
+            earliest = int(batch[0][0])       # authoritative: the row the venue returned
+            hi = mid - ms_per_bar             # boundary is at or before this
+        else:
+            lo = mid + ms_per_bar             # too deep; search shallower
+    return earliest
+
+
+def fetch_ohlcv_window(exchange, symbol: str, timeframe: str, since_ms: int, end_ms: int,
+                       limit: int, pause_sec: float, max_chunks: int) -> tuple:
+    """Paginate [since_ms, end_ms]; if the venue serves nothing that deep, fall
+    back to the earliest window it does serve.
+
+    Returns (rows, pages, largest_page, effective_since_ms). `effective_since_ms`
+    is None only when the venue returned nothing at all for this grain.
+    """
+    rows, pages, largest_page = paginate_ohlcv(
+        exchange, symbol, timeframe, since_ms, end_ms, limit, pause_sec, max_chunks)
+    if rows:
+        return rows, pages, largest_page, int(since_ms)
+
+    log.warning("No %s candles returned from a start of %s — that is deeper than the venue "
+                "stores, not an outage; locating the earliest available window",
+                timeframe, _iso_ms(since_ms))
+    earliest = find_earliest_available(exchange, symbol, timeframe, since_ms, end_ms, limit, pause_sec)
+    if earliest is None:
+        log.warning("Venue serves no %s candles for %s at all (checked up to %s)",
+                    timeframe, symbol, _iso_ms(end_ms))
+        return [], pages, largest_page, None
+
+    log.warning("Falling back to the earliest available %s candle: %s (requested start %s)",
+                timeframe, _iso_ms(earliest), _iso_ms(since_ms))
+    rows, extra_pages, extra_largest = paginate_ohlcv(
+        exchange, symbol, timeframe, earliest, end_ms, limit, pause_sec, max_chunks)
+    return rows, pages + extra_pages, max(largest_page, extra_largest), int(earliest)
+
+
+def _iso_ms(ms: int) -> str:
+    """Millisecond timestamp -> 'YYYY-MM-DD HH:MM UTC' for logs."""
+    try:
+        return pd.to_datetime(int(ms), unit="ms").strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return str(ms)
+
+
 class ExchangeClient:
     def __init__(self, cfg: ExchangeConfig, mode: str, fee_pct: float,
                  slippage_pct: float, starting_equity: float):
@@ -200,10 +324,17 @@ class ExchangeClient:
 
         `since` starts at now - days and the walk continues in batches up to the
         current timestamp, sleeping between requests so a long lookback cannot
-        trip a rate limit or return short pages.
+        trip a rate limit or return short pages. When the requested window is
+        deeper than the venue stores, the start is pulled back to the grain's
+        known limit and, failing that, to the earliest candle actually served.
         """
-        days = max(1, min(int(days), MAX_DAYS))
+        requested_days = max(1, min(int(days), MAX_DAYS))
         timeframe = timeframe or self.cfg.timeframe
+        days = clamp_lookback_days(requested_days, timeframe)
+        if days != requested_days:
+            log.warning("Lookback %s day(s) exceeds what %s stores for %s — requesting %s day(s) "
+                        "instead. %s", requested_days, self.cfg.exchange_id, timeframe, days,
+                        lookback_limit_note(timeframe))
         ms_per_bar = int(self.exchange.parse_timeframe(timeframe)) * 1000
 
         self.exchange.load_markets()
@@ -219,11 +350,19 @@ class ExchangeClient:
         log.info("Fetching %s %s from %s: %s day(s) (~%s candles) in pages of %s, %.2fs pause",
                  self.cfg.symbol, timeframe, self.cfg.exchange_id, days,
                  f"{expected:,}", limit, pause)
-        rows, pages, largest_page = paginate_ohlcv(
+        rows, pages, largest_page, effective_since = fetch_ohlcv_window(
             self.exchange, self.cfg.symbol, timeframe, since_ms, end_ms, limit, pause, max_chunks)
         df = to_frame(rows)
-        log.info("Fetched %s candles across %s days for %s (%s) in %d page(s) of up to %d",
-                 f"{len(df):,}", days, self.cfg.symbol, timeframe, pages, largest_page)
+        served_days = (end_ms - effective_since) / MS_PER_DAY if effective_since else 0
+        log.info("Fetched %s candles across %s day(s) for %s (%s) in %d page(s) of up to %d",
+                 f"{len(df):,}", f"{served_days:.0f}", self.cfg.symbol, timeframe, pages, largest_page)
+        if df.empty:
+            log.error("No %s candles available for %s from this venue. %s",
+                      timeframe, self.cfg.symbol, lookback_limit_note(timeframe))
+        elif effective_since and effective_since > since_ms:
+            log.warning("Only the last %s day(s) of %s were served (requested %s) — the backtest "
+                        "will cover a shorter window than asked", f"{served_days:.0f}",
+                        timeframe, days)
         return df
 
     def current_price(self) -> float:

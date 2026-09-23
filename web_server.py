@@ -38,7 +38,7 @@ safe_load_dotenv()
 migrate_and_sanitize_env_file()
 
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
-from exchange_client import ExchangeClient, MAX_DAYS
+from exchange_client import ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager, reward_risk_ratio
@@ -1325,7 +1325,10 @@ def run_backtest_endpoint(req: BacktestRequest):
 
         df = fetch_historical(exch, req.symbol, req.timeframe, days)
         if df is None or len(df) < 60:
-            raise HTTPException(status_code=400, detail="Insufficient historical bars returned for backtest")
+            raise HTTPException(status_code=400, detail=(
+                f"Insufficient historical bars for {req.symbol} {req.timeframe}: "
+                f"the exchange returned {0 if df is None else len(df)} candle(s). "
+                f"{lookback_limit_note(req.timeframe)}"))
 
         results = run_backtest(df, cfg)
         return {
@@ -2341,7 +2344,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div>
               <label class="block text-slate-400 mb-1">Timeframe</label>
-              <select id="bt-timeframe" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+              <select id="bt-timeframe" onchange="applyTimeframeLimits()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
                 <option value="5m">5m</option>
                 <option value="15m" selected>15m</option>
                 <option value="1h">1h</option>
@@ -2360,6 +2363,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <button type="button" onclick="setBacktestDays(365)" class="flex-1 text-[10px] text-slate-300 bg-slate-800 hover:bg-slate-700 border border-bordercol rounded px-1.5 py-0.5 transition">365d</button>
                 <button type="button" onclick="setBacktestDays(730)" class="flex-1 text-[10px] text-slate-300 bg-slate-800 hover:bg-slate-700 border border-bordercol rounded px-1.5 py-0.5 transition">730d</button>
               </div>
+              <div id="bt-days-note" class="text-[10px] text-slate-500 mt-1">--</div>
             </div>
             <div>
               <label class="block text-slate-400 mb-1">Start Equity ($)</label>
@@ -2941,6 +2945,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let botRunning = false;
     let currentUser = null;
     let exchangesList = [];
+
+    // Per-grain storage limits, injected by the server from the same table the
+    // candle fetcher uses. Asking deeper than this returns an empty page, not
+    // more candles, so the lookback input is bounded by it.
+    const BT_LOOKBACK_LIMITS = __BT_LOOKBACK_LIMITS__;
 
     // --- Exchange Meta & Selection ---
     async function loadExchanges() {
@@ -4306,7 +4315,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function setBacktestDays(days) {
       const el = document.getElementById('bt-days');
-      if (el) el.value = days;
+      if (!el) return;
+      // The quick-pick buttons are meant to be one click, but a grain that only
+      // stores 60 days must not silently hand the API a 730-day request.
+      const limit = backtestDayLimit();
+      el.value = Math.min(days, limit);
+      applyTimeframeLimits();
+    }
+
+    function backtestDayLimit() {
+      const tf = (document.getElementById('bt-timeframe') || {}).value;
+      const entry = BT_LOOKBACK_LIMITS[tf];
+      return entry ? entry.max_days : 730;
+    }
+
+    function applyTimeframeLimits() {
+      const input = document.getElementById('bt-days');
+      const note = document.getElementById('bt-days-note');
+      const limit = backtestDayLimit();
+      const grain = (document.getElementById('bt-timeframe') || {}).value || '';
+      const entry = BT_LOOKBACK_LIMITS[grain] || {};
+      if (input) input.max = String(limit);
+
+      const asked = input ? parseInt(input.value, 10) : limit;
+      const tooDeep = Number.isFinite(asked) && asked > limit;
+      if (note) {
+        note.innerText = tooDeep
+          ? `${grain} on this venue stores ~${limit} days; the run will be capped to ${limit}.`
+          : (entry.note || `Lookback up to ${limit} days for ${grain}.`);
+        note.className = tooDeep ? 'text-[10px] text-amber-400 mt-1' : 'text-[10px] text-slate-500 mt-1';
+      }
+      return limit;
     }
 
     async function executeBacktest(e) {
@@ -4320,11 +4359,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running Backtest...';
 
+      // Warn and cap rather than sending a request the venue cannot answer.
+      const dayLimit = applyTimeframeLimits();
+      const askedDays = parseInt(document.getElementById('bt-days').value, 10);
+      const days = Math.min(Number.isFinite(askedDays) ? askedDays : dayLimit, dayLimit);
+      if (days !== askedDays) setIf('bt-days-note', `Capped to ${days} days for this timeframe.`);
+
       const payload = {
         exchange: document.getElementById('bt-exchange').value,
         symbol: document.getElementById('bt-symbol').value,
         timeframe: document.getElementById('bt-timeframe').value,
-        days: parseInt(document.getElementById('bt-days').value),
+        days: days,
         starting_equity: parseFloat(document.getElementById('bt-equity').value),
         use_fib_filter: document.getElementById('bt-use-fib').checked,
         fib_level_mode: document.getElementById('bt-fib-depth').value,
@@ -4715,10 +4760,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     setInterval(fetchStatus, 3000);
     setInterval(refreshAnalysis, 15000);
     setInterval(refreshLogs, 5000);
+    applyTimeframeLimits();
   </script>
 </body>
 </html>
 """
+
+# Per-grain lookback limits, injected into the page so the UI can guide the
+# lookback input from the same single source of truth the fetcher uses.
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    "__BT_LOOKBACK_LIMITS__", json.dumps(lookback_limits(), sort_keys=True))
+
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def get_dashboard():
