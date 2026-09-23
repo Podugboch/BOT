@@ -70,6 +70,49 @@ and slippage applied, and prints win rate, total return, max drawdown, and an
 approximate Sharpe ratio. Try multiple symbols, timeframes, and date ranges —
 if it only looks good on one narrow window, that's overfitting, not an edge.
 
+Long lookbacks are paginated, because every exchange caps a single kline
+request (MEXC spot serves 500 candles, Kraken 720, Coinbase 300, Binance/Bybit
+1000). The fetcher walks the window forward with the `since` cursor, sleeps
+`max(exchange.rateLimit, 250ms)` between pages, retries transient failures with
+backoff, and concatenates the slices into one ordered, de-duplicated series. So
+`--days 250 --timeframe 5m` really does fetch ~72,000 candles across 144 pages
+(~35s of rate-limit pacing) instead of silently backtesting a single page:
+
+```
+Fetched 72,000 candles across 250 days for BTC/USDT (5m) in 144 page(s) of up to 500 — 2023-03-09 22:13 to 2023-11-14 22:08 UTC (100% of the nominal 72,000)
+```
+
+### Why no trades? Every signal explains itself
+
+The backtest walks the entry pipeline stage by stage — core indicator trigger,
+Fibonacci filter, capital/position sizing — and tallies what happened at each
+one. Whenever a core signal fires but no trade happens, the exact reason is
+written to the activity log (`bot.log`, i.e. the dashboard's Live Bot Activity
+Logs) and kept in the run report:
+
+```
+Timestamp: 2026-03-14 12:00 | Core signal triggered: BUY | Rejected by: Price outside the Fibonacci 0.618 zone (nearest level $46,800.00 is 0.91% away, band ±0.50%)
+```
+
+The same wording is used by the live bot (`bot.py`) for the cycle it just
+evaluated. Each run ends with the summary, printed by the CLI, returned under
+`results["diagnostics"]` by `/api/backtest`, and copyable from the backtester
+panel's "Run report" box:
+
+```
+--- Signal pipeline diagnostics ---
+Candles evaluated        : 1,448 (warmup 52 skipped, 77 in position, 9 signals blocked by risk gate)
+Stage 1 core indicator   : 23 raw BUY signal(s); misses: adx_filter=3, no_ema_cross=1,345
+Stage 2 Fibonacci filter : 17 passed, 6 blocked
+Stage 3 capital / sizing : 8 passed, 0 blocked
+Signals rejected         : fib_zone=6, risk_gate=9
+Trades executed          : 8
+```
+
+Raw signals always reconcile: `executed + rejected == stage 1 triggers`, so a
+run can never silently drop a signal. Rejection detail is capped
+(`REJECTION_LOG_LIMIT`) so a 72,000-candle run cannot flood the log.
+
 ## 2. Paper trade
 
 `config.py` defaults to `mode = "paper"`. Just run:
@@ -102,11 +145,53 @@ Stop the bot at any time, in any mode: `touch KILL` in this directory.
 No lines to draw, nothing manual. Each bar, the bot looks back
 `fib_lookback` bars (50 by default), finds the highest high and lowest low
 in that window, and computes the 38.2% / 50% / 61.8% retracement levels down
-from that high. A BUY signal only fires if price is also within
-`fib_tolerance_pct` (0.5% by default) of one of those levels — so the EMA
-crossover has to line up with a real pullback into a support zone, not just
-any point in the trend. Set `use_fib_filter = False` in `config.py` to turn
-it off and compare.
+from that high. The anchors are a **rolling window**: they are recomputed from
+each bar's own last `fib_lookback` candles, so an old swing that drops out of
+the window stops pulling the levels around — nothing is pinned to the start of
+the data.
+
+A BUY signal fires when the core EMA/ADX/RSI setup is also at a pullback: price
+must sit inside a **percentage band** of `fib_tolerance_pct` (1.0% by default;
+tune it between roughly 1.0% and 1.5%) around one of those levels, or have
+tagged one within the last `fib_touch_window` bars (3 by default; set it to 1
+for the old same-bar-only behaviour). The crossover itself is likewise allowed
+to stay fresh for `ema_cross_window` bars (3 by default) as long as EMA fast is
+still above EMA slow — set it to 1 for the old "cross on this exact candle"
+rule. Requiring both the tag *and* the crossover on one single bar is what used
+to starve the strategy. A zero/negative tolerance falls back to the default
+band instead of degenerating into an impossible exact price match.
+
+Turn the filter off with the **"Enable Fibonacci Zone Filter"** checkbox in the
+backtester (or `use_fib_filter = False` in `config.py` / the settings panel) to
+trade the core signal alone: the check is then skipped entirely, and the backtest
+results panel reports whether it ran and how many core signals it skipped. The
+checkbox is sent to `POST /api/backtest` as `use_fib_filter` (the alias
+`enable_fib_filter` is accepted too) and overrides `config.py` for that run.
+
+## Reading a backtest result
+
+Every run returns, alongside the P&L summary, the data window it was measured
+on and a stage-by-stage account of the signal pipeline:
+
+- `candles_tested` / `date_range` — how many candles were fetched and the first
+  and last timestamp covered (e.g. 72,000 candles over 250 days on 5m).
+- `diagnostics.report` — total candles evaluated, raw signals detected,
+  rejections per filter rule (fib zone, sizing, risk gate, circuit breaker),
+  and final trades executed, with the headline numbers echoed to the activity log.
+- `diagnostics.rejection_log` — for each blocked signal:
+  `Timestamp: 2026-03-14 12:00 | Core signal triggered: BUY | Rejected by: ...`
+  so a run with no trades explains itself instead of just reporting zero.
+
+## Historical data volume
+
+A single ccxt `fetch_ohlcv` call only returns one batch (500 candles on MEXC
+spot, up to 1,000 elsewhere), so the backtester walks the whole lookback window
+in pages: `since = now - days`, advancing to the last candle's timestamp + 1ms
+each round, sleeping between requests (`exchange.rateLimit / 1000`, floor 0.25s)
+and retrying transient network errors. Pages are concatenated into one
+continuous, de-duplicated series, and the run logs the tally, e.g.
+`Fetched 72,000 candles across 250 days for BTC/USDT (5m) in 144 page(s) of up
+to 500`.
 
 ## Tuning
 

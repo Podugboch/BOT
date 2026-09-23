@@ -5,16 +5,19 @@ Covers indicators, strategy signals, risk management, execution, and backtesting
 import os
 import shutil
 import tempfile
+import ccxt
 import pytest
 import numpy as np
 import pandas as pd
 
+import backtester
+import exchange_client
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
-from strategy import Signal, add_indicators, generate_signal, _near_fib_support
+from strategy import Signal, add_indicators, generate_signal, _near_fib_support, _fib_pullback_ok
 from risk_manager import RiskManager
 from exchange_client import ExchangeClient
-from backtester import run_backtest, summarize
+from backtester import run_backtest, summarize, fetch_historical
 from bot import TradingBot
 
 
@@ -366,6 +369,35 @@ class TestTradingBot:
 # ============================================================================
 # MULTI-STRATEGY & SETTINGS ENDPOINT TESTS
 # ============================================================================
+    def test_live_entry_pipeline_logs_the_rejection_reason(self, caplog):
+        """A fired core signal that is filtered out must say why in the activity log."""
+        cfg = BotConfig()
+        bot = TradingBot(cfg)
+        df = _pipeline_cross_frame()
+
+        with caplog.at_level("INFO", logger="bot"):
+            bot._maybe_enter(df, float(df["close"].iloc[-1]))
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        assert "Core signal triggered: BUY | Rejected by: Price outside the Fibonacci" in text
+        assert "core_trigger=True" in text and "sizing=not reached" in text
+        assert bot.position is None
+
+    def test_live_entry_pipeline_logs_sizing_rejection(self, caplog):
+        cfg = BotConfig()
+        cfg.strategy.use_fib_filter = False
+        cfg.risk.risk_per_trade_pct = 0.0            # sizing collapses to 0
+        bot = TradingBot(cfg)
+        df = _pipeline_cross_frame()
+
+        with caplog.at_level("INFO", logger="bot"):
+            bot._maybe_enter(df, float(df["close"].iloc[-1]))
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        assert "Rejected by: position sizing returned 0" in text
+        assert "sizing=False" in text
+        assert bot.position is None
+
 class TestNewIndicatorsAndMultiStrategy:
     def test_bollinger_bands(self, sample_ohlcv):
         from indicators import bollinger_bands
@@ -445,3 +477,628 @@ class TestNewIndicatorsAndMultiStrategy:
         assert st_data["timeframe"] == "5m"
         assert st_data["strategy"] == "pure_ema_cross"
 
+
+# ============================================================================
+# FIBONACCI ZONE FILTER — STARVATION FIXES
+# ============================================================================
+class TestFibZoneFilter:
+    """Covers the three starvation fixes: rolling swing anchors, a percentage
+    band instead of an exact match, and a toggle that skips the check."""
+
+    @staticmethod
+    def _cross(extra_curr=None, extra_prev=None):
+        """A clean core BUY setup: bullish EMA cross, trending ADX, tame RSI."""
+        prev = {"ema_fast": 100.0, "ema_slow": 100.0, "rsi": 50.0, "adx": 25.0, "close": 100.0}
+        curr = {"ema_fast": 102.0, "ema_slow": 100.5, "rsi": 55.0, "adx": 26.0, "close": 102.0}
+        prev.update(extra_prev or {})
+        curr.update(extra_curr or {})
+        return pd.DataFrame([prev, curr])
+
+    def test_swing_anchors_follow_the_trailing_window(self):
+        """The swing high/low must roll forward with the last N bars — an old
+        spike that leaves the window must stop anchoring the levels."""
+        n = 40
+        high = np.full(n, 101.0)
+        low = np.full(n, 99.0)
+        high[5] = 200.0                      # one-off spike early in the series
+        df = pd.DataFrame({
+            "high": high, "low": low, "close": (high + low) / 2.0,
+        })
+        fib = fib_retracement_levels(df, lookback=20)
+
+        # Bar 19 still sees the spike (its 20-bar window covers index 5)...
+        assert fib["swing_high"].iloc[19] == 200.0
+        # ...but by bar 25 the spike has aged out of the trailing window.
+        assert fib["swing_high"].iloc[25] == pytest.approx(101.0)
+        assert fib["swing_high"].iloc[-1] == pytest.approx(101.0)
+        # Anchors equal the trailing extremes on every warmed-up bar, i.e. the
+        # window slides with the data instead of being pinned to its start.
+        expected = df["high"].rolling(20).max()
+        assert fib["swing_high"].dropna().equals(expected.dropna())
+
+    def test_fib_levels_accept_a_percentage_band_not_exact_match(self):
+        cfg = StrategyConfig()               # fib_tolerance_pct = 0.01 (1%)
+        # Price 0.4% away from the 38.2% level is inside the band.
+        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 100.4,
+                                            "fib_500": 95.0, "fib_618": 90.0}), cfg) is True
+        # 1.4% away is outside it.
+        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 101.4,
+                                            "fib_500": 95.0, "fib_618": 90.0}), cfg) is False
+        # The band scales with price, so a $50000 asset gets a $500 band.
+        assert _near_fib_support(pd.Series({"close": 50000.0, "fib_382": 50200.0,
+                                            "fib_500": 49000.0, "fib_618": 48000.0}), cfg) is True
+
+    def test_default_tolerance_is_widened_and_tunable(self):
+        """0.5% starved the strategy — the default band is now 1.0% and can be
+        opened up to ~1.5% for choppier books."""
+        cfg = StrategyConfig()
+        assert cfg.fib_tolerance_pct == pytest.approx(0.01)
+
+        inside = pd.Series({"close": 100.0, "fib_382": 100.9, "fib_500": 95.0, "fib_618": 90.0})
+        outside = pd.Series({"close": 100.0, "fib_382": 101.4, "fib_500": 95.0, "fib_618": 90.0})
+        assert _near_fib_support(inside, cfg) is True
+        assert _near_fib_support(outside, cfg) is False
+        assert _near_fib_support(outside, StrategyConfig(fib_tolerance_pct=0.015)) is True
+        # A nonsense tolerance never degrades back into an exact-price match.
+        assert _near_fib_support(inside, StrategyConfig(fib_tolerance_pct=-1.0)) is True
+
+    def test_zero_tolerance_does_not_degrade_to_exact_match(self):
+        cfg = StrategyConfig(fib_tolerance_pct=0.0)
+        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": 100.4,
+                                            "fib_500": 90.0, "fib_618": 80.0}), cfg) is True
+
+    def test_missing_or_nan_fib_levels_never_block(self):
+        cfg = StrategyConfig()
+        # NaN levels (rolling swing not warmed up) are not "support".
+        assert _near_fib_support(pd.Series({"close": 100.0, "fib_382": np.nan,
+                                            "fib_500": np.nan, "fib_618": np.nan}), cfg) is False
+        # A frame with no fib columns at all must not raise either.
+        assert _near_fib_support(pd.Series({"close": 100.0}), cfg) is False
+        # And with no fib data available the entry falls back to the core signal.
+        sig = generate_signal(self._cross(), cfg, position_open=False)
+        assert sig == Signal.BUY
+
+    def test_recent_pullback_touch_satisfies_the_window(self):
+        far, near = 130.0, 100.0
+        rows = [
+            {"close": far, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},
+            {"close": near, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},  # tagged 2 bars back
+            {"close": far, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},
+            {"close": far, "fib_382": 100.2, "fib_500": 95.0, "fib_618": 90.0},
+        ]
+        df = pd.DataFrame(rows)
+        assert _fib_pullback_ok(df, StrategyConfig(fib_touch_window=3)) is True
+        # fib_touch_window = 1 reproduces the old single-bar behaviour.
+        assert _fib_pullback_ok(df, StrategyConfig(fib_touch_window=1)) is False
+        # The signal bar itself is not at a level — only the window makes it pass.
+        assert _near_fib_support(df.iloc[-1], StrategyConfig()) is False
+
+    @staticmethod
+    def _pullback_frame():
+        """Cross 2 bars back, EMA trend still intact, price back in the fib zone."""
+        return pd.DataFrame([
+            {"close": 101.0, "ema_fast": 100.0, "ema_slow": 100.0, "rsi": 50.0, "adx": 25.0,
+             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+            {"close": 102.0, "ema_fast": 102.0, "ema_slow": 100.5, "rsi": 55.0, "adx": 26.0,
+             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+            {"close": 103.0, "ema_fast": 103.0, "ema_slow": 101.0, "rsi": 56.0, "adx": 27.0,
+             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+            {"close": 102.0, "ema_fast": 104.0, "ema_slow": 102.0, "rsi": 55.0, "adx": 26.0,
+             "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0},
+        ])
+
+    def test_cross_stays_entry_eligible_across_recent_bars(self):
+        """The crossover must not have to land on the exact bar that tags the
+        fib zone: a cross a couple of bars back still counts while the trend holds."""
+        df = self._pullback_frame()
+        cfg = StrategyConfig()
+        assert cfg.ema_cross_window == 3
+
+        stages = {}
+        assert generate_signal(df, cfg, position_open=False, diagnostics=stages) == Signal.BUY
+        assert stages["core_trigger"] is True
+        assert stages["ema_cross_bars_ago"] == 2
+        assert stages["fib_pass"] is True
+
+        # ema_cross_window = 1 reproduces the old strict "cross on this candle" rule.
+        strict = StrategyConfig(ema_cross_window=1)
+        strict_stages = {}
+        assert generate_signal(df, strict, position_open=False, diagnostics=strict_stages) == Signal.HOLD
+        assert strict_stages["core_trigger"] is False
+        assert strict_stages["rejected_by"] == "no_ema_cross"
+        assert "no fresh EMA crossover on this candle" in strict_stages["core_reason"]
+
+    def test_cross_that_flipped_back_below_is_not_an_entry(self):
+        """A window looks back for freshness only — the trend must still be up."""
+        df = self._pullback_frame()
+        df.loc[3, ["ema_fast", "ema_slow"]] = [101.0, 101.5]
+
+        stages = {}
+        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert stages["core_trigger"] is False
+        assert "fallen back below the slow line" in stages["core_reason"]
+
+    def test_disabled_filter_uses_core_signals_only(self):
+        """Same core cross, price far from every fib level: the filter blocks
+        it, and toggling the checkbox off lets the trade through."""
+        curr = {"close": 102.0, "fib_382": 130.0, "fib_500": 120.0, "fib_618": 110.0}
+        df = self._cross(extra_curr=curr)
+
+        blocked = StrategyConfig(use_fib_filter=True)
+        diagnostics = {}
+        sig = generate_signal(df, blocked, position_open=False, diagnostics=diagnostics)
+        assert sig == Signal.HOLD
+        assert diagnostics.get("fib_blocked") == 1
+
+        allowed = StrategyConfig(use_fib_filter=False)
+        diagnostics_off = {}
+        sig = generate_signal(df, allowed, position_open=False, diagnostics=diagnostics_off)
+        assert sig == Signal.BUY
+        # The fib stage is recorded as "not evaluated" — the levels were never
+        # consulted, so the trade rode on the core signal alone.
+        assert diagnostics_off["core_trigger"] is True
+        assert diagnostics_off["fib_evaluated"] is False
+        assert diagnostics_off["fib_pass"] is None
+        assert diagnostics_off["fib_reason"] is None
+
+    def test_backtest_reports_and_skips_fib_when_toggled_off(self):
+        n = 800
+        trend = 50000 + np.sin(np.linspace(0, 30, n)) * 3000
+        close = trend + np.random.normal(0, 50, n)
+        df = pd.DataFrame({
+            "ts": pd.date_range("2026-01-01", periods=n, freq="15min"),
+            "open": close - 20, "high": close + 100, "low": close - 100,
+            "close": close, "volume": np.random.uniform(10, 100, n),
+        })
+
+        off = BotConfig()
+        off.strategy.use_fib_filter = False
+        off.strategy.adx_trend_threshold = 10
+        res_off = run_backtest(df.copy(), off)
+        assert res_off["fib_filter_enabled"] is False
+        assert res_off["fib_blocked_signals"] == 0
+
+        on = BotConfig()
+        on.strategy.use_fib_filter = True
+        on.strategy.adx_trend_threshold = 10
+        res_on = run_backtest(df.copy(), on)
+        assert res_on["fib_filter_enabled"] is True
+
+        # Strict single-bar fib check can only ever produce fewer trades.
+        strict = BotConfig()
+        strict.strategy.use_fib_filter = True
+        strict.strategy.adx_trend_threshold = 10
+        strict.strategy.fib_touch_window = 1
+        res_strict = run_backtest(df.copy(), strict)
+        assert res_strict["num_trades"] <= res_off["num_trades"]
+        assert res_on["num_trades"] >= res_strict["num_trades"]
+
+    def test_backtest_endpoint_honors_the_ui_checkbox(self, monkeypatch):
+        """The 'Enable Fibonacci Zone Filter' checkbox must reach the engine.
+
+        Drives the real /api/backtest handler (request model -> config -> engine)
+        with the historical fetch stubbed out, so no exchange network is needed.
+        """
+        import web_server
+
+        n = 800
+        trend = 50000 + np.sin(np.linspace(0, 30, n)) * 3000
+        close = trend + np.random.normal(0, 50, n)
+        hist = pd.DataFrame({
+            "ts": pd.date_range("2026-01-01", periods=n, freq="15min"),
+            "open": close - 20, "high": close + 100, "low": close - 100,
+            "close": close, "volume": np.random.uniform(10, 100, n),
+        })
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        base = {"exchange": "binance", "symbol": "BTC/USDT", "timeframe": "15m",
+                "days": 30, "starting_equity": 1000.0}
+
+        off = web_server.run_backtest_endpoint(
+            web_server.BacktestRequest(**base, use_fib_filter=False))
+        assert off["success"] is True
+        assert off["results"]["fib_filter_enabled"] is False
+        assert off["results"]["fib_blocked_signals"] == 0
+
+        on = web_server.run_backtest_endpoint(
+            web_server.BacktestRequest(**base, use_fib_filter=True))
+        assert on["success"] is True
+        assert on["results"]["fib_filter_enabled"] is True
+        assert on["results"]["num_trades"] <= off["results"]["num_trades"]
+
+
+    def test_endpoint_accepts_enable_fib_filter_alias(self, monkeypatch):
+        """The UI checkbox is labelled 'Enable Fibonacci Zone Filter', so the
+        payload may arrive as `enable_fib_filter`; it must override config.py."""
+        import web_server
+
+        n = 800
+        trend = 50000 + np.sin(np.linspace(0, 30, n)) * 3000
+        close = trend + np.random.normal(0, 50, n)
+        hist = pd.DataFrame({
+            "ts": pd.date_range("2026-01-01", periods=n, freq="15min"),
+            "open": close - 20, "high": close + 100, "low": close - 100,
+            "close": close, "volume": np.random.uniform(10, 100, n),
+        })
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        base = {"exchange": "binance", "symbol": "BTC/USDT", "timeframe": "15m",
+                "days": 30, "starting_equity": 1000.0}
+
+        # config.py ships with use_fib_filter = True, so an explicit False here
+        # can only come from the request payload.
+        assert BotConfig().strategy.use_fib_filter is True
+        req_off = web_server.BacktestRequest(**base, enable_fib_filter=False)
+        assert req_off.use_fib_filter is False
+        off = web_server.run_backtest_endpoint(req_off)
+        assert off["results"]["fib_filter_enabled"] is False
+
+        on = web_server.run_backtest_endpoint(
+            web_server.BacktestRequest(**base, enable_fib_filter=True))
+        assert on["results"]["fib_filter_enabled"] is True
+
+        # An explicit `use_fib_filter` still wins over a stale alias.
+        both = web_server.BacktestRequest(**base, use_fib_filter=False, enable_fib_filter=True)
+        assert both.use_fib_filter is False
+
+
+class TestBacktestResultPayload:
+    """Keys the frontend renders straight out of the /api/backtest response."""
+
+    def test_results_report_candles_tested_and_date_range(self):
+        df = _wave_ohlcv(n=400)
+        res = run_backtest(df.copy(), BotConfig())
+
+        assert res["candles_tested"] == len(df) == 400
+        assert res["date_range"] == [df["ts"].iloc[0].isoformat(), df["ts"].iloc[-1].isoformat()]
+        assert res["date_range"][0] < res["date_range"][1]
+        assert "Data window" in res["diagnostics"]["report"]
+
+    def test_date_range_is_present_in_the_http_payload(self, monkeypatch):
+        import web_server
+
+        hist = _wave_ohlcv(n=400)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+        payload = web_server.run_backtest_endpoint(web_server.BacktestRequest(
+            exchange="binance", symbol="BTC/USDT", timeframe="15m", days=5))
+
+        assert payload["success"] is True
+        assert payload["results"]["candles_tested"] == 400
+        assert payload["bars_analyzed"] == 400
+        assert payload["results"]["date_range"][0] == hist["ts"].iloc[0].isoformat()
+
+    def test_date_range_handles_missing_timestamps(self):
+        assert backtester._date_range(pd.DataFrame({"close": [1.0, 2.0]})) == [None, None]
+        assert backtester._date_range(pd.DataFrame()) == [None, None]
+
+
+# ============================================================================
+# HISTORICAL CANDLE FETCHING — PAGINATION
+# ============================================================================
+class _FakeExchange:
+    """ccxt-shaped exchange that serves synthetic klines in capped pages.
+
+    Mirrors the real-world shapes the fetcher has to survive: an advertised
+    page size, an actual (smaller) page size — MEXC spot advertises 1000 but
+    serves at most 500 — optional overlapping pages, empty payloads, transient
+    network errors and a venue that ignores `since`.
+    """
+
+    TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+
+    def __init__(self, advertised=1000, per_page=500, days_of_history=400, stall=False,
+                 fail_times=0, overlap=0):
+        self.id = "fake"
+        self.rateLimit = 50                     # ms, like MEXC
+        self.features = {"spot": {"fetchOHLCV": {"limit": advertised}}}
+        self._advertised = advertised
+        self._per_page = per_page
+        self._now = 1_700_000_000_000
+        self._first_ms = self._now - days_of_history * 24 * 60 * 60 * 1000
+        self._stall = stall
+        self._fail_times = fail_times
+        self._overlap = overlap
+        self.calls = []
+
+    def market(self, symbol):
+        return {"limits": {"ohlcv": {"max": self._advertised}}}
+
+    def load_markets(self):
+        return {}
+
+    def parse_timeframe(self, timeframe):
+        return self.TF_SECONDS[timeframe]
+
+    def milliseconds(self):
+        return self._now
+
+    def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None, **kwargs):
+        self.calls.append({"symbol": symbol, "since": since, "limit": limit})
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise ccxt.NetworkError("temporary failure")
+
+        ms = self.TF_SECONDS[timeframe] * 1000
+        if self._stall:
+            base = self._first_ms
+            return [[base + i * ms, 10.0, 11.0, 9.0, 10.5, 1.0] for i in range(self._per_page)]
+
+        start = max(since if since is not None else self._first_ms, self._first_ms)
+        # Real venues snap `since` onto the candle grid (Binance returns the
+        # bar containing it), so a +1ms cursor re-serves one bar per page.
+        start -= (start - self._first_ms) % ms
+        page = self._per_page if limit is None else min(self._per_page, limit)
+        rows = []
+        for k in range(self._overlap):          # re-serve a few older candles
+            rows.append([start - (self._overlap - k) * ms, 10.0, 11.0, 9.0, 10.5, 1.0])
+        ts = start
+        for _ in range(page):
+            if ts > self._now:
+                break
+            rows.append([ts, 10.0, 11.0, 9.0, 10.5, 1.0])
+            ts += ms
+        return rows
+
+
+class TestHistoricalPagination:
+    """Backtester data fetch must cover the whole lookback window, not one page."""
+
+    def test_walks_past_a_capped_page(self):
+        """MEXC regression: advertise 1000, serve 500 — the old loop stopped at 500."""
+        ex = _FakeExchange(advertised=1000, per_page=500)
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 20, client=ex, pause_sec=0)
+
+        assert len(df) > 5000                      # was 500 before the fix
+        assert len(ex.calls) >= 12                 # ~5760 candles / 500 per page
+        assert df["ts"].is_unique
+        assert df["ts"].is_monotonic_increasing
+        window_ms = 20 * 24 * 60 * 60 * 1000
+        assert df["ts"].iloc[0].value / 1_000_000 >= ex.milliseconds() - window_ms
+
+    def test_each_request_respects_the_exchange_page_limit(self):
+        ex = _FakeExchange(advertised=300, per_page=300)     # Coinbase-like
+        fetch_historical("coinbase", "BTC/USDT", "5m", 2, client=ex, pause_sec=0)
+        assert ex.calls
+        assert all(call["limit"] <= 300 for call in ex.calls)
+
+    def test_pauses_between_pages_to_avoid_rate_limits(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(exchange_client.time, "sleep", slept.append)
+        ex = _FakeExchange(per_page=500)
+
+        fetch_historical("mexc", "BTC/USDT", "5m", 20, client=ex, pause_sec=0.3)
+
+        assert len(slept) == len(ex.calls) - 1        # never sleeps before page 1
+        assert all(pause == pytest.approx(0.3) for pause in slept)
+
+    def test_pause_defaults_to_a_floor_over_exchange_ratelimit(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(exchange_client.time, "sleep", slept.append)
+        ex = _FakeExchange(per_page=500)              # rateLimit 50ms -> floor wins
+
+        fetch_historical("mexc", "BTC/USDT", "5m", 5, client=ex)
+
+        assert slept and all(pause >= exchange_client.MIN_PAUSE_SEC for pause in slept)
+
+    def test_retries_transient_network_errors(self, monkeypatch):
+        monkeypatch.setattr(exchange_client.time, "sleep", lambda _s: None)
+        ex = _FakeExchange(per_page=500, fail_times=2)
+
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 5, client=ex, pause_sec=0)
+
+        assert not df.empty
+        assert len(ex.calls) == 5                     # 3 pages + 2 retries
+        assert len(df) > 1000
+
+    def test_overlapping_pages_are_deduplicated(self):
+        ex = _FakeExchange(per_page=500, overlap=5)
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 20, client=ex, pause_sec=0)
+
+        assert df["ts"].is_unique                     # overlap must not duplicate bars
+        assert df["ts"].is_monotonic_increasing
+        assert len(df) > 5000
+
+    def test_empty_payload_stops_cleanly_when_history_runs_out(self):
+        ex = _FakeExchange(per_page=500, days_of_history=1)
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 30, client=ex, pause_sec=0)
+
+        assert 0 < len(df) < 1000                     # only ~1 day exists
+        assert len(ex.calls) <= 5
+
+    def test_venue_ignoring_since_cannot_loop_forever(self):
+        ex = _FakeExchange(per_page=500, stall=True)
+        df = fetch_historical("mexc", "BTC/USDT", "5m", 30, client=ex, pause_sec=0)
+
+        assert len(ex.calls) == 1                     # detected no progress, stopped at once
+        assert len(df) == 500
+
+    def test_logs_candle_count_and_lookback_window(self, caplog):
+        ex = _FakeExchange(per_page=500)
+        with caplog.at_level("INFO", logger="backtest"):
+            fetch_historical("mexc", "BTC/USDT", "5m", 10, client=ex, pause_sec=0)
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        assert "candles across 10 days for BTC/USDT" in text
+        assert "2,881" in text                        # 10 days of 5m bars, page count reported
+        assert "page(s)" in text
+
+    def test_unknown_exchange_and_timeframe_are_rejected(self):
+        with pytest.raises(ValueError):
+            fetch_historical("not_a_real_venue", "BTC/USDT", "5m", 1)
+        with pytest.raises(ValueError):
+            fetch_historical("mexc", "BTC/USDT", "7m", 1, client=_FakeExchange())
+
+
+# ============================================================================
+# SIGNAL PIPELINE DIAGNOSTICS
+# ============================================================================
+def _pipeline_cross_frame():
+    """Two-row frame holding a clean core BUY cross with fib levels far away."""
+    return pd.DataFrame([
+        {"ts": pd.Timestamp("2026-03-14 11:45"), "open": 100.0, "high": 101.0, "low": 99.0,
+         "close": 100.0, "volume": 1.0, "ema_fast": 100.0, "ema_slow": 100.0, "rsi": 50.0,
+         "adx": 25.0, "atr": 2.0, "fib_382": 130.0, "fib_500": 120.0, "fib_618": 110.0},
+        {"ts": pd.Timestamp("2026-03-14 12:00"), "open": 101.0, "high": 103.0, "low": 100.0,
+         "close": 102.0, "volume": 1.0, "ema_fast": 102.0, "ema_slow": 100.5, "rsi": 55.0,
+         "adx": 26.0, "atr": 2.0, "fib_382": 130.0, "fib_500": 120.0, "fib_618": 110.0},
+    ])
+
+
+def _wave_ohlcv(n=800, seed=7):
+    """Trending-wave series that produces EMA crosses (same shape as above)."""
+    dates = pd.date_range("2026-01-01", periods=n, freq="15min")
+    trend = 50000 + np.sin(np.linspace(0, 30, n)) * 3000
+    close = trend + np.random.default_rng(seed).normal(0, 50, n)
+    return pd.DataFrame({
+        "ts": dates, "open": close - 20, "high": close + 100, "low": close - 100,
+        "close": close, "volume": np.random.default_rng(seed + 1).uniform(10, 100, n),
+    })
+
+
+class TestPipelineDiagnostics:
+    """Each entry-pipeline stage must be reported, and every blocked signal explained."""
+
+    @staticmethod
+    def _series(n=1500, seed=3):
+        """Deterministic series that produces passes, fib rejections and risk blocks."""
+        rng = np.random.default_rng(seed)
+        t = np.arange(n)
+        close = 30000 * np.exp(np.cumsum(0.0004 + 0.0003 * np.sin(t / 300.0) + rng.normal(0, 0.004, n)))
+        return pd.DataFrame({
+            "ts": pd.date_range("2024-01-01", periods=n, freq="15min"),
+            "open": np.concatenate([[close[0]], close[:-1]]),
+            "high": close * (1 + np.abs(rng.normal(0, 0.003, n))),
+            "low": close * (1 - np.abs(rng.normal(0, 0.003, n))),
+            "close": close, "volume": rng.uniform(50, 500, n),
+        })
+
+    @staticmethod
+    def _diag_cfg():
+        cfg = BotConfig()
+        cfg.strategy.adx_trend_threshold = 10
+        cfg.strategy.fib_touch_window = 1      # strict single-bar fib check -> real rejections
+        return cfg
+
+    @staticmethod
+    def _cross(extra_curr=None):
+        prev = {"ema_fast": 100.0, "ema_slow": 100.0, "rsi": 50.0, "adx": 25.0, "close": 100.0}
+        curr = {"ema_fast": 102.0, "ema_slow": 100.5, "rsi": 55.0, "adx": 26.0, "close": 102.0}
+        curr.update(extra_curr or {})
+        return pd.DataFrame([prev, curr])
+
+    def test_stage1_blocked_by_adx(self):
+        df = self._cross({"adx": 12.0})          # no trend strength
+        stages = {}
+        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert stages["core_trigger"] is False
+        assert stages["core_signal"] is None
+        assert stages["rejected_by"] == "adx_filter"
+        assert "ADX" in stages["core_reason"]
+
+    def test_stage1_blocked_by_rsi(self):
+        df = self._cross({"rsi": 71.0})          # overbought
+        stages = {}
+        generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages)
+        assert stages["core_trigger"] is False
+        assert stages["rejected_by"] == "rsi_overbought"
+        assert "RSI" in stages["core_reason"]
+
+    def test_stage1_blocked_by_missing_cross(self):
+        df = self._cross({"ema_fast": 99.9, "ema_slow": 100.0})
+        stages = {}
+        generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages)
+        assert stages["core_trigger"] is False
+        assert stages["rejected_by"] == "no_ema_cross"
+
+    def test_stage2_reports_which_fib_zone_rejected(self):
+        df = self._cross({"close": 102.0, "fib_382": 130.0, "fib_500": 120.0, "fib_618": 110.0})
+        stages = {}
+        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.HOLD
+        assert stages["core_trigger"] is True
+        assert stages["fib_evaluated"] is True
+        assert stages["fib_pass"] is False
+        assert stages["rejected_by"] == "fib_zone"
+        assert "outside the Fibonacci 0.618 zone" in stages["fib_reason"]
+
+    def test_stage2_records_the_zone_when_it_passes(self):
+        df = self._cross({"close": 102.0, "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0})
+        stages = {}
+        assert generate_signal(df, StrategyConfig(), position_open=False, diagnostics=stages) == Signal.BUY
+        assert stages["fib_pass"] is True
+        assert "Fibonacci 0.382 zone" in stages["fib_reason"]
+
+    def test_backtest_counts_every_stage(self):
+        res = run_backtest(self._series(), self._diag_cfg())
+        diag = res["diagnostics"]
+
+        assert diag["candles_evaluated"] == 1500 - diag["candles_warmup"]
+        assert diag["core_signals_detected"] == diag["fib_filter_passed"] + diag["fib_filter_blocked"]
+        assert diag["fib_filter_passed"] == (diag["sizing_passed"] + diag["sizing_blocked"]
+                                             + diag["signals_risk_blocked"])
+        assert diag["trades_executed"] == res["num_trades"]
+        assert res["raw_signals"] == diag["core_signals_detected"]
+        assert res["trades_executed"] == diag["trades_executed"]
+        # Every signal that fired is accounted for: executed or rejected by a named rule.
+        assert diag["fib_filter_blocked"] > 0 and diag["trades_executed"] > 0
+        assert diag["rejections"].get("fib_zone", 0) == diag["fib_filter_blocked"]
+        assert diag["sizing_passed"] == diag["trades_executed"]
+        # Raw signals = executed + rejected: nothing is dropped silently.
+        assert sum(diag["rejections"].values()) + diag["trades_executed"] == diag["core_signals_detected"]
+        assert diag["trades_executed"] >= res["num_trades"]   # a position still open is not a closed trade
+
+    def test_rejection_log_has_the_requested_format(self):
+        res = run_backtest(self._series(), self._diag_cfg())
+        log_lines = res["diagnostics"]["rejection_log"]
+
+        assert log_lines, "expected at least one explained rejection"
+        for line in log_lines:
+            assert line.startswith("Timestamp: ")
+            assert "| Core signal triggered: BUY | Rejected by: " in line
+        assert any("Fibonacci" in line for line in log_lines)
+
+    def test_run_report_lists_the_four_summary_items(self):
+        res = run_backtest(self._series(), self._diag_cfg())
+        report = res["diagnostics"]["report"]
+
+        for expected in ["Candles evaluated", "Stage 1 core indicator",
+                         "Stage 2 Fibonacci filter", "Signals rejected", "Trades executed"]:
+            assert expected in report
+        assert "Rejection detail" in report
+
+    def test_summary_is_echoed_to_the_activity_log(self, caplog):
+        cfg = self._diag_cfg()
+        with caplog.at_level("INFO", logger="backtest"):
+            run_backtest(self._series(), cfg)
+        text = " ".join(record.getMessage() for record in caplog.records)
+
+        assert "Backtest summary:" in text
+        assert "candle(s) evaluated" in text
+        assert "Rejected by:" in text                  # per-signal explanation lines
+        assert "Backtest stages:" in text
+
+    def test_sizing_stage_can_be_the_blocker(self):
+        cfg = BotConfig()
+        cfg.strategy.use_fib_filter = False            # isolate the sizing stage
+        cfg.strategy.adx_trend_threshold = 10
+        cfg.risk.risk_per_trade_pct = 0.0              # sizing always returns 0
+        res = run_backtest(_wave_ohlcv(), cfg)
+        diag = res["diagnostics"]
+
+        assert diag["core_signals_detected"] > 0
+        assert diag["trades_executed"] == 0
+        assert diag["sizing_blocked"] == diag["core_signals_detected"]
+        assert diag["rejections"]["position_sizing"] == diag["core_signals_detected"]
+        assert any("Position sizing returned 0" in line for line in diag["rejection_log"])
+
+    def test_risk_gate_is_reported_as_the_blocker(self):
+        cfg = BotConfig()
+        cfg.strategy.use_fib_filter = False
+        cfg.strategy.adx_trend_threshold = 10
+        cfg.starting_equity = 0.0                      # equity depleted -> no trading
+        res = run_backtest(_wave_ohlcv(), cfg)
+        diag = res["diagnostics"]
+
+        assert diag["core_signals_detected"] > 0
+        assert diag["trades_executed"] == 0
+        assert diag["rejections"]["risk_gate"] == diag["core_signals_detected"]
+        assert any("depleted" in line for line in diag["rejection_log"])

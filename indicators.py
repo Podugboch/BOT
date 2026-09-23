@@ -66,11 +66,18 @@ def fib_retracement_levels(df: pd.DataFrame, lookback: int = 50) -> pd.DataFrame
     from that swing high, which is the standard convention for pullback
     support in an uptrend.
 
+    The anchors are strictly a trailing window: they are recomputed on every
+    bar from that bar's own last `lookback` candles, so a swing that has aged
+    out of the window stops influencing the levels. They are never frozen to
+    the first candle of the series or to the start of the lookback period.
+
     Returns a DataFrame with swing_high, swing_low, and the 38.2/50/61.8%
-    levels. Values are NaN until `lookback` bars of history exist.
+    levels. Values are NaN until `lookback` bars of history exist, which is
+    how callers detect "no fib data yet" (see strategy._fib_levels_available).
     """
-    swing_high = df["high"].rolling(lookback).max()
-    swing_low = df["low"].rolling(lookback).min()
+    lookback = max(1, int(lookback))
+    swing_high = df["high"].rolling(lookback, min_periods=lookback).max()
+    swing_low = df["low"].rolling(lookback, min_periods=lookback).min()
     span = swing_high - swing_low
     return pd.DataFrame({
         "swing_high": swing_high,
