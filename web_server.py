@@ -77,7 +77,7 @@ EXCHANGES_META = [
     {"id": "bybit", "name": "Bybit", "needs_passphrase": False, "sandbox": True},
     {"id": "okx", "name": "OKX", "needs_passphrase": True, "sandbox": True},
     {"id": "bitget", "name": "Bitget", "needs_passphrase": True, "sandbox": True},
-    {"id": "gateio", "name": "Gate.io", "needs_passphrase": False, "sandbox": False},
+    {"id": "gate", "name": "Gate.io", "needs_passphrase": False, "sandbox": False},
     {"id": "mexc", "name": "MEXC", "needs_passphrase": False, "sandbox": False},
     {"id": "bitfinex", "name": "Bitfinex", "needs_passphrase": False, "sandbox": False},
     {"id": "cryptocom", "name": "Crypto.com", "needs_passphrase": False, "sandbox": False},
@@ -2714,7 +2714,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <option value="bybit">Bybit</option>
               <option value="okx">OKX</option>
               <option value="bitget">Bitget</option>
-              <option value="gateio">Gate.io</option>
+              <option value="gate">Gate.io</option>
               <option value="mexc">MEXC</option>
               <option value="bitfinex">Bitfinex</option>
               <option value="cryptocom">Crypto.com</option>
@@ -3463,7 +3463,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .split('{')[0]
         .split('\\n')[0]
         .replace(/\\s+/g, ' ')
-        .replace(/^(binance|mexc|kraken|coinbase|kucoin|bybit|okx|bitget|gateio|bitfinex|cryptocom|htx)\\s+/i, '')
+        .replace(/^(binance|mexc|kraken|coinbase|kucoin|bybit|okx|bitget|gateio|gate|bitfinex|cryptocom|htx)\\s+/i, '')
         .trim();
       return line.length > 160 ? line.slice(0, 157).trimEnd() + '…' : line;
     }
