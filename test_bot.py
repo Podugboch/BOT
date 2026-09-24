@@ -3004,4 +3004,67 @@ globalThis.fetch = async (url, opts) => {
         assert encoded["rows"][0]["error"] == "Not enough history for 5m (max ~60d)"
         assert encoded["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
 
+    def test_breakdown_accounting_sums_to_candles_evaluated_exactly(self):
+        """The miss breakdown + raw signals must sum to candles_evaluated with 0 gap."""
+        from backtester import run_backtest
+        res = run_backtest(TestPipelineDiagnostics._series(), TestPipelineDiagnostics._diag_cfg())
+        diag = res["diagnostics"]
+
+        assert diag["candles_in_position"] > 0
+        assert "in_position" in diag["core_misses"]
+        assert diag["core_misses"]["in_position"] == diag["candles_in_position"]
+        total_accounted = sum(diag["core_misses"].values()) + diag["core_signals_detected"]
+        assert total_accounted == diag["candles_evaluated"]
+        assert total_accounted == res["candles_evaluated"]
+
+    def test_walked_candle_range_and_post_warmup_count_logged(self, caplog):
+        """Activity log must include walked first/last timestamps and post-warmup evaluated count."""
+        from backtester import run_backtest
+        from config import BotConfig
+        cfg = BotConfig()
+        cfg.strategy.use_fib_filter = False
+        hist = _wave_ohlcv(n=200)
+
+        with caplog.at_level("INFO", logger="backtest"):
+            res = run_backtest(hist, cfg)
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        eval_range = res["eval_date_range"]
+        eval_count = res["candles_evaluated"]
+
+        assert "Strategy loop walked" in text
+        assert f"{eval_count:,} post-warmup candle(s) evaluated for signals" in text
+        assert eval_range[0] in text
+        assert eval_range[1] in text
+
+    def test_sweep_endpoints_log_walked_range_and_evaluated_candles(self, monkeypatch, caplog):
+        """Compare windows and compare timeframes endpoints must log walked range and count per row."""
+        import web_server
+        hist = _wave_ohlcv(n=400)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        with caplog.at_level("INFO", logger="web"):
+            # Compare windows
+            req_win = web_server.CompareWindowsRequest(
+                exchange="binance", symbol="BTC/USDT", timeframe="1h",
+                windows=[30, 60], starting_equity=1000.0,
+            )
+            res_win = web_server.compare_windows_endpoint(req_win)
+            assert res_win["success"] is True
+
+            # Compare timeframes
+            req_tf = web_server.CompareTimeframesRequest(
+                exchange="binance", symbol="BTC/USDT", days=30,
+                timeframes=["1h", "4h"], starting_equity=1000.0,
+            )
+            res_tf = web_server.compare_timeframes_endpoint(req_tf)
+            assert res_tf["success"] is True
+
+        web_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "Sweep window 30d: walked" in web_text
+        assert "Sweep window 60d: walked" in web_text
+        assert "Sweep timeframe 1h: walked" in web_text
+        assert "Sweep timeframe 4h: walked" in web_text
+
+
 

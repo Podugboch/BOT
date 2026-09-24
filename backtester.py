@@ -45,6 +45,7 @@ CORE_MISS_LABELS = {
     "no_bb_breakout": "close did not break the upper Bollinger Band",
     "adx_filter": "ADX below the trend threshold",
     "rsi_overbought": "RSI above the overbought limit",
+    "in_position": "already in open position",
 }
 
 
@@ -124,8 +125,12 @@ def format_pipeline_report(results: dict) -> str:
     return "\n".join(lines)
 
 
-def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int) -> None:
+def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int, eval_date_range: list = None) -> None:
     """Echo the pipeline outcome to the activity log (bot.log -> dashboard)."""
+    eval_start, eval_end = (eval_date_range or [None, None])[:2]
+    eval_str = f" from {eval_start} to {eval_end}" if eval_start and eval_end else ""
+    log.info("Strategy loop walked %s post-warmup candle(s) evaluated for signals%s (skipped %s warmup candle(s))",
+             f"{diag['candles_evaluated']:,}", eval_str, f"{warmup:,}")
     for entry in diag["rejection_log"][:REJECTION_LOG_LINES]:
         log.info("%s", entry)
     hidden = len(diag["rejection_log"]) - REJECTION_LOG_LINES
@@ -321,9 +326,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                                   timeframe=cfg.exchange.timeframe)
 
             if not stages.get("core_trigger"):
-                miss = stages.get("rejected_by")
-                if miss:
-                    diag["core_misses"][miss] = diag["core_misses"].get(miss, 0) + 1
+                miss = stages.get("rejected_by") or "no_signal"
+                diag["core_misses"][miss] = diag["core_misses"].get(miss, 0) + 1
             else:
                 diag["core_signals_detected"] += 1
                 if stages.get("fib_evaluated"):
@@ -365,6 +369,7 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
 
         elif position is not None:
             diag["candles_in_position"] += 1
+            diag["core_misses"]["in_position"] = diag["candles_in_position"]
             atr_val = row["atr"] if (pd.notna(row["atr"]) and row["atr"] > 0) else (price * 0.02)
 
             # Trail first, then test the exit against the ratcheted stop, so a
@@ -405,7 +410,11 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
 
         equity_curve.append({"ts": row["ts"], "equity": risk.state.equity})
 
-    _log_pipeline_summary(diag, fib_filter_enabled, warmup)
+    eval_first_row = df.iloc[warmup]["ts"] if warmup < len(df) else None
+    eval_first_ts = eval_first_row.isoformat() if hasattr(eval_first_row, "isoformat") else (str(eval_first_row) if eval_first_row is not None else None)
+    eval_date_range = [eval_first_ts, date_range[1] if date_range else None]
+
+    _log_pipeline_summary(diag, fib_filter_enabled, warmup, eval_date_range)
 
     results = summarize(trades, equity_curve, cfg.starting_equity, cfg.exchange.timeframe)
     results["fib_filter_enabled"] = fib_filter_enabled
@@ -439,15 +448,13 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     results["candles_tested"] = candles_tested
     results["date_range"] = date_range
     results["indicator_date_range"] = date_range
-    eval_first_row = df.iloc[warmup]["ts"] if warmup < len(df) else None
-    eval_first_ts = eval_first_row.isoformat() if hasattr(eval_first_row, "isoformat") else (str(eval_first_row) if eval_first_row is not None else None)
-    results["eval_date_range"] = [eval_first_ts, date_range[1] if date_range else None]
+    results["eval_date_range"] = eval_date_range
     results["candles_warmup"] = warmup
     results["taker_fee_pct"] = float(cfg.taker_fee_pct)
     results["slippage_pct"] = float(cfg.slippage_pct)
     diag["candles_warmup"] = warmup
     diag["indicator_date_range"] = date_range
-    diag["eval_date_range"] = results["eval_date_range"]
+    diag["eval_date_range"] = eval_date_range
     diag["report"] = format_pipeline_report(results)
     return results
 

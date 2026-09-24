@@ -1433,6 +1433,12 @@ def run_backtest_endpoint(req: BacktestRequest):
                 f"{lookback_limit_note(req.timeframe)}"))
 
         results = run_backtest(df, cfg)
+        eval_range = results.get("eval_date_range") or [None, None]
+        eval_count = results.get("candles_evaluated", 0)
+        logger.info(
+            "Backtest run complete for %s %s (%sd): walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+            req.symbol, req.timeframe, days, eval_count, eval_range[0], eval_range[1], results.get("num_trades", 0)
+        )
         return sanitize_for_json({
             "success": True,
             "params": req.dict(),
@@ -1548,12 +1554,19 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                 continue
 
             res = run_backtest(df_slice, cfg)
+            eval_range = res.get("eval_date_range") or [None, None]
+            eval_count = res.get("candles_evaluated", 0)
+            logger.info(
+                "Sweep window %sd: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                w, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+            )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
                 "lookback_days": int(w),
                 "lookback_label": f"{w}d",
-                "candles_evaluated": int(res.get("candles_tested", len(df_slice))),
+                "candles_evaluated": int(res.get("candles_evaluated", len(df_slice))),
+                "candles_tested": int(res.get("candles_tested", len(df_slice))),
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
@@ -1667,12 +1680,19 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
 
             cfg = _build_backtest_config(req, exch, req.symbol, tf_clean, starting_equity)
             res = run_backtest(df, cfg)
+            eval_range = res.get("eval_date_range") or [None, None]
+            eval_count = res.get("candles_evaluated", 0)
+            logger.info(
+                "Sweep timeframe %s: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                tf_clean, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+            )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
                 "timeframe": str(tf_clean),
                 "lookback_days": int(req.days),
-                "candles_evaluated": int(res.get("candles_tested", len(df))),
+                "candles_evaluated": int(res.get("candles_evaluated", len(df))),
+                "candles_tested": int(res.get("candles_tested", len(df))),
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
@@ -5280,7 +5300,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               rowData = {
                 lookback_days: item.days,
                 lookback_label: item.label,
-                candles_evaluated: r.candles_tested ?? 0,
+                candles_evaluated: r.candles_evaluated ?? r.candles_tested ?? 0,
+                candles_tested: r.candles_tested ?? 0,
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
@@ -5399,7 +5420,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               rowData = {
                 timeframe: item.tf,
                 lookback_days: item.days,
-                candles_evaluated: r.candles_tested ?? 0,
+                candles_evaluated: r.candles_evaluated ?? r.candles_tested ?? 0,
+                candles_tested: r.candles_tested ?? 0,
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
