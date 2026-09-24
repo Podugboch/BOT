@@ -19,7 +19,7 @@ import html
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Header, HTTPException, Query, Response, Request, Cookie
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
@@ -38,7 +38,7 @@ safe_load_dotenv()
 migrate_and_sanitize_env_file()
 
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
-from exchange_client import ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days
+from exchange_client import ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days, lookback_limit_note, clamp_lookback_days
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager, reward_risk_ratio
@@ -275,6 +275,7 @@ class BacktestRequest(BaseModel):
     timeframe: str = "15m"
     days: int = 30                      # clamped to 1..MAX_DAYS (730) server-side
     starting_equity: float = 1000.0
+    strategy: str = "ema_cross_fib"
     use_fib_filter: bool = True
     # Dynamic (ATR-scaled) fib band: 0 restores the fixed percentage band.
     fib_tolerance_atr_mult: float = 0.5
@@ -292,6 +293,58 @@ class BacktestRequest(BaseModel):
     def accept_fib_filter_alias(cls, values):
         """Accept `enable_fib_filter` (the label on the UI checkbox) as an
         alias for `use_fib_filter`; an explicit `use_fib_filter` still wins."""
+        if isinstance(values, dict) and "use_fib_filter" not in values:
+            alias = values.get("enable_fib_filter")
+            if alias is not None:
+                values["use_fib_filter"] = alias
+        return values
+
+
+class CompareWindowsRequest(BaseModel):
+    exchange: str = "binance"
+    symbol: str = "BTC/USDT"
+    timeframe: str = "1h"
+    starting_equity: float = 1000.0
+    strategy: str = "ema_cross_fib"
+    use_fib_filter: bool = True
+    fib_tolerance_atr_mult: float = 0.5
+    fib_tolerance_pct: float = 0.003
+    fib_level_mode: str = "deep"
+    trailing_stop_enabled: bool = True
+    trailing_stop_atr_mult: float = 3.5
+    min_bars_between_trades: Optional[int] = None
+    risk_per_trade_pct: float = 0.01
+    windows: Optional[List[int]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_fib_filter_alias(cls, values):
+        if isinstance(values, dict) and "use_fib_filter" not in values:
+            alias = values.get("enable_fib_filter")
+            if alias is not None:
+                values["use_fib_filter"] = alias
+        return values
+
+
+class CompareTimeframesRequest(BaseModel):
+    exchange: str = "binance"
+    symbol: str = "BTC/USDT"
+    days: int = 90
+    starting_equity: float = 1000.0
+    strategy: str = "ema_cross_fib"
+    use_fib_filter: bool = True
+    fib_tolerance_atr_mult: float = 0.5
+    fib_tolerance_pct: float = 0.003
+    fib_level_mode: str = "deep"
+    trailing_stop_enabled: bool = True
+    trailing_stop_atr_mult: float = 3.5
+    min_bars_between_trades: Optional[int] = None
+    risk_per_trade_pct: float = 0.01
+    timeframes: Optional[List[str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_fib_filter_alias(cls, values):
         if isinstance(values, dict) and "use_fib_filter" not in values:
             alias = values.get("enable_fib_filter")
             if alias is not None:
@@ -1317,6 +1370,26 @@ def _clamp_days(days) -> int:
     return max(1, min(value, MAX_DAYS))
 
 
+def _build_backtest_config(req, exchange_id: str, symbol: str, timeframe: str, starting_equity: float) -> BotConfig:
+    cfg = BotConfig()
+    cfg.exchange.exchange_id = exchange_id
+    cfg.exchange.symbol = symbol
+    cfg.exchange.timeframe = timeframe
+    cfg.starting_equity = max(1.0, float(starting_equity))
+    cfg.strategy.strategy_name = (getattr(req, "strategy", None) or "ema_cross_fib").strip().lower()
+    cfg.strategy.use_fib_filter = req.use_fib_filter
+    cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
+    cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
+    cfg.strategy.fib_level_mode = str(req.fib_level_mode or "deep").strip().lower()
+    cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
+    cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
+    # None keeps the timeframe-derived default; an explicit 0 disables it.
+    cfg.strategy.min_bars_between_trades = (None if req.min_bars_between_trades is None
+                                            else max(0, int(req.min_bars_between_trades)))
+    cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
+    return cfg
+
+
 @app.post("/api/backtest")
 def run_backtest_endpoint(req: BacktestRequest):
     try:
@@ -1326,21 +1399,7 @@ def run_backtest_endpoint(req: BacktestRequest):
         days = _clamp_days(req.days)
         starting_equity = max(1.0, float(req.starting_equity))
 
-        cfg = BotConfig()
-        cfg.exchange.exchange_id = exch
-        cfg.exchange.symbol = req.symbol
-        cfg.exchange.timeframe = req.timeframe
-        cfg.starting_equity = starting_equity
-        cfg.strategy.use_fib_filter = req.use_fib_filter
-        cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
-        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
-        cfg.strategy.fib_level_mode = str(req.fib_level_mode or "deep").strip().lower()
-        cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
-        cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
-        # None keeps the timeframe-derived default; an explicit 0 disables it.
-        cfg.strategy.min_bars_between_trades = (None if req.min_bars_between_trades is None
-                                                else max(0, int(req.min_bars_between_trades)))
-        cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
+        cfg = _build_backtest_config(req, exch, req.symbol, req.timeframe, starting_equity)
 
         df = fetch_historical(exch, req.symbol, req.timeframe, days)
         if df is None or len(df) < 60:
@@ -1360,6 +1419,204 @@ def run_backtest_endpoint(req: BacktestRequest):
         raise
     except Exception as e:
         logger.exception("Backtest execution failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backtest/compare-windows")
+def compare_windows_endpoint(req: CompareWindowsRequest):
+    try:
+        exch = req.exchange.strip().lower()
+        if exch not in ccxt.exchanges:
+            raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
+
+        starting_equity = max(1.0, float(req.starting_equity))
+        default_windows = [90, 365, 730]
+        if req.timeframe == "5m":
+            default_windows = [7, 30, 60]
+        elif req.timeframe in ("15m", "30m"):
+            default_windows = [14, 30, 90]
+
+        requested_windows = req.windows or default_windows
+        windows = []
+        for w in requested_windows:
+            clamped = clamp_lookback_days(w, req.timeframe)
+            if clamped not in windows:
+                windows.append(clamped)
+        windows = sorted(windows)
+        if not windows:
+            windows = [30]
+
+        max_days = max(windows)
+        df_full = fetch_historical(exch, req.symbol, req.timeframe, max_days)
+        if df_full is None or len(df_full) < 60:
+            raise HTTPException(status_code=400, detail=(
+                f"Insufficient historical bars for {req.symbol} {req.timeframe}: "
+                f"the exchange returned {0 if df_full is None else len(df_full)} candle(s). "
+                f"{lookback_limit_note(req.timeframe)}"))
+
+        cfg = _build_backtest_config(req, exch, req.symbol, req.timeframe, starting_equity)
+
+        rows = []
+        last_ts = df_full["ts"].iloc[-1]
+        for w in windows:
+            cutoff = last_ts - pd.Timedelta(days=w)
+            df_slice = df_full[df_full["ts"] >= cutoff].copy().reset_index(drop=True)
+            if len(df_slice) < 60:
+                rows.append({
+                    "lookback_days": w,
+                    "lookback_label": f"{w}d",
+                    "error": f"Insufficient bars ({len(df_slice)} < 60)",
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
+            res = run_backtest(df_slice, cfg)
+            diag = res.get("diagnostics", {})
+            rows.append({
+                "lookback_days": w,
+                "lookback_label": f"{w}d",
+                "candles_evaluated": res.get("candles_tested", len(df_slice)),
+                "trades": res.get("total_trades", 0),
+                "win_rate_pct": res.get("win_rate_pct", 0.0),
+                "total_return_pct": res.get("total_return_pct", 0.0),
+                "final_equity": res.get("final_equity", starting_equity),
+                "sharpe_approx": res.get("sharpe_approx"),
+                "realized_rr": res.get("realized_rr", 0.0),
+                "max_drawdown_pct": res.get("max_drawdown_pct", 0.0),
+                "fib_blocked": diag.get("fib_filter_blocked", 0),
+                "sizing_blocked": diag.get("sizing_blocked", 0),
+                "risk_blocked": diag.get("signals_risk_blocked", 0),
+                "total_fees_paid": res.get("total_fees_paid", 0.0),
+                "profitable": res.get("total_return_pct", 0.0) > 0,
+                "eval_date_range": res.get("eval_date_range", []),
+                "date_range": res.get("date_range", []),
+                "candles_warmup": res.get("candles_warmup", 0),
+            })
+
+        profitable_count = sum(1 for r in rows if r.get("profitable"))
+        return {
+            "success": True,
+            "mode": "windows",
+            "symbol": req.symbol,
+            "exchange": exch,
+            "timeframe": req.timeframe,
+            "windows": windows,
+            "profitable_count": profitable_count,
+            "total_windows": len(rows),
+            "rows": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Compare windows execution failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backtest/compare-timeframes")
+def compare_timeframes_endpoint(req: CompareTimeframesRequest):
+    try:
+        exch = req.exchange.strip().lower()
+        if exch not in ccxt.exchanges:
+            raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
+
+        starting_equity = max(1.0, float(req.starting_equity))
+        target_tfs = req.timeframes or ["5m", "15m", "1h", "4h", "1d"]
+        rows = []
+        for tf in target_tfs:
+            tf_clean = tf.strip().lower()
+            clamped_days = clamp_lookback_days(req.days, tf_clean)
+            try:
+                df = fetch_historical(exch, req.symbol, tf_clean, clamped_days)
+            except Exception as fe:
+                rows.append({
+                    "timeframe": tf_clean,
+                    "lookback_days": clamped_days,
+                    "error": str(fe),
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
+            if df is None or len(df) < 60:
+                rows.append({
+                    "timeframe": tf_clean,
+                    "lookback_days": clamped_days,
+                    "error": f"Insufficient bars ({0 if df is None else len(df)} < 60)",
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
+            cfg = _build_backtest_config(req, exch, req.symbol, tf_clean, starting_equity)
+            res = run_backtest(df, cfg)
+            diag = res.get("diagnostics", {})
+            rows.append({
+                "timeframe": tf_clean,
+                "lookback_days": clamped_days,
+                "candles_evaluated": res.get("candles_tested", len(df)),
+                "trades": res.get("total_trades", 0),
+                "win_rate_pct": res.get("win_rate_pct", 0.0),
+                "total_return_pct": res.get("total_return_pct", 0.0),
+                "final_equity": res.get("final_equity", starting_equity),
+                "sharpe_approx": res.get("sharpe_approx"),
+                "realized_rr": res.get("realized_rr", 0.0),
+                "max_drawdown_pct": res.get("max_drawdown_pct", 0.0),
+                "fib_blocked": diag.get("fib_filter_blocked", 0),
+                "sizing_blocked": diag.get("sizing_blocked", 0),
+                "risk_blocked": diag.get("signals_risk_blocked", 0),
+                "total_fees_paid": res.get("total_fees_paid", 0.0),
+                "profitable": res.get("total_return_pct", 0.0) > 0,
+                "eval_date_range": res.get("eval_date_range", []),
+                "date_range": res.get("date_range", []),
+                "candles_warmup": res.get("candles_warmup", 0),
+            })
+
+        profitable_count = sum(1 for r in rows if r.get("profitable"))
+        return {
+            "success": True,
+            "mode": "timeframes",
+            "symbol": req.symbol,
+            "exchange": exch,
+            "timeframes": target_tfs,
+            "profitable_count": profitable_count,
+            "total_timeframes": len(rows),
+            "rows": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Compare timeframes execution failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2454,10 +2711,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div class="text-[10px] text-slate-500">Band 0 = fixed percentage; otherwise the band is the wider of &times;ATR and the floor. 730d on 1h spans ~17,500 candles (bull, bear and chop).</div>
 
-          <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
-            <i class="fa-solid fa-play"></i> Run Historical Backtest
-          </button>
+          <div class="space-y-2 pt-1">
+            <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
+              <i class="fa-solid fa-play"></i> Run Historical Backtest
+            </button>
+            <div class="grid grid-cols-2 gap-2">
+              <button type="button" id="btn-sweep-windows" onclick="executeCompareWindows(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-purple-500/50 text-purple-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
+                <i class="fa-solid fa-table-columns"></i> Compare All Windows
+              </button>
+              <button type="button" id="btn-sweep-timeframes" onclick="executeCompareTimeframes(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-blue-500/50 text-blue-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
+                <i class="fa-solid fa-layer-group"></i> Sweep Timeframes
+              </button>
+            </div>
+          </div>
         </form>
+
+        <!-- Multi-Window / Timeframe Comparison Sweep Panel -->
+        <div id="bt-sweep-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-purple-500/40 text-xs space-y-2">
+          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-table-columns text-purple-400"></i>
+              <span id="bt-sweep-title">Regime Robustness Comparison</span>
+            </div>
+            <span id="bt-sweep-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold">--</span>
+          </div>
+          <div id="bt-sweep-summary" class="text-[11px] text-slate-300">--</div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-[11px] border-collapse">
+              <thead>
+                <tr class="border-b border-bordercol/60 text-slate-400">
+                  <th class="py-1 px-1.5 font-medium" id="bt-th-window">Lookback</th>
+                  <th class="py-1 px-1.5 font-medium">Trades</th>
+                  <th class="py-1 px-1.5 font-medium">Win Rate</th>
+                  <th class="py-1 px-1.5 font-medium">Return</th>
+                  <th class="py-1 px-1.5 font-medium">Sharpe</th>
+                  <th class="py-1 px-1.5 font-medium">Realized R:R</th>
+                  <th class="py-1 px-1.5 font-medium">Max DD</th>
+                  <th class="py-1 px-1.5 font-medium">Fib Blk</th>
+                  <th class="py-1 px-1.5 font-medium">Risk Blk</th>
+                  <th class="py-1 px-1.5 font-medium">Fees Paid</th>
+                  <th class="py-1 px-1.5 font-medium">Regime</th>
+                </tr>
+              </thead>
+              <tbody id="bt-sweep-tbody" class="divide-y divide-bordercol/40 font-mono text-[10px]">
+                <!-- Rows injected dynamically -->
+              </tbody>
+            </table>
+          </div>
+          <div class="text-[10px] text-slate-500">A robust strategy maintains positive expectancy across regimes; profitability in only 1 window indicates regime dependency.</div>
+        </div>
 
         <div id="bt-results-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-bordercol text-xs space-y-2">
           <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between">
@@ -2473,7 +2775,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Avg Loss: <span id="bt-res-avgloss" class="font-semibold text-red-400">$0</span></div>
             <div>Realized R:R: <span id="bt-res-rr" class="font-semibold text-white">0</span></div>
             <div>Max Drawdown: <span id="bt-res-drawdown" class="font-semibold text-amber-400">0%</span></div>
-            <div class="col-span-2">Exits: <span id="bt-res-exits" class="font-semibold text-slate-300">--</span></div>
+            <div>Total Fees Paid: <span id="bt-res-fees" class="font-semibold text-amber-400">$0.00</span></div>
+            <div>Exits: <span id="bt-res-exits" class="font-semibold text-slate-300">--</span></div>
           </div>
           <div class="grid grid-cols-2 gap-2 text-[11px] border-t border-bordercol/60 pt-1.5">
             <div>Candles evaluated: <span id="bt-res-candles" class="font-semibold text-white">0</span></div>
@@ -2482,7 +2785,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Sizing/risk blocked: <span id="bt-res-blocked" class="font-semibold text-amber-400">0</span></div>
           </div>
           <div id="bt-res-fib-note" class="text-[10px] text-slate-400">--</div>
-          <div id="bt-res-window" class="text-[10px] text-slate-400">Window: --</div>
+          <div id="bt-res-window" class="text-[10px] text-slate-400">Indicator Calc: --</div>
+          <div id="bt-res-eval-window" class="text-[10px] text-slate-400">Signal Eval: --</div>
           <details class="text-[10px] text-slate-400">
             <summary class="cursor-pointer hover:text-slate-200">Run report / rejection detail (copyable)</summary>
             <textarea id="bt-res-report" readonly rows="7" class="w-full mt-1 bg-slate-950 border border-bordercol rounded p-1.5 text-slate-300 font-mono text-[10px]"></textarea>
@@ -4582,10 +4886,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('bt-res-trades').innerText = r.num_trades;
         document.getElementById('bt-res-winrate').innerText = r.win_rate_pct + '%';
         document.getElementById('bt-res-final').innerText = '$' + r.final_equity.toLocaleString();
-        document.getElementById('bt-res-sharpe').innerText = r.sharpe_approx;
+        const sharpeDisplay = (r.sharpe_approx !== null && r.sharpe_approx !== undefined) ? r.sharpe_approx : '-- (< 20 trades)';
+        document.getElementById('bt-res-sharpe').innerText = sharpeDisplay;
         document.getElementById('bt-res-avgwin').innerText = '$' + r.avg_win;
         document.getElementById('bt-res-avgloss').innerText = '$' + r.avg_loss;
         document.getElementById('bt-res-drawdown').innerText = r.max_drawdown_pct + '%';
+        setIf('bt-res-fees', '$' + (r.total_fees_paid != null ? Number(r.total_fees_paid).toFixed(2) : '0.00'));
         setIf('bt-res-rr', (r.realized_rr ?? 0) + ' : 1');
         const exits = r.exit_reasons || {};
         setIf('bt-res-exits', Object.keys(exits).length
@@ -4595,9 +4901,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const diag = r.diagnostics || {};
         setIf('bt-res-candles', (r.candles_tested ?? r.candles_evaluated ?? diag.candles_evaluated ?? 0).toLocaleString());
         const range = (r.date_range || []).filter(Boolean);
+        const evalRange = (r.eval_date_range || []).filter(Boolean);
+        const warmup = r.candles_warmup ?? diag.candles_warmup ?? 0;
         setIf('bt-res-window', range.length === 2
-          ? 'Window: ' + (r.candles_tested ?? 0).toLocaleString() + ' candles ' + range[0] + ' \u2192 ' + range[1]
-          : 'Window: --');
+          ? 'Indicator Calc: ' + (r.candles_tested ?? 0).toLocaleString() + ' candles (' + range[0] + ' \u2192 ' + range[1] + ')'
+          : 'Indicator Calc: --');
+        setIf('bt-res-eval-window', evalRange.length === 2
+          ? 'Signal Eval: ' + (diag.candles_evaluated ?? 0).toLocaleString() + ' candles (' + evalRange[0] + ' \u2192 ' + evalRange[1] + '; ' + warmup + ' warmup skipped)'
+          : 'Signal Eval: --');
         setIf('bt-res-raw', (r.raw_signals ?? 0).toLocaleString());
         setIf('bt-res-fibblocked', (diag.fib_filter_blocked || 0).toLocaleString());
         setIf('bt-res-blocked', ((diag.sizing_blocked || 0) + (diag.signals_risk_blocked || 0)).toLocaleString());
@@ -4642,6 +4953,161 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } finally {
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-play"></i> Run Historical Backtest';
+      }
+    }
+
+    function getBacktestPayloadBase() {
+      return {
+        exchange: document.getElementById('bt-exchange').value,
+        symbol: document.getElementById('bt-symbol').value,
+        starting_equity: parseFloat(document.getElementById('bt-equity').value) || 1000.0,
+        use_fib_filter: document.getElementById('bt-use-fib').checked,
+        fib_level_mode: document.getElementById('bt-fib-depth').value,
+        fib_tolerance_atr_mult: parseFloat(document.getElementById('bt-fib-atr').value) || 0.5,
+        fib_tolerance_pct: (parseFloat(document.getElementById('bt-fib-floor').value) || 0.3) / 100,
+        trailing_stop_enabled: document.getElementById('bt-trail').checked,
+        trailing_stop_atr_mult: parseFloat(document.getElementById('bt-trail-atr').value) || 3.5,
+        risk_per_trade_pct: 0.01
+      };
+    }
+
+    function renderSweepTable(data) {
+      const sweepBox = document.getElementById('bt-sweep-box');
+      if (!sweepBox) return;
+      sweepBox.classList.remove('hidden');
+      hideNotice();
+
+      const titleEl = document.getElementById('bt-sweep-title');
+      const badgeEl = document.getElementById('bt-sweep-badge');
+      const summaryEl = document.getElementById('bt-sweep-summary');
+      const thWindowEl = document.getElementById('bt-th-window');
+      const tbody = document.getElementById('bt-sweep-tbody');
+
+      const isTimeframes = (data.mode === 'timeframes');
+      thWindowEl.innerText = isTimeframes ? 'Timeframe' : 'Lookback';
+      titleEl.innerText = isTimeframes
+        ? `Timeframe Sweep Grid (${data.symbol} on ${data.exchange.toUpperCase()})`
+        : `Multi-Window Sweep (${data.symbol} ${data.timeframe} on ${data.exchange.toUpperCase()})`;
+
+      const profCount = data.profitable_count || 0;
+      const totalCount = data.rows ? data.rows.length : 0;
+      const pctProf = totalCount > 0 ? (profCount / totalCount) * 100 : 0;
+
+      if (pctProf === 100) {
+        badgeEl.innerText = 'ROBUST REGIME';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+        summaryEl.innerHTML = `<span class="text-emerald-400 font-semibold">\u2714 Profitable across all ${totalCount} test regimes (${profCount}/${totalCount}).</span> Strategy exhibits strong regime independence.`;
+      } else if (pctProf > 0) {
+        badgeEl.innerText = 'REGIME DEPENDENT';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30';
+        summaryEl.innerHTML = `<span class="text-amber-400 font-semibold">\u26a0 Profitable in ${profCount} of ${totalCount} regimes.</span> Strategy gains are concentrated in specific market regimes and fragile in others.`;
+      } else {
+        badgeEl.innerText = 'UNPROFITABLE';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
+        summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Unprofitable across all ${totalCount} regimes (0/${totalCount}).</span> Parameters require re-tuning.`;
+      }
+
+      tbody.innerHTML = '';
+      (data.rows || []).forEach(row => {
+        const tr = document.createElement('tr');
+        const isProf = row.profitable;
+        const hasErr = !!row.error;
+
+        tr.className = hasErr ? 'bg-slate-900/40 text-slate-500' : (isProf ? 'bg-emerald-950/20 hover:bg-emerald-950/30' : 'bg-rose-950/15 hover:bg-rose-950/25');
+
+        const windowLabel = isTimeframes ? (row.timeframe + ` (${row.lookback_days}d)`) : row.lookback_label;
+        const returnText = hasErr ? '--' : ((row.total_return_pct >= 0 ? '+' : '') + row.total_return_pct.toFixed(2) + '%');
+        const returnClass = hasErr ? 'text-slate-500' : (row.total_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold');
+        const sharpeText = (row.sharpe_approx !== null && row.sharpe_approx !== undefined) ? Number(row.sharpe_approx).toFixed(2) : '--';
+        const regimeBadge = hasErr
+          ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400 font-sans">ERROR</span>`
+          : (isProf
+              ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">PROFIT</span>`
+              : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">LOSS</span>`);
+
+        const evalRange = (row.eval_date_range || []).filter(Boolean);
+        const dateTooltip = evalRange.length === 2 ? `title="Eval: ${evalRange[0]} \u2192 ${evalRange[1]}"` : '';
+
+        tr.innerHTML = `
+          <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : row.trades}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : (row.win_rate_pct.toFixed(1) + '%')}</td>
+          <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : ((row.realized_rr ?? 0) + ' : 1')}</td>
+          <td class="py-1.5 px-1.5 text-amber-400">${hasErr ? '--' : (row.max_drawdown_pct.toFixed(1) + '%')}</td>
+          <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : (row.fib_blocked || 0)}</td>
+          <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : ((row.sizing_blocked || 0) + (row.risk_blocked || 0))}</td>
+          <td class="py-1.5 px-1.5 text-amber-400 font-sans">${hasErr ? '--' : ('$' + (row.total_fees_paid || 0).toFixed(2))}</td>
+          <td class="py-1.5 px-1.5">${regimeBadge}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function executeCompareWindows(e) {
+      if (e) e.preventDefault();
+      const btn = document.getElementById('btn-sweep-windows');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Windows...';
+
+      const payload = getBacktestPayloadBase();
+      payload.timeframe = document.getElementById('bt-timeframe').value;
+      payload.windows = [90, 365, 730];
+
+      try {
+        const res = await fetch('/api/backtest/compare-windows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        let data = null;
+        try { data = await res.json(); } catch (pe) { data = null; }
+        if (!data || !data.success) {
+          throw new Error((data && data.detail) || `Sweep request failed (HTTP ${res.status})`);
+        }
+        renderSweepTable(data);
+      } catch (err) {
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-table-columns"></i> Compare All Windows';
+      }
+    }
+
+    async function executeCompareTimeframes(e) {
+      if (e) e.preventDefault();
+      const btn = document.getElementById('btn-sweep-timeframes');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Grid...';
+
+      const dayLimit = applyTimeframeLimits();
+      const askedDays = parseInt(document.getElementById('bt-days').value, 10);
+      const days = Math.min(Number.isFinite(askedDays) ? askedDays : dayLimit, dayLimit);
+
+      const payload = getBacktestPayloadBase();
+      payload.days = days;
+      payload.timeframes = ['5m', '15m', '1h', '4h', '1d'];
+
+      try {
+        const res = await fetch('/api/backtest/compare-timeframes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        let data = null;
+        try { data = await res.json(); } catch (pe) { data = null; }
+        if (!data || !data.success) {
+          throw new Error((data && data.detail) || `Timeframe sweep request failed (HTTP ${res.status})`);
+        }
+        renderSweepTable(data);
+      } catch (err) {
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-layer-group"></i> Sweep Timeframes';
       }
     }
 

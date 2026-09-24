@@ -298,6 +298,7 @@ class TestLossStreakCooldown:
         """The run report must say when trading resumes, not just 'circuit breaker'."""
         cfg = TestPipelineDiagnostics._diag_cfg()
         cfg.strategy.use_fib_filter = False      # isolate the risk gate from the fib filter
+        cfg.strategy.min_bars_between_trades = 0  # isolate from entry debounce
         res = run_backtest(TestPipelineDiagnostics._series(), cfg)
         lines = res["diagnostics"]["rejection_log"]
 
@@ -307,6 +308,7 @@ class TestLossStreakCooldown:
         """More trades than the old 4-loss hard halt would ever allow."""
         cfg = TestPipelineDiagnostics._diag_cfg()
         cfg.strategy.use_fib_filter = False      # isolate the risk gate from the fib filter
+        cfg.strategy.min_bars_between_trades = 0  # isolate from entry debounce
         res = run_backtest(TestPipelineDiagnostics._series(), cfg)
         diag = res["diagnostics"]
 
@@ -712,40 +714,59 @@ class TestNewIndicatorsAndMultiStrategy:
         sig_sell = generate_signal(df_sell, cfg, position_open=True)
         assert sig_sell == Signal.SELL
 
-    def test_settings_api_and_5m_timeframe(self):
+    def test_settings_api_and_5m_timeframe(self, monkeypatch, tmp_path):
+        from pathlib import Path
         from fastapi.testclient import TestClient
-        from web_server import app, AVAILABLE_TIMEFRAMES
+        from web_server import app, AVAILABLE_TIMEFRAMES, runner
 
-        assert "5m" in AVAILABLE_TIMEFRAMES
+        fake_env = tmp_path / ".test_env"
+        fake_env.write_text("STRATEGY=ema_cross_fib\n")
+        orig_path = Path
+        monkeypatch.setattr("web_server.Path", lambda p: fake_env if p == ".env" else orig_path(p))
+        monkeypatch.setenv("STRATEGY", os.getenv("STRATEGY", "ema_cross_fib"))
+        monkeypatch.setenv("EXECUTION_MODE", os.getenv("EXECUTION_MODE", "auto"))
+        monkeypatch.setenv("TIMEFRAME", os.getenv("TIMEFRAME", "15m"))
+        monkeypatch.setenv("SYMBOL", os.getenv("SYMBOL", "BTC/USDT"))
+        orig_strat = runner.cfg.strategy.strategy_name
+        orig_mode = runner.cfg.execution_mode
+        orig_tf = runner.cfg.exchange.timeframe
+        orig_sym = runner.cfg.exchange.symbol
+        try:
+            assert "5m" in AVAILABLE_TIMEFRAMES
 
-        client = TestClient(app)
-        # GET settings
-        get_res = client.get("/api/bot/settings")
-        assert get_res.status_code == 200
-        data = get_res.json()
-        assert "5m" in data["available_timeframes"]
-        assert any(s["id"] == "pure_ema_cross" for s in data["available_strategies"])
+            client = TestClient(app)
+            # GET settings
+            get_res = client.get("/api/bot/settings")
+            assert get_res.status_code == 200
+            data = get_res.json()
+            assert "5m" in data["available_timeframes"]
+            assert any(s["id"] == "pure_ema_cross" for s in data["available_strategies"])
 
-        # POST settings with 5m and manual mode
-        post_res = client.post("/api/bot/settings", json={
-            "execution_mode": "manual",
-            "strategy": "pure_ema_cross",
-            "timeframe": "5m",
-            "symbol": "BTC/USDT",
-        })
-        assert post_res.status_code == 200
-        post_data = post_res.json()
-        assert post_data["execution_mode"] == "manual"
-        assert post_data["timeframe"] == "5m"
-        assert post_data["strategy"] == "pure_ema_cross"
+            # POST settings with 5m and manual mode
+            post_res = client.post("/api/bot/settings", json={
+                "execution_mode": "manual",
+                "strategy": "pure_ema_cross",
+                "timeframe": "5m",
+                "symbol": "BTC/USDT",
+            })
+            assert post_res.status_code == 200
+            post_data = post_res.json()
+            assert post_data["execution_mode"] == "manual"
+            assert post_data["timeframe"] == "5m"
+            assert post_data["strategy"] == "pure_ema_cross"
 
-        # Check status reflects settings
-        st_res = client.get("/api/status")
-        assert st_res.status_code == 200
-        st_data = st_res.json()
-        assert st_data["execution_mode"] == "manual"
-        assert st_data["timeframe"] == "5m"
-        assert st_data["strategy"] == "pure_ema_cross"
+            # Check status reflects settings
+            st_res = client.get("/api/status")
+            assert st_res.status_code == 200
+            st_data = st_res.json()
+            assert st_data["execution_mode"] == "manual"
+            assert st_data["timeframe"] == "5m"
+            assert st_data["strategy"] == "pure_ema_cross"
+        finally:
+            runner.cfg.strategy.strategy_name = orig_strat
+            runner.cfg.execution_mode = orig_mode
+            runner.cfg.exchange.timeframe = orig_tf
+            runner.cfg.exchange.symbol = orig_sym
 
 
 # ============================================================================
@@ -2597,3 +2618,86 @@ class TestInAppNotice:
         assert out["noticeTitle"] == "Backtest could not run"
         assert "HTTP 200" in out["noticeBody"] or "Unexpected token" in out["noticeDetail"]
         assert out["resultsHidden"] is True
+
+
+class TestBacktestEnhancements:
+    """Tests for per-trade Sharpe, fee accounting, timestamp reporting, and multi-window sweeps."""
+
+    def test_per_trade_sharpe_suppressed_below_20_trades(self):
+        trades = [{"pnl": 10.0, "exit_price": 100.0, "size": 1.0, "fee": 0.2} for _ in range(10)]
+        res = summarize(trades, [{"equity": 1000.0}], 1000.0, "1h")
+        assert res["sharpe_approx"] is None
+        assert res["num_trades"] == 10
+
+    def test_per_trade_sharpe_calculated_at_20_trades_or_more(self):
+        trades = []
+        for i in range(25):
+            pnl = 20.0 if i % 2 == 0 else -10.0
+            trades.append({"pnl": pnl, "exit_price": 100.0, "size": 1.0, "fee": 0.2})
+        res = summarize(trades, [{"equity": 1000.0}], 1000.0, "1h")
+        assert res["sharpe_approx"] is not None
+        assert isinstance(res["sharpe_approx"], float)
+        assert res["num_trades"] == 25
+
+    def test_backtest_reports_total_fees_paid_and_timestamps(self):
+        df = _wave_ohlcv(n=500)
+        cfg = BotConfig()
+        cfg.strategy.min_bars_between_trades = 0
+        res = run_backtest(df.copy(), cfg)
+        assert "total_fees_paid" in res
+        assert "eval_date_range" in res
+        assert "date_range" in res
+        assert "candles_warmup" in res
+        assert res["taker_fee_pct"] == 0.001
+        assert res["slippage_pct"] == 0.0005
+        assert res["eval_date_range"][0] == df["ts"].iloc[res["candles_warmup"]].isoformat()
+        assert res["eval_date_range"][1] == df["ts"].iloc[-1].isoformat()
+
+    def test_compare_windows_endpoint(self, monkeypatch):
+        import web_server
+        hist = _wave_ohlcv(n=600)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        req = web_server.CompareWindowsRequest(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe="1h",
+            windows=[30, 90],
+            starting_equity=1000.0,
+        )
+        res = web_server.compare_windows_endpoint(req)
+        assert res["success"] is True
+        assert res["mode"] == "windows"
+        assert len(res["rows"]) == 2
+        for row in res["rows"]:
+            assert "lookback_days" in row
+            assert "trades" in row
+            assert "win_rate_pct" in row
+            assert "total_return_pct" in row
+            assert "sharpe_approx" in row
+            assert "realized_rr" in row
+            assert "max_drawdown_pct" in row
+            assert "fib_blocked" in row
+            assert "sizing_blocked" in row
+            assert "total_fees_paid" in row
+            assert "profitable" in row
+
+    def test_compare_timeframes_endpoint(self, monkeypatch):
+        import web_server
+        hist = _wave_ohlcv(n=300)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        req = web_server.CompareTimeframesRequest(
+            exchange="binance",
+            symbol="BTC/USDT",
+            days=30,
+            timeframes=["15m", "1h"],
+            starting_equity=1000.0,
+        )
+        res = web_server.compare_timeframes_endpoint(req)
+        assert res["success"] is True
+        assert res["mode"] == "timeframes"
+        assert len(res["rows"]) == 2
+        assert res["rows"][0]["timeframe"] == "15m"
+        assert res["rows"][1]["timeframe"] == "1h"
+

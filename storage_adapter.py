@@ -60,6 +60,10 @@ def _driver() -> str:
     return "none"
 
 
+if _DRIVER:
+    _driver()
+
+
 def is_remote_storage_available() -> bool:
     return _driver() != "none"
 
@@ -359,13 +363,15 @@ def remote_delete_account(user_id: int, username: str = "", email: str = "") -> 
         for name in names or []: operations.append(_kv_ok("DEL", f"exchange_key:{uid}:{_exchange(name)}"))
         return ok and all(operations)
     if driver == "turso": return _turso_init() and _turso_execute("DELETE FROM remote_exchange_keys WHERE user_id=?", (uid,))[0] and _turso_execute("DELETE FROM remote_users WHERE id=?", (uid,))[0]
+    names = _blob_json(f"exchange_keys/{uid}/list.json")
+    if names is not None and not isinstance(names, list):
+        return False
     paths = [f"users/by_id/{uid}.json"]
     if username: paths.append(f"users/by_username/{_component(username, 'username')}.json")
     if email: paths.append(f"users/by_email/{_component(email, 'email')}.json")
-    names = _blob_json(f"exchange_keys/{uid}/list.json")
-    if not isinstance(names, list): return False if names is None else False
-    paths += [f"exchange_keys/{uid}/{_exchange(name)}.json" for name in names]
-    paths.append(f"exchange_keys/{uid}/list.json")
+    if isinstance(names, list):
+        paths += [f"exchange_keys/{uid}/{_exchange(name)}.json" for name in names]
+        paths.append(f"exchange_keys/{uid}/list.json")
     return all(_blob_del(path) for path in paths)
 
 

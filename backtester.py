@@ -81,15 +81,20 @@ def format_pipeline_report(results: dict) -> str:
     diag = results.get("diagnostics") or {}
     start, end = (results.get("date_range") or [None, None])[:2]
     window = f"{start} -> {end}" if start and end else "n/a"
+    eval_start, eval_end = (results.get("eval_date_range") or [None, None])[:2]
+    eval_window = f"{eval_start} -> {eval_end}" if eval_start and eval_end else window
+    warmup = diag.get("candles_warmup", results.get("candles_warmup", 0))
+    sharpe_str = f"{results.get('sharpe_approx'):.2f}" if results.get("sharpe_approx") is not None else "-- (< 20 trades)"
     lines = [
         "--- Signal pipeline diagnostics ---",
-        f"Data window              : {window} "
-        f"({results.get('candles_tested', diag.get('candles_evaluated', 0)):,} candle(s) fetched, "
-        f"{results.get('candles_tested', 0) - diag.get('candles_warmup', 0):,} tested)",
-        f"Candles evaluated        : {diag.get('candles_evaluated', 0):,} "
-        f"(warmup {diag.get('candles_warmup', 0):,} skipped, "
+        f"Data window (indicators) : {window} "
+        f"({results.get('candles_tested', diag.get('candles_evaluated', 0)):,} candle(s) fed to indicators)",
+        f"Candles evaluated (eval) : {eval_window} "
+        f"({diag.get('candles_evaluated', 0):,} candle(s) evaluated; {warmup:,} warmup skipped, "
         f"{diag.get('candles_in_position', 0):,} in position, "
         f"{diag.get('signals_risk_blocked', 0):,} signals blocked by risk gate)",
+        f"Fees and slippage        : ${results.get('total_fees_paid', 0.0):,.2f} total fees paid "
+        f"({results.get('taker_fee_pct', 0.001)*100:.2f}% taker fee + {results.get('slippage_pct', 0.0005)*100:.2f}% slippage per fill)",
         f"Stage 1 core indicator   : {diag.get('core_signals_detected', 0):,} raw BUY signal(s); "
         f"misses: {_fmt_counts(diag.get('core_misses', {}))}",
         f"Stage 2 Fibonacci filter : {diag.get('fib_filter_passed', 0):,} passed, "
@@ -105,7 +110,7 @@ def format_pipeline_report(results: dict) -> str:
         f"(exits: {_fmt_counts(results.get('exit_reasons', {}))})",
         f"Expectancy               : avg win ${results.get('avg_win', 0):,.2f} vs avg loss "
         f"${abs(results.get('avg_loss', 0)):,.2f} -> realized R:R "
-        f"{results.get('realized_rr', 0):.2f} (win rate {results.get('win_rate_pct', 0):.1f}%)",
+        f"{results.get('realized_rr', 0):.2f} (win rate {results.get('win_rate_pct', 0):.1f}%, Sharpe: {sharpe_str})",
     ]
     rejection_log = diag.get("rejection_log") or []
     if rejection_log:
@@ -369,9 +374,10 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
                 if hit_stop and position.get("trail_armed"):
                     reason = "trail"
                 risk.record_trade_result(pnl, now=row["ts"])
+                trade_fee = float(position["fee_paid"] + exit_fee)
                 trades.append({
                     "entry": position["entry"], "exit": exit_fill, "size": position["size"],
-                    "pnl": pnl, "reason": reason,
+                    "pnl": pnl, "fee": round(trade_fee, 4), "reason": reason,
                     "stop": position["stop"], "initial_stop": position.get("initial_stop"),
                     # Bar positions, so a run can be checked for adjacent-candle
                     # re-entries instead of taking the debounce on faith.
@@ -415,7 +421,16 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     # and which window it covered.
     results["candles_tested"] = candles_tested
     results["date_range"] = date_range
+    results["indicator_date_range"] = date_range
+    eval_first_row = df.iloc[warmup]["ts"] if warmup < len(df) else None
+    eval_first_ts = eval_first_row.isoformat() if hasattr(eval_first_row, "isoformat") else (str(eval_first_row) if eval_first_row is not None else None)
+    results["eval_date_range"] = [eval_first_ts, date_range[1] if date_range else None]
+    results["candles_warmup"] = warmup
+    results["taker_fee_pct"] = float(cfg.taker_fee_pct)
+    results["slippage_pct"] = float(cfg.slippage_pct)
     diag["candles_warmup"] = warmup
+    diag["indicator_date_range"] = date_range
+    diag["eval_date_range"] = results["eval_date_range"]
     diag["report"] = format_pipeline_report(results)
     return results
 
@@ -433,7 +448,6 @@ def _date_range(df: pd.DataFrame) -> list:
 def summarize(trades: list, equity_curve: list, starting_equity: float, timeframe: str) -> dict:
     eq = pd.DataFrame(equity_curve)
     final_equity = eq["equity"].iloc[-1] if len(eq) else starting_equity
-    returns = eq["equity"].pct_change().dropna() if len(eq) > 1 else pd.Series(dtype=float)
 
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
@@ -442,11 +456,33 @@ def summarize(trades: list, equity_curve: list, starting_equity: float, timefram
     drawdown = ((eq["equity"] - running_max) / running_max) if len(eq) else pd.Series([0])
 
     bars_per_year = {"1m": 525600, "5m": 105120, "15m": 35040, "1h": 8760, "4h": 2190, "1d": 365}
-    ann_factor = np.sqrt(bars_per_year.get(timeframe, 35040))
-    sharpe = (returns.mean() / returns.std() * ann_factor) if returns.std() else 0
+
+    # Per-trade Sharpe ratio: more standard and stable for strategies that are flat
+    # between setups, avoiding the extreme distortions of annualizing bar-by-bar flat tape.
+    # Below 20 trades, Sharpe is suppressed as statistically uninformative.
+    if len(trades) >= 20:
+        trade_returns = pd.Series([t["pnl"] / starting_equity for t in trades])
+        mean_tr = float(trade_returns.mean())
+        std_tr = float(trade_returns.std(ddof=1))
+
+        total_days = 0.0
+        if len(eq) > 1 and "ts" in eq.columns:
+            try:
+                total_days = max(1.0, (pd.to_datetime(eq["ts"].iloc[-1]) - pd.to_datetime(eq["ts"].iloc[0])).total_seconds() / 86400.0)
+            except Exception:
+                total_days = float(len(eq)) / (bars_per_year.get(timeframe, 35040) / 365.0)
+        else:
+            total_days = 365.0
+
+        trades_per_year = len(trades) / (total_days / 365.25) if total_days > 0 else float(len(trades))
+        ann_factor = np.sqrt(max(1.0, trades_per_year))
+        sharpe = round(float(mean_tr / std_tr * ann_factor), 2) if std_tr > 0 else 0.0
+    else:
+        sharpe = None
 
     avg_win = abs(float(np.mean([t["pnl"] for t in wins]))) if wins else 0.0
     avg_loss = abs(float(np.mean([t["pnl"] for t in losses]))) if losses else 0.0
+    total_fees_paid = round(float(sum(t.get("fee", 0.0) for t in trades)), 2)
     exit_reasons: dict = {}
     for trade in trades:
         key = trade.get("reason", "signal")
@@ -463,9 +499,10 @@ def summarize(trades: list, equity_curve: list, starting_equity: float, timefram
         # The number that decides whether a 30-45% win rate pays: a winner has to
         # be worth more than a loser on average, not merely the same.
         "realized_rr": round(avg_win / avg_loss, 2) if avg_loss > 0 else 0,
+        "total_fees_paid": total_fees_paid,
         "exit_reasons": exit_reasons,
         "max_drawdown_pct": round(float(drawdown.min()) * 100, 2) if len(drawdown) else 0,
-        "sharpe_approx": round(float(sharpe), 2),
+        "sharpe_approx": sharpe,
     }
 
 
