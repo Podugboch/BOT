@@ -4971,7 +4971,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       };
     }
 
-    function renderSweepTable(data) {
+    function initSweepTable(mode, title, items) {
       const sweepBox = document.getElementById('bt-sweep-box');
       if (!sweepBox) return;
       sweepBox.classList.remove('hidden');
@@ -4983,14 +4983,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const thWindowEl = document.getElementById('bt-th-window');
       const tbody = document.getElementById('bt-sweep-tbody');
 
-      const isTimeframes = (data.mode === 'timeframes');
+      const isTimeframes = (mode === 'timeframes');
       thWindowEl.innerText = isTimeframes ? 'Timeframe' : 'Lookback';
-      titleEl.innerText = isTimeframes
-        ? `Timeframe Sweep Grid (${data.symbol} on ${data.exchange.toUpperCase()})`
-        : `Multi-Window Sweep (${data.symbol} ${data.timeframe} on ${data.exchange.toUpperCase()})`;
+      titleEl.innerText = title;
+      badgeEl.innerText = 'RUNNING';
+      badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30';
+      summaryEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running sweep across regimes...</span> Completed <span id="bt-sweep-progress">0</span> of ${items.length}.`;
 
-      const profCount = data.profitable_count || 0;
-      const totalCount = data.rows ? data.rows.length : 0;
+      tbody.innerHTML = '';
+      items.forEach((item, idx) => {
+        const tr = document.createElement('tr');
+        tr.id = `bt-sweep-row-${idx}`;
+        tr.className = 'bg-slate-900/40 text-slate-400';
+        const label = isTimeframes ? (item.tf + ` (${item.days}d)`) : item.label;
+        tr.innerHTML = `
+          <td class="py-1.5 px-1.5 font-semibold text-slate-300">${label}</td>
+          <td colspan="10" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
+            <i class="fa-solid fa-clock mr-1"></i> Waiting in queue...
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function updateSweepTableRow(idx, isTimeframes, row) {
+      const tr = document.getElementById(`bt-sweep-row-${idx}`);
+      if (!tr) return;
+      const isProf = row.profitable;
+      const hasErr = !!row.error;
+
+      tr.className = hasErr ? 'bg-slate-900/40 text-slate-500' : (isProf ? 'bg-emerald-950/20 hover:bg-emerald-950/30' : 'bg-rose-950/15 hover:bg-rose-950/25');
+
+      const windowLabel = isTimeframes ? (row.timeframe + ` (${row.lookback_days}d)`) : row.lookback_label;
+      const returnText = hasErr ? '--' : ((row.total_return_pct >= 0 ? '+' : '') + Number(row.total_return_pct).toFixed(2) + '%');
+      const returnClass = hasErr ? 'text-slate-500' : (row.total_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold');
+      const sharpeText = (row.sharpe_approx !== null && row.sharpe_approx !== undefined) ? Number(row.sharpe_approx).toFixed(2) : '--';
+      const regimeBadge = hasErr
+        ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400 font-sans">ERROR</span>`
+        : (isProf
+            ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">PROFIT</span>`
+            : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">LOSS</span>`);
+
+      const evalRange = (row.eval_date_range || []).filter(Boolean);
+      const dateTooltip = evalRange.length === 2 ? `title="Eval: ${evalRange[0]} \u2192 ${evalRange[1]}"` : '';
+
+      tr.innerHTML = `
+        <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
+        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : row.trades}</td>
+        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : (Number(row.win_rate_pct).toFixed(1) + '%')}</td>
+        <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
+        <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
+        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : ((row.realized_rr ?? 0) + ' : 1')}</td>
+        <td class="py-1.5 px-1.5 text-amber-400">${hasErr ? '--' : (Number(row.max_drawdown_pct).toFixed(1) + '%')}</td>
+        <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : (row.fib_blocked || 0)}</td>
+        <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : ((row.sizing_blocked || 0) + (row.risk_blocked || 0))}</td>
+        <td class="py-1.5 px-1.5 text-amber-400 font-sans">${hasErr ? '--' : ('$' + Number(row.total_fees_paid || 0).toFixed(2))}</td>
+        <td class="py-1.5 px-1.5">${regimeBadge}</td>
+      `;
+    }
+
+    function finalizeSweepSummary(rows) {
+      const badgeEl = document.getElementById('bt-sweep-badge');
+      const summaryEl = document.getElementById('bt-sweep-summary');
+      if (!badgeEl || !summaryEl) return;
+
+      const profCount = rows.filter(r => r.profitable).length;
+      const totalCount = rows.length;
       const pctProf = totalCount > 0 ? (profCount / totalCount) * 100 : 0;
 
       if (pctProf === 100) {
@@ -5006,43 +5064,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
         summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Unprofitable across all ${totalCount} regimes (0/${totalCount}).</span> Parameters require re-tuning.`;
       }
-
-      tbody.innerHTML = '';
-      (data.rows || []).forEach(row => {
-        const tr = document.createElement('tr');
-        const isProf = row.profitable;
-        const hasErr = !!row.error;
-
-        tr.className = hasErr ? 'bg-slate-900/40 text-slate-500' : (isProf ? 'bg-emerald-950/20 hover:bg-emerald-950/30' : 'bg-rose-950/15 hover:bg-rose-950/25');
-
-        const windowLabel = isTimeframes ? (row.timeframe + ` (${row.lookback_days}d)`) : row.lookback_label;
-        const returnText = hasErr ? '--' : ((row.total_return_pct >= 0 ? '+' : '') + row.total_return_pct.toFixed(2) + '%');
-        const returnClass = hasErr ? 'text-slate-500' : (row.total_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold');
-        const sharpeText = (row.sharpe_approx !== null && row.sharpe_approx !== undefined) ? Number(row.sharpe_approx).toFixed(2) : '--';
-        const regimeBadge = hasErr
-          ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400 font-sans">ERROR</span>`
-          : (isProf
-              ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">PROFIT</span>`
-              : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">LOSS</span>`);
-
-        const evalRange = (row.eval_date_range || []).filter(Boolean);
-        const dateTooltip = evalRange.length === 2 ? `title="Eval: ${evalRange[0]} \u2192 ${evalRange[1]}"` : '';
-
-        tr.innerHTML = `
-          <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
-          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : row.trades}</td>
-          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : (row.win_rate_pct.toFixed(1) + '%')}</td>
-          <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
-          <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
-          <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : ((row.realized_rr ?? 0) + ' : 1')}</td>
-          <td class="py-1.5 px-1.5 text-amber-400">${hasErr ? '--' : (row.max_drawdown_pct.toFixed(1) + '%')}</td>
-          <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : (row.fib_blocked || 0)}</td>
-          <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : ((row.sizing_blocked || 0) + (row.risk_blocked || 0))}</td>
-          <td class="py-1.5 px-1.5 text-amber-400 font-sans">${hasErr ? '--' : ('$' + (row.total_fees_paid || 0).toFixed(2))}</td>
-          <td class="py-1.5 px-1.5">${regimeBadge}</td>
-        `;
-        tbody.appendChild(tr);
-      });
     }
 
     async function executeCompareWindows(e) {
@@ -5051,25 +5072,91 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Windows...';
 
-      const payload = getBacktestPayloadBase();
-      payload.timeframe = document.getElementById('bt-timeframe').value;
-      payload.windows = [90, 365, 730];
+      const tf = document.getElementById('bt-timeframe').value;
+      const exch = document.getElementById('bt-exchange').value;
+      const sym = document.getElementById('bt-symbol').value;
+      const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+        ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+
+      let windows = [90, 365, 730];
+      if (tf === '5m') windows = [7, 30, Math.min(60, tfLimit)];
+      else if (tf === '15m' || tf === '30m') windows = [14, 30, Math.min(90, tfLimit)];
+      else windows = [90, 365, Math.min(730, tfLimit)];
+      windows = [...new Set(windows)].sort((a, b) => a - b);
+
+      const items = windows.map(w => ({ days: w, label: w + 'd' }));
+      const title = `Multi-Window Sweep (${sym} ${tf} on ${exch.toUpperCase()})`;
+      initSweepTable('windows', title, items);
+
+      const rows = [];
+      const basePayload = getBacktestPayloadBase();
+      basePayload.timeframe = tf;
 
       try {
-        const res = await fetch('/api/backtest/compare-windows', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        let data = null;
-        try { data = await res.json(); } catch (pe) { data = null; }
-        if (!data || !data.success) {
-          throw new Error((data && data.detail) || `Sweep request failed (HTTP ${res.status})`);
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const stEl = document.getElementById(`bt-sweep-status-${i}`);
+          if (stEl) stEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.label} backtest...</span>`;
+
+          const payload = { ...basePayload, days: item.days };
+          let rowData = null;
+          try {
+            const res = await fetch('/api/backtest', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            let data = null;
+            try { data = await res.json(); } catch (pe) { data = null; }
+            if (data && data.success) {
+              const r = data.results;
+              const diag = r.diagnostics || {};
+              rowData = {
+                lookback_days: item.days,
+                lookback_label: item.label,
+                candles_evaluated: r.candles_tested ?? 0,
+                trades: r.num_trades ?? 0,
+                win_rate_pct: r.win_rate_pct ?? 0,
+                total_return_pct: r.total_return_pct ?? 0,
+                final_equity: r.final_equity ?? 0,
+                sharpe_approx: r.sharpe_approx,
+                realized_rr: r.realized_rr ?? 0,
+                max_drawdown_pct: r.max_drawdown_pct ?? 0,
+                fib_blocked: diag.fib_filter_blocked ?? 0,
+                sizing_blocked: diag.sizing_blocked ?? 0,
+                risk_blocked: diag.signals_risk_blocked ?? 0,
+                total_fees_paid: r.total_fees_paid ?? 0,
+                profitable: (r.total_return_pct ?? 0) > 0,
+                eval_date_range: r.eval_date_range || [],
+                date_range: r.date_range || [],
+              };
+            } else {
+              const detail = (data && data.detail) || `HTTP ${res.status}`;
+              rowData = {
+                lookback_days: item.days,
+                lookback_label: item.label,
+                error: detail,
+                trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: payload.starting_equity,
+                sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+                fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+              };
+            }
+          } catch (netErr) {
+            rowData = {
+              lookback_days: item.days,
+              lookback_label: item.label,
+              error: netErr.message || 'Network error',
+              trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: payload.starting_equity,
+              sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+              fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+            };
+          }
+          rows.push(rowData);
+          updateSweepTableRow(i, false, rowData);
+          const progEl = document.getElementById('bt-sweep-progress');
+          if (progEl) progEl.innerText = String(i + 1);
         }
-        renderSweepTable(data);
-      } catch (err) {
-        const failure = describeBacktestError(err);
-        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        finalizeSweepSummary(rows);
       } finally {
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-table-columns"></i> Compare All Windows';
@@ -5082,29 +5169,89 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Grid...';
 
-      const dayLimit = applyTimeframeLimits();
-      const askedDays = parseInt(document.getElementById('bt-days').value, 10);
-      const days = Math.min(Number.isFinite(askedDays) ? askedDays : dayLimit, dayLimit);
+      const askedDays = parseInt(document.getElementById('bt-days').value, 10) || 30;
+      const exch = document.getElementById('bt-exchange').value;
+      const sym = document.getElementById('bt-symbol').value;
+      const timeframes = ['5m', '15m', '1h', '4h', '1d'];
 
-      const payload = getBacktestPayloadBase();
-      payload.days = days;
-      payload.timeframes = ['5m', '15m', '1h', '4h', '1d'];
+      const items = timeframes.map(tf => {
+        const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+          ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+        const clampedDays = Math.min(askedDays, tfLimit);
+        return { tf, days: clampedDays, label: tf };
+      });
+
+      const title = `Timeframe Sweep Grid (${sym} on ${exch.toUpperCase()})`;
+      initSweepTable('timeframes', title, items);
+
+      const rows = [];
+      const basePayload = getBacktestPayloadBase();
 
       try {
-        const res = await fetch('/api/backtest/compare-timeframes', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        let data = null;
-        try { data = await res.json(); } catch (pe) { data = null; }
-        if (!data || !data.success) {
-          throw new Error((data && data.detail) || `Timeframe sweep request failed (HTTP ${res.status})`);
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const stEl = document.getElementById(`bt-sweep-status-${i}`);
+          if (stEl) stEl.innerHTML = `<span class="text-blue-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.tf} backtest (${item.days}d)...</span>`;
+
+          const payload = { ...basePayload, timeframe: item.tf, days: item.days };
+          let rowData = null;
+          try {
+            const res = await fetch('/api/backtest', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            let data = null;
+            try { data = await res.json(); } catch (pe) { data = null; }
+            if (data && data.success) {
+              const r = data.results;
+              const diag = r.diagnostics || {};
+              rowData = {
+                timeframe: item.tf,
+                lookback_days: item.days,
+                candles_evaluated: r.candles_tested ?? 0,
+                trades: r.num_trades ?? 0,
+                win_rate_pct: r.win_rate_pct ?? 0,
+                total_return_pct: r.total_return_pct ?? 0,
+                final_equity: r.final_equity ?? 0,
+                sharpe_approx: r.sharpe_approx,
+                realized_rr: r.realized_rr ?? 0,
+                max_drawdown_pct: r.max_drawdown_pct ?? 0,
+                fib_blocked: diag.fib_filter_blocked ?? 0,
+                sizing_blocked: diag.sizing_blocked ?? 0,
+                risk_blocked: diag.signals_risk_blocked ?? 0,
+                total_fees_paid: r.total_fees_paid ?? 0,
+                profitable: (r.total_return_pct ?? 0) > 0,
+                eval_date_range: r.eval_date_range || [],
+                date_range: r.date_range || [],
+              };
+            } else {
+              const detail = (data && data.detail) || `HTTP ${res.status}`;
+              rowData = {
+                timeframe: item.tf,
+                lookback_days: item.days,
+                error: detail,
+                trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: payload.starting_equity,
+                sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+                fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+              };
+            }
+          } catch (netErr) {
+            rowData = {
+              timeframe: item.tf,
+              lookback_days: item.days,
+              error: netErr.message || 'Network error',
+              trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: payload.starting_equity,
+              sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+              fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+            };
+          }
+          rows.push(rowData);
+          updateSweepTableRow(i, true, rowData);
+          const progEl = document.getElementById('bt-sweep-progress');
+          if (progEl) progEl.innerText = String(i + 1);
         }
-        renderSweepTable(data);
-      } catch (err) {
-        const failure = describeBacktestError(err);
-        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        finalizeSweepSummary(rows);
       } finally {
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-layer-group"></i> Sweep Timeframes';
