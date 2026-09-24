@@ -2302,6 +2302,7 @@ def _backtest_js_source() -> str:
     return (
         "const BT_LOOKBACK_LIMITS = " + limits.group(1) + ";\n"
         + "let noticeTimer = null;\n"
+        + _dashboard_function("escapeHtml") + "\n"
         + _dashboard_function("setBacktestDays") + "\n"
         + _dashboard_function("backtestDayLimit") + "\n"
         + _dashboard_function("applyTimeframeLimits") + "\n"
@@ -2310,7 +2311,13 @@ def _backtest_js_source() -> str:
         + _dashboard_function("showNotice") + "\n"
         + _dashboard_function("firstUsefulLine") + "\n"
         + _dashboard_function("describeBacktestError") + "\n"
-        + _dashboard_function("executeBacktest")
+        + _dashboard_function("executeBacktest") + "\n"
+        + _dashboard_function("getBacktestPayloadBase") + "\n"
+        + _dashboard_function("initSweepTable") + "\n"
+        + _dashboard_function("updateSweepTableRow") + "\n"
+        + _dashboard_function("finalizeSweepSummary") + "\n"
+        + _dashboard_function("executeCompareWindows") + "\n"
+        + _dashboard_function("executeCompareTimeframes")
     )
 
 
@@ -2328,6 +2335,7 @@ function makeEl(id) {
   const classes = new Set(['hidden']);
   let text = '';
   let val = '';
+  const children = [];
   return {
     id,
     // A real DOM stringifies innerText; the stub does too, so the assertions
@@ -2338,6 +2346,8 @@ function makeEl(id) {
     set value(v) { val = String(v); },
     innerHTML: '', checked: false,
     disabled: false, className: '',
+    appendChild: (c) => children.push(c),
+    children,
     classList: {
       add: (c) => classes.add(c),
       remove: (c) => classes.delete(c),
@@ -2700,4 +2710,118 @@ class TestBacktestEnhancements:
         assert len(res["rows"]) == 2
         assert res["rows"][0]["timeframe"] == "15m"
         assert res["rows"][1]["timeframe"] == "1h"
+
+    def test_dashboard_sweep_runtime_and_error_handling(self, tmp_path):
+        """executeCompareWindows and executeCompareTimeframes must run cleanly in Node.js."""
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; JS runtime check skipped")
+
+        src = _backtest_js_source()
+        (tmp_path / "fn.js").write_text(src)
+        test_js = r"""
+const fs = require('fs');
+const fnCode = fs.readFileSync(process.argv[2], 'utf8');
+
+const elements = {};
+function makeEl(id) {
+  const classes = new Set(['hidden']);
+  let text = '';
+  let val = '';
+  const children = [];
+  return {
+    id,
+    get innerText() { return text; },
+    set innerText(v) { text = String(v); },
+    get value() { return val; },
+    set value(v) { val = String(v); },
+    innerHTML: '', checked: true,
+    disabled: false, className: '',
+    appendChild: (c) => children.push(c),
+    children,
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+    },
+  };
+}
+const el = (id) => (elements[id] = elements[id] || makeEl(id));
+globalThis.document = { getElementById: el, createElement: () => makeEl('tr') };
+
+el('bt-exchange').value = 'mexc';
+el('bt-symbol').value = 'BTC/USDT';
+el('bt-timeframe').value = '1h';
+el('bt-days').value = '365';
+el('bt-equity').value = '1000';
+el('bt-fib-depth').value = 'deep';
+el('bt-fib-atr').value = '0.5';
+el('bt-fib-floor').value = '0.3';
+el('bt-trail-atr').value = '3.5';
+
+const sweepFunctions = new Function(
+  fnCode + '\nreturn { executeCompareWindows, executeCompareTimeframes };')();
+
+globalThis.fetch = async (url, opts) => {
+  return {
+    ok: true, status: 200,
+    json: async () => ({
+      success: true,
+      results: {
+        total_return_pct: 8.5,
+        num_trades: 22,
+        win_rate_pct: 50.0,
+        final_equity: 1085.0,
+        sharpe_approx: 1.2,
+        realized_rr: 2.0,
+        max_drawdown_pct: -4.5,
+        total_fees_paid: 10.0,
+        date_range: ['2023-01-01', '2024-01-01'],
+        eval_date_range: ['2023-02-01', '2024-01-01'],
+        diagnostics: { fib_filter_blocked: 3, sizing_blocked: 0, signals_risk_blocked: 0 }
+      }
+    })
+  };
+};
+
+(async () => {
+  await sweepFunctions.executeCompareWindows({ preventDefault() {} });
+  const badgeWindows = el('bt-sweep-badge').innerText;
+  const btnWindowsDisabled = el('btn-sweep-windows').disabled;
+
+  await sweepFunctions.executeCompareTimeframes({ preventDefault() {} });
+  const badgeTf = el('bt-sweep-badge').innerText;
+  const btnTfDisabled = el('btn-sweep-timeframes').disabled;
+
+  globalThis.fetch = async () => ({
+    ok: false, status: 500,
+    json: async () => ({ success: false, detail: 'binance 451 restricted location' })
+  });
+
+  await sweepFunctions.executeCompareWindows({ preventDefault() {} });
+  const badgeErr = el('bt-sweep-badge').innerText;
+  const noticeTitle = el('app-notice-title').innerText;
+
+  console.log(JSON.stringify({
+    badgeWindows, btnWindowsDisabled,
+    badgeTf, btnTfDisabled,
+    badgeErr, noticeTitle
+  }));
+})().catch(err => {
+  console.error('FAILED:', err);
+  process.exit(1);
+});
+"""
+        (tmp_path / "test.js").write_text(test_js)
+        proc = subprocess.run([node, str(tmp_path / "test.js"), str(tmp_path / "fn.js")],
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, f"node failed:\n{proc.stdout}\n{proc.stderr}"
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert out["badgeWindows"] == "ROBUST REGIME"
+        assert out["btnWindowsDisabled"] is False
+        assert out["badgeTf"] == "ROBUST REGIME"
+        assert out["btnTfDisabled"] is False
+        assert out["badgeErr"] == "EXECUTION ERROR"
+        assert "is not available in this region" in out["noticeTitle"]
+
 

@@ -1483,25 +1483,26 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
 
             res = run_backtest(df_slice, cfg)
             diag = res.get("diagnostics", {})
+            ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
-                "lookback_days": w,
+                "lookback_days": int(w),
                 "lookback_label": f"{w}d",
-                "candles_evaluated": res.get("candles_tested", len(df_slice)),
-                "trades": res.get("total_trades", 0),
-                "win_rate_pct": res.get("win_rate_pct", 0.0),
-                "total_return_pct": res.get("total_return_pct", 0.0),
-                "final_equity": res.get("final_equity", starting_equity),
-                "sharpe_approx": res.get("sharpe_approx"),
-                "realized_rr": res.get("realized_rr", 0.0),
-                "max_drawdown_pct": res.get("max_drawdown_pct", 0.0),
-                "fib_blocked": diag.get("fib_filter_blocked", 0),
-                "sizing_blocked": diag.get("sizing_blocked", 0),
-                "risk_blocked": diag.get("signals_risk_blocked", 0),
-                "total_fees_paid": res.get("total_fees_paid", 0.0),
-                "profitable": res.get("total_return_pct", 0.0) > 0,
-                "eval_date_range": res.get("eval_date_range", []),
-                "date_range": res.get("date_range", []),
-                "candles_warmup": res.get("candles_warmup", 0),
+                "candles_evaluated": int(res.get("candles_tested", len(df_slice))),
+                "trades": int(res.get("num_trades", 0)),
+                "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
+                "total_return_pct": ret_pct,
+                "final_equity": float(res.get("final_equity", starting_equity)),
+                "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
+                "realized_rr": float(res.get("realized_rr", 0.0)),
+                "max_drawdown_pct": float(res.get("max_drawdown_pct", 0.0)),
+                "fib_blocked": int(diag.get("fib_filter_blocked", 0)),
+                "sizing_blocked": int(diag.get("sizing_blocked", 0)),
+                "risk_blocked": int(diag.get("signals_risk_blocked", 0)),
+                "total_fees_paid": float(res.get("total_fees_paid", 0.0)),
+                "profitable": bool(ret_pct > 0),
+                "eval_date_range": list(res.get("eval_date_range", [])),
+                "date_range": list(res.get("date_range", [])),
+                "candles_warmup": int(res.get("candles_warmup", 0)),
             })
 
         profitable_count = sum(1 for r in rows if r.get("profitable"))
@@ -1581,25 +1582,26 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
             cfg = _build_backtest_config(req, exch, req.symbol, tf_clean, starting_equity)
             res = run_backtest(df, cfg)
             diag = res.get("diagnostics", {})
+            ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
-                "timeframe": tf_clean,
-                "lookback_days": clamped_days,
-                "candles_evaluated": res.get("candles_tested", len(df)),
-                "trades": res.get("total_trades", 0),
-                "win_rate_pct": res.get("win_rate_pct", 0.0),
-                "total_return_pct": res.get("total_return_pct", 0.0),
-                "final_equity": res.get("final_equity", starting_equity),
-                "sharpe_approx": res.get("sharpe_approx"),
-                "realized_rr": res.get("realized_rr", 0.0),
-                "max_drawdown_pct": res.get("max_drawdown_pct", 0.0),
-                "fib_blocked": diag.get("fib_filter_blocked", 0),
-                "sizing_blocked": diag.get("sizing_blocked", 0),
-                "risk_blocked": diag.get("signals_risk_blocked", 0),
-                "total_fees_paid": res.get("total_fees_paid", 0.0),
-                "profitable": res.get("total_return_pct", 0.0) > 0,
-                "eval_date_range": res.get("eval_date_range", []),
-                "date_range": res.get("date_range", []),
-                "candles_warmup": res.get("candles_warmup", 0),
+                "timeframe": str(tf_clean),
+                "lookback_days": int(clamped_days),
+                "candles_evaluated": int(res.get("candles_tested", len(df))),
+                "trades": int(res.get("num_trades", 0)),
+                "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
+                "total_return_pct": ret_pct,
+                "final_equity": float(res.get("final_equity", starting_equity)),
+                "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
+                "realized_rr": float(res.get("realized_rr", 0.0)),
+                "max_drawdown_pct": float(res.get("max_drawdown_pct", 0.0)),
+                "fib_blocked": int(diag.get("fib_filter_blocked", 0)),
+                "sizing_blocked": int(diag.get("sizing_blocked", 0)),
+                "risk_blocked": int(diag.get("signals_risk_blocked", 0)),
+                "total_fees_paid": float(res.get("total_fees_paid", 0.0)),
+                "profitable": bool(ret_pct > 0),
+                "eval_date_range": list(res.get("eval_date_range", [])),
+                "date_range": list(res.get("date_range", [])),
+                "candles_warmup": int(res.get("candles_warmup", 0)),
             })
 
         profitable_count = sum(1 for r in rows if r.get("profitable"))
@@ -4956,17 +4958,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .split('&').join('&amp;')
+        .split('<').join('&lt;')
+        .split('>').join('&gt;')
+        .split('"').join('&quot;')
+        .split("'").join('&#039;');
+    }
+
     function getBacktestPayloadBase() {
       return {
-        exchange: document.getElementById('bt-exchange').value,
-        symbol: document.getElementById('bt-symbol').value,
-        starting_equity: parseFloat(document.getElementById('bt-equity').value) || 1000.0,
-        use_fib_filter: document.getElementById('bt-use-fib').checked,
-        fib_level_mode: document.getElementById('bt-fib-depth').value,
-        fib_tolerance_atr_mult: parseFloat(document.getElementById('bt-fib-atr').value) || 0.5,
-        fib_tolerance_pct: (parseFloat(document.getElementById('bt-fib-floor').value) || 0.3) / 100,
-        trailing_stop_enabled: document.getElementById('bt-trail').checked,
-        trailing_stop_atr_mult: parseFloat(document.getElementById('bt-trail-atr').value) || 3.5,
+        exchange: (document.getElementById('bt-exchange') || {}).value || 'binance',
+        symbol: (document.getElementById('bt-symbol') || {}).value || 'BTC/USDT',
+        starting_equity: parseFloat((document.getElementById('bt-equity') || {}).value) || 1000.0,
+        use_fib_filter: (document.getElementById('bt-use-fib') || {}).checked ?? true,
+        fib_level_mode: (document.getElementById('bt-fib-depth') || {}).value || 'deep',
+        fib_tolerance_atr_mult: parseFloat((document.getElementById('bt-fib-atr') || {}).value) || 0.5,
+        fib_tolerance_pct: (parseFloat((document.getElementById('bt-fib-floor') || {}).value) || 0.3) / 100,
+        trailing_stop_enabled: (document.getElementById('bt-trail') || {}).checked ?? true,
+        trailing_stop_atr_mult: parseFloat((document.getElementById('bt-trail-atr') || {}).value) || 3.5,
         risk_per_trade_pct: 0.01
       };
     }
@@ -4984,26 +4996,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const tbody = document.getElementById('bt-sweep-tbody');
 
       const isTimeframes = (mode === 'timeframes');
-      thWindowEl.innerText = isTimeframes ? 'Timeframe' : 'Lookback';
-      titleEl.innerText = title;
-      badgeEl.innerText = 'RUNNING';
-      badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30';
-      summaryEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running sweep across regimes...</span> Completed <span id="bt-sweep-progress">0</span> of ${items.length}.`;
+      if (thWindowEl) thWindowEl.innerText = isTimeframes ? 'Timeframe' : 'Lookback';
+      if (titleEl) titleEl.innerText = title;
+      if (badgeEl) {
+        badgeEl.innerText = 'RUNNING';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30';
+      }
+      if (summaryEl) {
+        summaryEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running sweep across regimes...</span> Completed <span id="bt-sweep-progress">0</span> of ${items.length}.`;
+      }
 
-      tbody.innerHTML = '';
-      items.forEach((item, idx) => {
-        const tr = document.createElement('tr');
-        tr.id = `bt-sweep-row-${idx}`;
-        tr.className = 'bg-slate-900/40 text-slate-400';
-        const label = isTimeframes ? (item.tf + ` (${item.days}d)`) : item.label;
-        tr.innerHTML = `
-          <td class="py-1.5 px-1.5 font-semibold text-slate-300">${label}</td>
-          <td colspan="10" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
-            <i class="fa-solid fa-clock mr-1"></i> Waiting in queue...
-          </td>
-        `;
-        tbody.appendChild(tr);
-      });
+      if (tbody) {
+        tbody.innerHTML = '';
+        items.forEach((item, idx) => {
+          const tr = document.createElement('tr');
+          tr.id = `bt-sweep-row-${idx}`;
+          tr.className = 'bg-slate-900/40 text-slate-400';
+          const label = isTimeframes ? (item.tf + ` (${item.days}d)`) : item.label;
+          tr.innerHTML = `
+            <td class="py-1.5 px-1.5 font-semibold text-slate-300">${label}</td>
+            <td colspan="10" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
+              <i class="fa-solid fa-clock mr-1"></i> Waiting in queue...
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
     }
 
     function updateSweepTableRow(idx, isTimeframes, row) {
@@ -5027,19 +5045,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const evalRange = (row.eval_date_range || []).filter(Boolean);
       const dateTooltip = evalRange.length === 2 ? `title="Eval: ${evalRange[0]} \u2192 ${evalRange[1]}"` : '';
 
-      tr.innerHTML = `
-        <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
-        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : row.trades}</td>
-        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : (Number(row.win_rate_pct).toFixed(1) + '%')}</td>
-        <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
-        <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
-        <td class="py-1.5 px-1.5 text-slate-300">${hasErr ? '--' : ((row.realized_rr ?? 0) + ' : 1')}</td>
-        <td class="py-1.5 px-1.5 text-amber-400">${hasErr ? '--' : (Number(row.max_drawdown_pct).toFixed(1) + '%')}</td>
-        <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : (row.fib_blocked || 0)}</td>
-        <td class="py-1.5 px-1.5 text-slate-400">${hasErr ? '--' : ((row.sizing_blocked || 0) + (row.risk_blocked || 0))}</td>
-        <td class="py-1.5 px-1.5 text-amber-400 font-sans">${hasErr ? '--' : ('$' + Number(row.total_fees_paid || 0).toFixed(2))}</td>
-        <td class="py-1.5 px-1.5">${regimeBadge}</td>
-      `;
+      if (hasErr) {
+        const cleanErr = firstUsefulLine(row.error) || row.error;
+        tr.innerHTML = `
+          <td class="py-1.5 px-1.5 font-semibold text-slate-300" ${dateTooltip}>${windowLabel}</td>
+          <td colspan="9" class="py-1.5 px-1.5 text-rose-400 text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
+            <i class="fa-solid fa-triangle-exclamation mr-1"></i> ${escapeHtml(cleanErr)}
+          </td>
+          <td class="py-1.5 px-1.5">${regimeBadge}</td>
+        `;
+      } else {
+        tr.innerHTML = `
+          <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${row.trades}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${(Number(row.win_rate_pct).toFixed(1) + '%')}</td>
+          <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
+          <td class="py-1.5 px-1.5 text-slate-300">${((row.realized_rr ?? 0) + ' : 1')}</td>
+          <td class="py-1.5 px-1.5 text-amber-400">${(Number(row.max_drawdown_pct).toFixed(1) + '%')}</td>
+          <td class="py-1.5 px-1.5 text-slate-400">${(row.fib_blocked || 0)}</td>
+          <td class="py-1.5 px-1.5 text-slate-400">${((row.sizing_blocked || 0) + (row.risk_blocked || 0))}</td>
+          <td class="py-1.5 px-1.5 text-amber-400 font-sans">${('$' + Number(row.total_fees_paid || 0).toFixed(2))}</td>
+          <td class="py-1.5 px-1.5">${regimeBadge}</td>
+        `;
+      }
     }
 
     function finalizeSweepSummary(rows) {
@@ -5047,52 +5076,69 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const summaryEl = document.getElementById('bt-sweep-summary');
       if (!badgeEl || !summaryEl) return;
 
-      const profCount = rows.filter(r => r.profitable).length;
       const totalCount = rows.length;
-      const pctProf = totalCount > 0 ? (profCount / totalCount) * 100 : 0;
+      const errRows = rows.filter(r => !!r.error);
+      const validRows = rows.filter(r => !r.error);
+      const profCount = validRows.filter(r => r.profitable).length;
+      const validCount = validRows.length;
+
+      if (errRows.length === totalCount && totalCount > 0) {
+        badgeEl.innerText = 'EXECUTION ERROR';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
+        const sampleErr = errRows[0].error || 'Exchange request failed';
+        summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Sweep failed (${errRows.length}/${totalCount} regimes failed).</span> ${escapeHtml(firstUsefulLine(sampleErr) || sampleErr)}`;
+        const failure = describeBacktestError({ message: sampleErr });
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        return;
+      }
+
+      const pctProf = validCount > 0 ? (profCount / validCount) * 100 : 0;
+      const errSuffix = errRows.length > 0 ? ` (${errRows.length} errored)` : '';
 
       if (pctProf === 100) {
         badgeEl.innerText = 'ROBUST REGIME';
         badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
-        summaryEl.innerHTML = `<span class="text-emerald-400 font-semibold">\u2714 Profitable across all ${totalCount} test regimes (${profCount}/${totalCount}).</span> Strategy exhibits strong regime independence.`;
+        summaryEl.innerHTML = `<span class="text-emerald-400 font-semibold">\u2714 Profitable across all ${validCount} test regimes (${profCount}/${validCount}).</span> Strategy exhibits strong regime independence.${errSuffix}`;
       } else if (pctProf > 0) {
         badgeEl.innerText = 'REGIME DEPENDENT';
         badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30';
-        summaryEl.innerHTML = `<span class="text-amber-400 font-semibold">\u26a0 Profitable in ${profCount} of ${totalCount} regimes.</span> Strategy gains are concentrated in specific market regimes and fragile in others.`;
+        summaryEl.innerHTML = `<span class="text-amber-400 font-semibold">\u26a0 Profitable in ${profCount} of ${validCount} regimes.</span> Strategy gains are concentrated in specific market regimes and fragile in others.${errSuffix}`;
       } else {
         badgeEl.innerText = 'UNPROFITABLE';
         badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
-        summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Unprofitable across all ${totalCount} regimes (0/${totalCount}).</span> Parameters require re-tuning.`;
+        summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Unprofitable across all ${validCount} regimes (0/${validCount}).</span> Parameters require re-tuning.${errSuffix}`;
       }
     }
 
     async function executeCompareWindows(e) {
-      if (e) e.preventDefault();
+      if (e && e.preventDefault) e.preventDefault();
       const btn = document.getElementById('btn-sweep-windows');
-      btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Windows...';
-
-      const tf = document.getElementById('bt-timeframe').value;
-      const exch = document.getElementById('bt-exchange').value;
-      const sym = document.getElementById('bt-symbol').value;
-      const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
-        ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
-
-      let windows = [90, 365, 730];
-      if (tf === '5m') windows = [7, 30, Math.min(60, tfLimit)];
-      else if (tf === '15m' || tf === '30m') windows = [14, 30, Math.min(90, tfLimit)];
-      else windows = [90, 365, Math.min(730, tfLimit)];
-      windows = [...new Set(windows)].sort((a, b) => a - b);
-
-      const items = windows.map(w => ({ days: w, label: w + 'd' }));
-      const title = `Multi-Window Sweep (${sym} ${tf} on ${exch.toUpperCase()})`;
-      initSweepTable('windows', title, items);
-
-      const rows = [];
-      const basePayload = getBacktestPayloadBase();
-      basePayload.timeframe = tf;
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Windows...';
+      }
 
       try {
+        const tf = (document.getElementById('bt-timeframe') || {}).value || '1h';
+        const exch = (document.getElementById('bt-exchange') || {}).value || 'binance';
+        const sym = (document.getElementById('bt-symbol') || {}).value || 'BTC/USDT';
+        const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+          ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+
+        let windows = [90, 365, 730];
+        if (tf === '5m') windows = [7, 30, Math.min(60, tfLimit)];
+        else if (tf === '15m' || tf === '30m') windows = [14, 30, Math.min(90, tfLimit)];
+        else windows = [90, 365, Math.min(730, tfLimit)];
+        windows = [...new Set(windows)].sort((a, b) => a - b);
+
+        const items = windows.map(w => ({ days: w, label: w + 'd' }));
+        const title = `Multi-Window Sweep (${sym} ${tf} on ${exch.toUpperCase()})`;
+        initSweepTable('windows', title, items);
+
+        const rows = [];
+        const basePayload = getBacktestPayloadBase();
+        basePayload.timeframe = tf;
+
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const stEl = document.getElementById(`bt-sweep-status-${i}`);
@@ -5157,37 +5203,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+      } catch (err) {
+        console.error('Multi-window sweep error:', err);
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
       } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-table-columns"></i> Compare All Windows';
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-table-columns"></i> Compare All Windows';
+        }
       }
     }
 
     async function executeCompareTimeframes(e) {
-      if (e) e.preventDefault();
+      if (e && e.preventDefault) e.preventDefault();
       const btn = document.getElementById('btn-sweep-timeframes');
-      btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Grid...';
-
-      const askedDays = parseInt(document.getElementById('bt-days').value, 10) || 30;
-      const exch = document.getElementById('bt-exchange').value;
-      const sym = document.getElementById('bt-symbol').value;
-      const timeframes = ['5m', '15m', '1h', '4h', '1d'];
-
-      const items = timeframes.map(tf => {
-        const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
-          ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
-        const clampedDays = Math.min(askedDays, tfLimit);
-        return { tf, days: clampedDays, label: tf };
-      });
-
-      const title = `Timeframe Sweep Grid (${sym} on ${exch.toUpperCase()})`;
-      initSweepTable('timeframes', title, items);
-
-      const rows = [];
-      const basePayload = getBacktestPayloadBase();
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sweeping Grid...';
+      }
 
       try {
+        const askedDays = parseInt((document.getElementById('bt-days') || {}).value, 10) || 30;
+        const exch = (document.getElementById('bt-exchange') || {}).value || 'binance';
+        const sym = (document.getElementById('bt-symbol') || {}).value || 'BTC/USDT';
+        const timeframes = ['5m', '15m', '1h', '4h', '1d'];
+
+        const items = timeframes.map(tf => {
+          const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+            ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+          const clampedDays = Math.min(askedDays, tfLimit);
+          return { tf, days: clampedDays, label: tf };
+        });
+
+        const title = `Timeframe Sweep Grid (${sym} on ${exch.toUpperCase()})`;
+        initSweepTable('timeframes', title, items);
+
+        const rows = [];
+        const basePayload = getBacktestPayloadBase();
+
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const stEl = document.getElementById(`bt-sweep-status-${i}`);
@@ -5252,9 +5306,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+      } catch (err) {
+        console.error('Timeframe sweep error:', err);
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
       } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-layer-group"></i> Sweep Timeframes';
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-layer-group"></i> Sweep Timeframes';
+        }
       }
     }
 
@@ -5573,6 +5633,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     setInterval(refreshAnalysis, 15000);
     setInterval(refreshLogs, 5000);
     applyTimeframeLimits();
+
+    const btnSweepWindows = document.getElementById('btn-sweep-windows');
+    if (btnSweepWindows) btnSweepWindows.addEventListener('click', executeCompareWindows);
+    const btnSweepTf = document.getElementById('btn-sweep-timeframes');
+    if (btnSweepTf) btnSweepTf.addEventListener('click', executeCompareTimeframes);
   </script>
 </body>
 </html>
