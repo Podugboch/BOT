@@ -2940,3 +2940,68 @@ globalThis.fetch = async (url, opts) => {
         assert out["badgeErr"] == "EXECUTION ERROR"
         assert "is not available in this region" in out["noticeTitle"]
 
+    def test_compare_windows_skips_windows_exceeding_history_on_short_timeframes(self, monkeypatch):
+        """15m only stores ~90d: 365d and 730d must be skipped without failing the request."""
+        import web_server
+        hist = _wave_ohlcv(n=500)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        req = web_server.CompareWindowsRequest(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe="15m",
+            windows=[90, 365, 730],
+            starting_equity=1000.0,
+        )
+        res = web_server.compare_windows_endpoint(req)
+        assert res["success"] is True
+        assert len(res["rows"]) == 3
+        # 90d runs
+        assert res["rows"][0]["lookback_days"] == 90
+        assert "error" not in res["rows"][0]
+        # 365d skipped
+        assert res["rows"][1]["lookback_days"] == 365
+        assert res["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
+        assert res["rows"][1]["trades"] == 0
+        # 730d skipped
+        assert res["rows"][2]["lookback_days"] == 730
+        assert res["rows"][2]["error"] == "Not enough history for 15m (max ~90d)"
+        assert res["rows"][2]["trades"] == 0
+
+        # Entire response must serialize cleanly to JSON
+        encoded = json.loads(json.dumps(res))
+        assert encoded["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
+
+    def test_compare_timeframes_skips_short_timeframes_when_lookback_exceeds(self, monkeypatch):
+        """When 365d is requested, 5m and 15m must be skipped while 1h runs."""
+        import web_server
+        hist = _wave_ohlcv(n=500)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        req = web_server.CompareTimeframesRequest(
+            exchange="binance",
+            symbol="BTC/USDT",
+            days=365,
+            timeframes=["5m", "15m", "1h"],
+            starting_equity=1000.0,
+        )
+        res = web_server.compare_timeframes_endpoint(req)
+        assert res["success"] is True
+        assert len(res["rows"]) == 3
+        # 5m skipped (max ~60d)
+        assert res["rows"][0]["timeframe"] == "5m"
+        assert res["rows"][0]["error"] == "Not enough history for 5m (max ~60d)"
+        # 15m skipped (max ~90d)
+        assert res["rows"][1]["timeframe"] == "15m"
+        assert res["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
+        # 1h runs (stores up to 730d)
+        assert res["rows"][2]["timeframe"] == "1h"
+        assert "error" not in res["rows"][2]
+        assert res["rows"][2]["lookback_days"] == 365
+
+        # Entire response must serialize cleanly to JSON
+        encoded = json.loads(json.dumps(res))
+        assert encoded["rows"][0]["error"] == "Not enough history for 5m (max ~60d)"
+        assert encoded["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
+
+

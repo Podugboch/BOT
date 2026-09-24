@@ -1455,39 +1455,81 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
 
         starting_equity = max(1.0, float(req.starting_equity))
         default_windows = [90, 365, 730]
-        if req.timeframe == "5m":
-            default_windows = [7, 30, 60]
-        elif req.timeframe in ("15m", "30m"):
-            default_windows = [14, 30, 90]
-
         requested_windows = req.windows or default_windows
         windows = []
         for w in requested_windows:
-            clamped = clamp_lookback_days(w, req.timeframe)
-            if clamped not in windows:
-                windows.append(clamped)
-        windows = sorted(windows)
+            try:
+                w_int = int(w)
+                if w_int > 0 and w_int not in windows:
+                    windows.append(w_int)
+            except (ValueError, TypeError):
+                continue
         if not windows:
-            windows = [30]
+            windows = [90, 365, 730]
 
-        max_days = max(windows)
-        df_full = fetch_historical(exch, req.symbol, req.timeframe, max_days)
-        if df_full is None or len(df_full) < 60:
-            raise HTTPException(status_code=400, detail=(
-                f"Insufficient historical bars for {req.symbol} {req.timeframe}: "
-                f"the exchange returned {0 if df_full is None else len(df_full)} candle(s). "
-                f"{lookback_limit_note(req.timeframe)}"))
+        limit = max_lookback_days(req.timeframe)
+        valid_windows = [w for w in windows if w <= limit]
+
+        df_full = None
+        if valid_windows:
+            max_days = max(valid_windows)
+            try:
+                df_full = fetch_historical(exch, req.symbol, req.timeframe, max_days)
+            except Exception as fe:
+                logger.warning(f"Failed to fetch historical data for {req.symbol} {req.timeframe}: {fe}")
+                df_full = None
 
         cfg = _build_backtest_config(req, exch, req.symbol, req.timeframe, starting_equity)
 
         rows = []
-        last_ts = df_full["ts"].iloc[-1]
+        last_ts = df_full["ts"].iloc[-1] if (df_full is not None and not df_full.empty) else None
+
         for w in windows:
+            if w > limit:
+                rows.append({
+                    "lookback_days": int(w),
+                    "lookback_label": f"{w}d",
+                    "error": f"Not enough history for {req.timeframe} (max ~{limit}d)",
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
+            if df_full is None or len(df_full) < 60 or last_ts is None:
+                rows.append({
+                    "lookback_days": int(w),
+                    "lookback_label": f"{w}d",
+                    "error": f"Insufficient historical bars ({0 if df_full is None else len(df_full)} < 60)",
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
             cutoff = last_ts - pd.Timedelta(days=w)
             df_slice = df_full[df_full["ts"] >= cutoff].copy().reset_index(drop=True)
             if len(df_slice) < 60:
                 rows.append({
-                    "lookback_days": w,
+                    "lookback_days": int(w),
                     "lookback_label": f"{w}d",
                     "error": f"Insufficient bars ({len(df_slice)} < 60)",
                     "trades": 0,
@@ -1560,13 +1602,33 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
         rows = []
         for tf in target_tfs:
             tf_clean = tf.strip().lower()
-            clamped_days = clamp_lookback_days(req.days, tf_clean)
+            limit = max_lookback_days(tf_clean)
+            if req.days > limit:
+                rows.append({
+                    "timeframe": tf_clean,
+                    "lookback_days": int(req.days),
+                    "error": f"Not enough history for {tf_clean} (max ~{limit}d)",
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "final_equity": starting_equity,
+                    "sharpe_approx": None,
+                    "realized_rr": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "fib_blocked": 0,
+                    "sizing_blocked": 0,
+                    "risk_blocked": 0,
+                    "total_fees_paid": 0.0,
+                    "profitable": False,
+                })
+                continue
+
             try:
-                df = fetch_historical(exch, req.symbol, tf_clean, clamped_days)
+                df = fetch_historical(exch, req.symbol, tf_clean, req.days)
             except Exception as fe:
                 rows.append({
                     "timeframe": tf_clean,
-                    "lookback_days": clamped_days,
+                    "lookback_days": int(req.days),
                     "error": str(fe),
                     "trades": 0,
                     "win_rate_pct": 0.0,
@@ -1586,7 +1648,7 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
             if df is None or len(df) < 60:
                 rows.append({
                     "timeframe": tf_clean,
-                    "lookback_days": clamped_days,
+                    "lookback_days": int(req.days),
                     "error": f"Insufficient bars ({0 if df is None else len(df)} < 60)",
                     "trades": 0,
                     "win_rate_pct": 0.0,
@@ -1609,7 +1671,7 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
             ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
                 "timeframe": str(tf_clean),
-                "lookback_days": int(clamped_days),
+                "lookback_days": int(req.days),
                 "candles_evaluated": int(res.get("candles_tested", len(df))),
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
@@ -3427,12 +3489,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                  body: 'Too many requests in a row. Give it a minute, then run the backtest again.',
                  detail: detail };
       }
-      if (text.includes('insufficient historical bars')) {
+      if (text.includes('insufficient historical bars') || text.includes('not enough history')) {
         // The server appends the venue's real storage limit after the colon.
         const tail = raw.split(/insufficient historical bars[^:]*:\\s*/i)[1];
         return { title: 'Not enough history for that window',
                  body: (tail || '').trim() ||
-                       'The exchange had no candles that far back. Shorten the lookback and try again.',
+                       (text.includes('not enough history') ? raw : 'The exchange had no candles that far back. Shorten the lookback and try again.'),
                  detail: detail };
       }
       if (text.includes('timeout') || text.includes('timed out') || text.includes('network') ||
@@ -5060,8 +5122,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const returnText = hasErr ? '--' : ((row.total_return_pct >= 0 ? '+' : '') + Number(row.total_return_pct).toFixed(2) + '%');
       const returnClass = hasErr ? 'text-slate-500' : (row.total_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold');
       const sharpeText = (row.sharpe_approx !== null && row.sharpe_approx !== undefined) ? Number(row.sharpe_approx).toFixed(2) : '--';
+      const isUnavailable = row.error && row.error.includes('Not enough history');
       const regimeBadge = hasErr
-        ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400 font-sans">ERROR</span>`
+        ? (isUnavailable
+            ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-amber-500/20 text-amber-300 font-sans">UNAVAILABLE</span>`
+            : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400 font-sans">ERROR</span>`)
         : (isProf
             ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">PROFIT</span>`
             : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">LOSS</span>`);
@@ -5071,10 +5136,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (hasErr) {
         const cleanErr = firstUsefulLine(row.error) || row.error;
+        const iconClass = isUnavailable ? 'fa-solid fa-circle-exclamation' : 'fa-solid fa-triangle-exclamation';
+        const textCol = isUnavailable ? 'text-amber-400/90' : 'text-rose-400';
         tr.innerHTML = `
           <td class="py-1.5 px-1.5 font-semibold text-slate-300" ${dateTooltip}>${windowLabel}</td>
-          <td colspan="9" class="py-1.5 px-1.5 text-rose-400 text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
-            <i class="fa-solid fa-triangle-exclamation mr-1"></i> ${escapeHtml(cleanErr)}
+          <td colspan="9" class="py-1.5 px-1.5 ${textCol} text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
+            <i class="${iconClass} mr-1"></i> ${escapeHtml(cleanErr)}
           </td>
           <td class="py-1.5 px-1.5">${regimeBadge}</td>
         `;
@@ -5107,17 +5174,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const validCount = validRows.length;
 
       if (errRows.length === totalCount && totalCount > 0) {
-        badgeEl.innerText = 'EXECUTION ERROR';
-        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
-        const sampleErr = errRows[0].error || 'Exchange request failed';
-        summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Sweep failed (${errRows.length}/${totalCount} regimes failed).</span> ${escapeHtml(firstUsefulLine(sampleErr) || sampleErr)}`;
-        const failure = describeBacktestError({ message: sampleErr });
-        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        const allUnavailable = errRows.every(r => r.error && r.error.includes('Not enough history'));
+        if (allUnavailable) {
+          badgeEl.innerText = 'UNAVAILABLE';
+          badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30';
+          const sampleErr = errRows[0].error || 'Exchange request failed';
+          summaryEl.innerHTML = `<span class="text-amber-400 font-semibold">\u26a0 Lookback window unavailable.</span> ${escapeHtml(firstUsefulLine(sampleErr) || sampleErr)}`;
+        } else {
+          badgeEl.innerText = 'EXECUTION ERROR';
+          badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
+          const sampleErr = errRows[0].error || 'Exchange request failed';
+          summaryEl.innerHTML = `<span class="text-rose-400 font-semibold">\u2718 Sweep failed (${errRows.length}/${totalCount} regimes failed).</span> ${escapeHtml(firstUsefulLine(sampleErr) || sampleErr)}`;
+          const failure = describeBacktestError({ message: sampleErr });
+          showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+        }
         return;
       }
 
       const pctProf = validCount > 0 ? (profCount / validCount) * 100 : 0;
-      const errSuffix = errRows.length > 0 ? ` (${errRows.length} errored)` : '';
+      const unavailCount = errRows.filter(r => r.error && r.error.includes('Not enough history')).length;
+      const rawErrCount = errRows.length - unavailCount;
+      let errSuffix = '';
+      if (unavailCount > 0 && rawErrCount > 0) {
+        errSuffix = ` (${unavailCount} unavailable, ${rawErrCount} errored)`;
+      } else if (unavailCount > 0) {
+        errSuffix = ` (${unavailCount} unavailable)`;
+      } else if (rawErrCount > 0) {
+        errSuffix = ` (${rawErrCount} errored)`;
+      }
 
       if (pctProf === 100) {
         badgeEl.innerText = 'ROBUST REGIME';
@@ -5149,12 +5233,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
           ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
 
-        let windows = [90, 365, 730];
-        if (tf === '5m') windows = [7, 30, Math.min(60, tfLimit)];
-        else if (tf === '15m' || tf === '30m') windows = [14, 30, Math.min(90, tfLimit)];
-        else windows = [90, 365, Math.min(730, tfLimit)];
-        windows = [...new Set(windows)].sort((a, b) => a - b);
-
+        const windows = [90, 365, 730];
         const items = windows.map(w => ({ days: w, label: w + 'd' }));
         const title = `Multi-Window Sweep (${sym} ${tf} on ${exch.toUpperCase()})`;
         initSweepTable('windows', title, items);
@@ -5166,6 +5245,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const stEl = document.getElementById(`bt-sweep-status-${i}`);
+
+          if (item.days > tfLimit) {
+            const rowData = {
+              lookback_days: item.days,
+              lookback_label: item.label,
+              error: `Not enough history for ${tf} (max ~${tfLimit}d)`,
+              trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: basePayload.starting_equity,
+              sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+              fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+            };
+            rows.push(rowData);
+            updateSweepTableRow(i, false, rowData);
+            const progEl = document.getElementById('bt-sweep-progress');
+            if (progEl) progEl.innerText = String(i + 1);
+            continue;
+          }
+
           if (stEl) stEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.label} backtest...</span>`;
 
           const payload = { ...basePayload, days: item.days };
@@ -5256,8 +5352,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const items = timeframes.map(tf => {
           const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
             ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
-          const clampedDays = Math.min(askedDays, tfLimit);
-          return { tf, days: clampedDays, label: tf };
+          return { tf, days: askedDays, limit: tfLimit, label: tf };
         });
 
         const title = `Timeframe Sweep Grid (${sym} on ${exch.toUpperCase()})`;
@@ -5269,6 +5364,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const stEl = document.getElementById(`bt-sweep-status-${i}`);
+
+          if (askedDays > item.limit) {
+            const rowData = {
+              timeframe: item.tf,
+              lookback_days: askedDays,
+              error: `Not enough history for ${item.tf} (max ~${item.limit}d)`,
+              trades: 0, win_rate_pct: 0, total_return_pct: 0, final_equity: basePayload.starting_equity,
+              sharpe_approx: null, realized_rr: 0, max_drawdown_pct: 0,
+              fib_blocked: 0, sizing_blocked: 0, risk_blocked: 0, total_fees_paid: 0, profitable: false
+            };
+            rows.push(rowData);
+            updateSweepTableRow(i, true, rowData);
+            const progEl = document.getElementById('bt-sweep-progress');
+            if (progEl) progEl.innerText = String(i + 1);
+            continue;
+          }
+
           if (stEl) stEl.innerHTML = `<span class="text-blue-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.tf} backtest (${item.days}d)...</span>`;
 
           const payload = { ...basePayload, timeframe: item.tf, days: item.days };
