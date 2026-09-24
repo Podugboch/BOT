@@ -38,7 +38,7 @@ BLOB_STORE_ID = (os.getenv("BLOB_STORE_ID") or "").strip().removeprefix("store_"
 _DRIVER = (os.getenv("REMOTE_STORAGE_DRIVER") or "").strip().lower()
 
 _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9_.@-]{0,127}$", re.IGNORECASE)
-_EXCHANGES = {"binance", "coinbase", "kraken", "kucoin", "bybit", "okx", "bitget", "gateio", "mexc", "bitfinex", "cryptocom", "htx", "bingx", "whitebit", "gemini", "phemex", "poloniex", "deribit"}
+_EXCHANGES = {"binance", "coinbase", "kraken", "kucoin", "bybit", "okx", "bitget", "gate", "gateio", "mexc", "bitfinex", "cryptocom", "htx", "bingx", "whitebit", "gemini", "phemex", "poloniex", "deribit"}
 
 
 def _component(value: Any, field: str = "identifier") -> str:
