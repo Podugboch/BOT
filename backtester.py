@@ -9,6 +9,7 @@ Usage:
 """
 import argparse
 import logging
+import time
 
 import ccxt
 import numpy as np
@@ -143,6 +144,9 @@ def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int) -> 
              f"{diag['sizing_passed']:,}", f"{diag['sizing_blocked']:,}",
              _fmt_counts(diag["core_misses"]))
 
+_HISTORICAL_CACHE: dict = {}
+
+
 def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
                      client=None, pause_sec: float = None, max_chunks: int = None) -> pd.DataFrame:
     """Historical OHLCV pull that paginates across the whole lookback window.
@@ -166,6 +170,17 @@ def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
                     lookback_limit_note(timeframe))
 
     if client is None:
+        cache_key = (str(exchange_id).strip().lower(), str(symbol).strip().upper(), str(timeframe).strip().lower())
+        now_mono = time.monotonic()
+        if cache_key in _HISTORICAL_CACHE:
+            cached_time, cached_days, cached_df = _HISTORICAL_CACHE[cache_key]
+            if (now_mono - cached_time < 300) and (cached_days >= days) and (not cached_df.empty):
+                cutoff = cached_df["ts"].iloc[-1] - pd.Timedelta(days=days)
+                slice_df = cached_df[cached_df["ts"] >= cutoff].copy().reset_index(drop=True)
+                if len(slice_df) >= 30:
+                    log.info("Serving %s %s (%sd) from in-memory cache (%d bars)", symbol, timeframe, days, len(slice_df))
+                    return slice_df
+
         ex_clean = str(exchange_id).strip().lower()
         if ex_clean not in ccxt.exchanges:
             raise ValueError(f"'{exchange_id}' is not a valid ccxt exchange id.")
@@ -227,6 +242,8 @@ def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
     if coverage < 80:
         log.warning("Only %.0f%% of the expected candles came back for %s — the exchange may "
                     "not list this symbol that far back, or pages were skipped", coverage, symbol)
+    if client is None and not df.empty:
+        _HISTORICAL_CACHE[cache_key] = (now_mono, days, df)
     return df
 
 
