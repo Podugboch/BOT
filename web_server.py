@@ -902,6 +902,30 @@ def _no_store(response: Response) -> None:
             response.headers[key] = value
 
 
+def sanitize_for_json(obj):
+    """Recursively convert NumPy scalars/arrays into JSON-native Python types.
+
+    Indicator math and the backtester hand back values like ``np.bool_``,
+    ``np.float64`` and ``np.int64``. FastAPI's ``jsonable_encoder`` cannot encode
+    those scalars (``np.bool_`` is not iterable and has no ``__dict__``), which is
+    what turned every sweep click into an HTTP 500. Sanitizing the payload at the
+    boundary keeps the endpoints returning plain dicts/lists/bools/floats/ints.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, (np.bool_, getattr(np, 'bool8', bool))):
+        return bool(obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
     """HTML that must never be cached, with the headers set for you.
 
@@ -1282,7 +1306,7 @@ def get_analysis(response: Response = None, symbol: Optional[str] = None,
 
     # 3. If exchange calls fail, return last known cached analysis if available
     if (df is None or len(df) < 2) and LAST_ANALYSIS_CACHE:
-        return LAST_ANALYSIS_CACHE
+        return sanitize_for_json(LAST_ANALYSIS_CACHE)
 
     if df is None or len(df) < 2:
         raise HTTPException(status_code=500, detail="Insufficient market data returned from exchange network")
@@ -1347,11 +1371,11 @@ def get_analysis(response: Response = None, symbol: Optional[str] = None,
             "candles": recent_candles,
         }
         LAST_ANALYSIS_CACHE = result
-        return result
+        return sanitize_for_json(result)
     except Exception as e:
         logger.exception("Analysis calculation failed")
         if LAST_ANALYSIS_CACHE:
-            return LAST_ANALYSIS_CACHE
+            return sanitize_for_json(LAST_ANALYSIS_CACHE)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1409,12 +1433,12 @@ def run_backtest_endpoint(req: BacktestRequest):
                 f"{lookback_limit_note(req.timeframe)}"))
 
         results = run_backtest(df, cfg)
-        return {
+        return sanitize_for_json({
             "success": True,
             "params": req.dict(),
             "bars_analyzed": len(df),
             "results": results,
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:
@@ -1506,7 +1530,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
             })
 
         profitable_count = sum(1 for r in rows if r.get("profitable"))
-        return {
+        return sanitize_for_json({
             "success": True,
             "mode": "windows",
             "symbol": req.symbol,
@@ -1516,7 +1540,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
             "profitable_count": profitable_count,
             "total_windows": len(rows),
             "rows": rows,
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:
@@ -1605,7 +1629,7 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
             })
 
         profitable_count = sum(1 for r in rows if r.get("profitable"))
-        return {
+        return sanitize_for_json({
             "success": True,
             "mode": "timeframes",
             "symbol": req.symbol,
@@ -1614,7 +1638,7 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
             "profitable_count": profitable_count,
             "total_timeframes": len(rows),
             "rows": rows,
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:

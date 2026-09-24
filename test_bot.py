@@ -2711,6 +2711,122 @@ class TestBacktestEnhancements:
         assert res["rows"][0]["timeframe"] == "15m"
         assert res["rows"][1]["timeframe"] == "1h"
 
+    def test_sanitize_for_json_converts_numpy_scalars(self):
+        """The sweep buttons 500'd because FastAPI cannot encode NumPy scalars."""
+        from web_server import sanitize_for_json
+
+        payload = {
+            "flag": np.bool_(True),
+            "count": np.int64(7),
+            "ratio": np.float64(1.25),
+            "nested": {"blocked": np.bool_(False), "items": [np.int64(1), np.float64(2.5)]},
+            "arr": np.array([1, 2, 3]),
+            "arr2d": np.zeros((2, 2)),
+            "plain": "text",
+        }
+        clean = sanitize_for_json(payload)
+
+        assert clean["flag"] is True
+        assert clean["count"] == 7 and isinstance(clean["count"], int)
+        assert clean["ratio"] == 1.25 and isinstance(clean["ratio"], float)
+        assert clean["nested"]["blocked"] is False
+        assert clean["nested"]["items"] == [1, 2.5]
+        assert clean["arr"] == [1, 2, 3]
+        assert clean["arr2d"] == [[0.0, 0.0], [0.0, 0.0]]
+        assert clean["plain"] == "text"
+        # Every leaf must survive a real JSON round-trip.
+        assert json.loads(json.dumps(clean)) == clean
+        for value in clean.values():
+            assert not isinstance(value, np.generic)
+
+    @staticmethod
+    def _numpy_backtest_result(candles):
+        """A backtest payload stuffed with the NumPy scalars indicators emit."""
+        return {
+            "starting_equity": np.float64(1000.0),
+            "final_equity": np.float64(1085.5),
+            "total_return_pct": np.float64(8.55),
+            "num_trades": np.int64(22),
+            "win_rate_pct": np.float64(45.45),
+            "avg_win": np.float64(20.0),
+            "avg_loss": np.float64(-10.0),
+            "realized_rr": np.float64(2.0),
+            "total_fees_paid": np.float64(10.5),
+            "exit_reasons": {"target": np.int64(10)},
+            "max_drawdown_pct": np.float64(-4.5),
+            "sharpe_approx": np.float64(1.2),
+            "fib_filter_enabled": np.bool_(True),
+            "fib_blocked_signals": np.int64(3),
+            "trailing_stop_enabled": np.bool_(True),
+            "debounce_blocked": np.int64(1),
+            "min_bars_between_trades": np.int64(3),
+            "min_entry_gap_bars": np.int64(4),
+            "candles_tested": np.int64(len(candles)),
+            "candles_warmup": np.int64(50),
+            "date_range": [candles["ts"].iloc[0].isoformat(), candles["ts"].iloc[-1].isoformat()],
+            "eval_date_range": [candles["ts"].iloc[0].isoformat(), candles["ts"].iloc[-1].isoformat()],
+            "raw_signals": np.int64(30),
+            "signals_rejected": {"fib_zone": np.int64(8)},
+            "trades_executed": np.int64(22),
+            "diagnostics": {
+                "candles_evaluated": np.int64(len(candles)),
+                "signals_risk_blocked": np.int64(0),
+                "fib_filter_blocked": np.int64(3),
+                "sizing_blocked": np.int64(0),
+                "rejections": {"fib_zone": np.int64(8)},
+                "core_misses": {"no_ema_cross": np.int64(12)},
+                "all_clear": np.bool_(True),
+                "report": "ok",
+            },
+        }
+
+    def test_backtest_endpoint_sanitizes_numpy_results(self, monkeypatch):
+        import web_server
+        hist = _wave_ohlcv(n=100)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+        monkeypatch.setattr(web_server, "run_backtest",
+                            lambda df, cfg: self._numpy_backtest_result(hist))
+
+        req = web_server.BacktestRequest(exchange="binance", symbol="BTC/USDT",
+                                         timeframe="1h", days=30)
+        res = web_server.run_backtest_endpoint(req)
+
+        assert res["success"] is True
+        assert res["results"]["num_trades"] == 22
+        assert res["results"]["diagnostics"]["fib_filter_blocked"] == 3
+        assert res["results"]["diagnostics"]["all_clear"] is True
+        assert not isinstance(res["results"]["num_trades"], np.generic)
+        assert json.loads(json.dumps(res))["results"]["final_equity"] == 1085.5
+
+    def test_compare_endpoints_sanitize_numpy_results(self, monkeypatch):
+        import web_server
+        dates = pd.date_range("2026-01-01", periods=1500, freq="1h")
+        close = 50000 + np.sin(np.linspace(0, 30, 1500)) * 3000
+        hist = pd.DataFrame({
+            "ts": dates, "open": close - 20, "high": close + 100,
+            "low": close - 100, "close": close,
+            "volume": np.random.default_rng(3).uniform(10, 100, 1500),
+        })
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+        monkeypatch.setattr(web_server, "run_backtest",
+                            lambda df, cfg: self._numpy_backtest_result(hist))
+
+        windows = web_server.compare_windows_endpoint(web_server.CompareWindowsRequest(
+            exchange="binance", symbol="BTC/USDT", timeframe="1h",
+            windows=[30, 60], starting_equity=1000.0))
+        assert windows["success"] is True
+        assert len(windows["rows"]) == 2
+        assert windows["rows"][0]["profitable"] is True
+        assert json.loads(json.dumps(windows))["rows"][0]["trades"] == 22
+
+        timeframes = web_server.compare_timeframes_endpoint(web_server.CompareTimeframesRequest(
+            exchange="binance", symbol="BTC/USDT", days=30,
+            timeframes=["15m", "1h"], starting_equity=1000.0))
+        assert timeframes["success"] is True
+        assert [row["timeframe"] for row in timeframes["rows"]] == ["15m", "1h"]
+        assert timeframes["rows"][1]["fib_blocked"] == 3
+        assert json.loads(json.dumps(timeframes))["profitable_count"] == 2
+
     def test_dashboard_sweep_runtime_and_error_handling(self, tmp_path):
         """executeCompareWindows and executeCompareTimeframes must run cleanly in Node.js."""
         node = shutil.which("node")
@@ -2823,5 +2939,4 @@ globalThis.fetch = async (url, opts) => {
         assert out["btnTfDisabled"] is False
         assert out["badgeErr"] == "EXECUTION ERROR"
         assert "is not available in this region" in out["noticeTitle"]
-
 
