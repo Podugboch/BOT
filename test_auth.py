@@ -563,27 +563,27 @@ class TestAuthRegistrationFlow:
             cmd = args[0]
             if cmd == "SET":
                 fake_redis[args[1]] = args[2]
-                return "OK"
+                return True, "OK"
             elif cmd == "GET":
-                return fake_redis.get(args[1])
+                return True, fake_redis.get(args[1])
             elif cmd == "DEL":
-                fake_redis.pop(args[1], None)
-                return 1
+                return True, fake_redis.pop(args[1], None)
             elif cmd == "SADD":
                 s = fake_redis.setdefault(args[1], set())
                 s.add(args[2])
-                return 1
+                return True, 1
             elif cmd == "SMEMBERS":
-                return list(fake_redis.get(args[1], []))
+                return True, list(fake_redis.get(args[1], []))
             elif cmd == "SREM":
                 s = fake_redis.get(args[1], set())
                 s.discard(args[2])
-                return 1
-            return None
+                return True, 1
+            return False, None
 
         monkeypatch.setattr("storage_adapter.KV_URL", "https://fake-kv.upstash.io")
         monkeypatch.setattr("storage_adapter.KV_TOKEN", "fake_token")
         monkeypatch.setattr("storage_adapter._kv_command", mock_kv_cmd)
+        monkeypatch.setattr("storage_adapter._DRIVER", "kv")
 
         assert remote_save_user(10, "remote_user", "remote@test.com", "h123", "s123", is_active=1)
         u = remote_get_user("remote_user")
