@@ -446,6 +446,25 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
     results["trades_executed"] = diag["trades_executed"]
     # Payload the frontend renders directly: how much data was actually tested
     # and which window it covered.
+    # Buy-and-hold benchmark (Item 3): computed over the same evaluated window, net of 0 fees
+    if len(df) > warmup:
+        bh_start_price = float(df.iloc[warmup]["close"])
+        bh_end_price = float(df.iloc[-1]["close"])
+    elif len(df) > 0:
+        bh_start_price = float(df.iloc[0]["close"])
+        bh_end_price = float(df.iloc[-1]["close"])
+    else:
+        bh_start_price = 1.0
+        bh_end_price = 1.0
+
+    bh_return_pct = round(((bh_end_price - bh_start_price) / bh_start_price) * 100.0, 2) if bh_start_price > 0 else 0.0
+    bh_final_equity = round(float(cfg.starting_equity) * (1.0 + (bh_return_pct / 100.0)), 2)
+
+    results["buy_and_hold_return_pct"] = bh_return_pct
+    results["buy_and_hold_final_equity"] = bh_final_equity
+    results["buy_and_hold_start_price"] = bh_start_price
+    results["buy_and_hold_end_price"] = bh_end_price
+
     results["candles_tested"] = candles_tested
     results["date_range"] = date_range
     results["indicator_date_range"] = date_range
@@ -461,6 +480,110 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
     diag["eval_date_range"] = eval_date_range
     diag["report"] = format_pipeline_report(results)
     return results
+
+
+def run_walk_forward_validation(
+    df: pd.DataFrame,
+    cfg: BotConfig,
+    n_splits: int = 3,
+    train_ratio: float = 0.7
+) -> dict:
+    """
+    Sequential Walk-Forward Validation (out-of-sample parameter verification).
+    Splits history into chronological train/test segments.
+    Parameters are evaluated in-sample and verified strictly out-of-sample
+    on subsequent unseen data to detect curve-fitting / data-mining bias.
+    """
+    total_bars = len(df)
+    min_required_bars = 120
+    if total_bars < min_required_bars:
+        return {
+            "success": False,
+            "error": f"Insufficient candles ({total_bars} < {min_required_bars}) for walk-forward validation.",
+            "is_out_of_sample_validated": False,
+            "folds": [],
+        }
+
+    n_segments = max(2, n_splits + 1)
+    seg_size = total_bars // n_segments
+
+    folds = []
+    total_is_return = 0.0
+    total_oos_return = 0.0
+    total_oos_trades = 0
+    total_oos_bh_return = 0.0
+
+    for k in range(n_splits):
+        train_start = k * seg_size
+        train_end = (k + 1) * seg_size
+        test_start = train_end
+        test_end = min(total_bars, (k + 2) * seg_size if k < n_splits - 1 else total_bars)
+
+        train_slice = df.iloc[train_start:train_end].copy().reset_index(drop=True)
+        test_slice = df.iloc[test_start:test_end].copy().reset_index(drop=True)
+
+        if len(train_slice) < 55 or len(test_slice) < 55:
+            continue
+
+        train_res = run_backtest(train_slice, cfg, sweep_tag=f"WFO Fold {k+1} Train")
+        test_res = run_backtest(test_slice, cfg, sweep_tag=f"WFO Fold {k+1} Test")
+
+        is_ret = float(train_res.get("total_return_pct", 0.0))
+        oos_ret = float(test_res.get("total_return_pct", 0.0))
+        oos_bh = float(test_res.get("buy_and_hold_return_pct", 0.0))
+        oos_trades = int(test_res.get("num_trades", 0))
+
+        total_is_return += is_ret
+        total_oos_return += oos_ret
+        total_oos_trades += oos_trades
+        total_oos_bh_return += oos_bh
+
+        folds.append({
+            "fold": k + 1,
+            "train_date_range": train_res.get("eval_date_range") or train_res.get("date_range"),
+            "test_date_range": test_res.get("eval_date_range") or test_res.get("date_range"),
+            "train_bars": len(train_slice),
+            "test_bars": len(test_slice),
+            "in_sample_return_pct": is_ret,
+            "out_of_sample_return_pct": oos_ret,
+            "out_of_sample_bh_return_pct": oos_bh,
+            "in_sample_trades": int(train_res.get("num_trades", 0)),
+            "out_of_sample_trades": oos_trades,
+            "in_sample_win_rate_pct": float(train_res.get("win_rate_pct", 0.0)),
+            "out_of_sample_win_rate_pct": float(test_res.get("win_rate_pct", 0.0)),
+            "in_sample_sharpe": float(train_res["sharpe_approx"]) if train_res.get("sharpe_approx") is not None else None,
+            "out_of_sample_sharpe": float(test_res["sharpe_approx"]) if test_res.get("sharpe_approx") is not None else None,
+            "out_of_sample_profitable": bool(oos_ret > 0),
+        })
+
+    num_valid_folds = len(folds)
+    avg_is_return = total_is_return / num_valid_folds if num_valid_folds > 0 else 0.0
+    avg_oos_return = total_oos_return / num_valid_folds if num_valid_folds > 0 else 0.0
+    avg_oos_bh = total_oos_bh_return / num_valid_folds if num_valid_folds > 0 else 0.0
+
+    if avg_is_return > 0:
+        wfe_pct = round((avg_oos_return / avg_is_return) * 100.0, 1)
+    else:
+        wfe_pct = 0.0 if avg_oos_return <= 0 else 100.0
+
+    profitable_folds = sum(1 for f in folds if f["out_of_sample_profitable"])
+    is_validated = bool(wfe_pct >= 25.0 and avg_oos_return > 0 and profitable_folds >= (num_valid_folds / 2))
+
+    status_label = "OUT_OF_SAMPLE_VALIDATED" if is_validated else "IN_SAMPLE_ONLY_UNVERIFIED"
+
+    return {
+        "success": True,
+        "is_out_of_sample_validated": is_validated,
+        "status": status_label,
+        "walk_forward_efficiency_pct": wfe_pct,
+        "avg_in_sample_return_pct": round(avg_is_return, 2),
+        "avg_out_of_sample_return_pct": round(avg_oos_return, 2),
+        "avg_out_of_sample_bh_return_pct": round(avg_oos_bh, 2),
+        "total_out_of_sample_trades": total_oos_trades,
+        "profitable_folds": profitable_folds,
+        "total_folds": num_valid_folds,
+        "folds": folds,
+    }
 
 
 def _date_range(df: pd.DataFrame) -> list:
