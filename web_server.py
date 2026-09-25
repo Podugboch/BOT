@@ -38,12 +38,17 @@ safe_load_dotenv()
 migrate_and_sanitize_env_file()
 
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
-from exchange_client import ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days, lookback_limit_note, clamp_lookback_days
+from exchange_client import (
+    ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days,
+    lookback_limit_note, clamp_lookback_days, get_exchange_fee_info
+)
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager, reward_risk_ratio
-from backtester import fetch_historical, run_backtest, summarize
+from backtester import fetch_historical, run_backtest, summarize, run_walk_forward_validation
 from bot import TradingBot, setup_logging
+from execution_tracker import get_execution_tracker
+from alerts import get_alert_dispatcher
 from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection, auth_service
 auth_service = AuthService
 
@@ -989,6 +994,10 @@ def get_status(response: Response = None):
         "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
         "paper_position": round(exchange.paper_position, 6) if exchange else 0.0,
         "active_position": bot.position if bot else None,
+        "timeframe_warning": (
+            f"Negative expectancy (-10% to -15%) in historical backtests on {cfg.exchange.timeframe}. Do not risk live capital on this grain without strategy recalibration."
+            if cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] else None
+        ),
     }
 
 
@@ -1172,9 +1181,18 @@ def execute_manual_trade(req: ManualTradeRequest):
 
 
 @app.post("/api/bot/start")
-def start_bot():
+def start_bot(force: bool = False):
     if runner.running:
         return {"success": False, "message": "Bot is already running"}
+    if runner.cfg.mode == "live" and runner.cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] and not force:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Safety Protection: Live trading with real capital is blocked on {runner.cfg.exchange.timeframe}. "
+                "Historical backtests on this grain show negative expectancy (-10% to -15% returns). "
+                "Please switch to 1h, 4h, or 1d for live execution, or test on Paper mode."
+            )
+        )
     started = runner.start()
     return {"success": started, "message": "Bot started in " + runner.cfg.mode + " mode (" + runner.cfg.execution_mode.upper() + ")"}
 
@@ -1401,17 +1419,21 @@ def _build_backtest_config(req, exchange_id: str, symbol: str, timeframe: str, s
     cfg.exchange.symbol = symbol
     cfg.exchange.timeframe = timeframe
     cfg.starting_equity = max(1.0, float(starting_equity))
-    cfg.strategy.strategy_name = (getattr(req, "strategy", None) or "ema_cross_fib").strip().lower()
-    cfg.strategy.use_fib_filter = req.use_fib_filter
-    cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
-    cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
-    cfg.strategy.fib_level_mode = str(req.fib_level_mode or "deep").strip().lower()
-    cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
-    cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
-    # None keeps the timeframe-derived default; an explicit 0 disables it.
-    cfg.strategy.min_bars_between_trades = (None if req.min_bars_between_trades is None
-                                            else max(0, int(req.min_bars_between_trades)))
-    cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
+    cfg.strategy.strategy_name = (getattr(req, "strategy", None) or getattr(req, "strategy_name", None) or "ema_cross_fib").strip().lower()
+    cfg.strategy.use_fib_filter = getattr(req, "use_fib_filter", True)
+    if getattr(req, "fib_tolerance_atr_mult", None) is not None:
+        cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
+    if getattr(req, "fib_tolerance_pct", None) is not None:
+        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
+    cfg.strategy.fib_level_mode = str(getattr(req, "fib_level_mode", None) or "deep").strip().lower()
+    if getattr(req, "trailing_stop_enabled", None) is not None:
+        cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
+    if getattr(req, "trailing_stop_atr_mult", None) is not None:
+        cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
+    if getattr(req, "min_bars_between_trades", None) is not None:
+        cfg.strategy.min_bars_between_trades = max(0, int(req.min_bars_between_trades))
+    if getattr(req, "risk_per_trade_pct", None) is not None:
+        cfg.risk.risk_per_trade_pct = float(req.risk_per_trade_pct)
     return cfg
 
 
@@ -1584,6 +1606,8 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
+                "buy_and_hold_return_pct": float(res.get("buy_and_hold_return_pct", 0.0)),
+                "buy_and_hold_final_equity": float(res.get("buy_and_hold_final_equity", starting_equity)),
                 "final_equity": float(res.get("final_equity", starting_equity)),
                 "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
                 "realized_rr": float(res.get("realized_rr", 0.0)),
@@ -1711,6 +1735,8 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
+                "buy_and_hold_return_pct": float(res.get("buy_and_hold_return_pct", 0.0)),
+                "buy_and_hold_final_equity": float(res.get("buy_and_hold_final_equity", starting_equity)),
                 "final_equity": float(res.get("final_equity", starting_equity)),
                 "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
                 "realized_rr": float(res.get("realized_rr", 0.0)),
@@ -1779,6 +1805,131 @@ def get_logs(response: Response = None, lines: int = 50):
             return {"logs": all_lines[-lines:]}
     except Exception as e:
         return {"logs": [f"Error reading log file: {e}"]}
+
+
+class SizingValidationRequest(BaseModel):
+    equity: float
+    risk_per_trade_pct: float = 0.01
+    price: float
+    stop_price: float
+    min_notional: float = 5.0
+
+
+class WalkForwardRequest(BaseModel):
+    exchange: str = "binance"
+    symbol: str = "BTC/USDT"
+    timeframe: str = "1h"
+    days: int = 180
+    n_splits: int = 3
+    starting_equity: float = 1000.0
+    use_fib_filter: bool = True
+    fib_tolerance_atr_mult: Optional[float] = None
+    trailing_stop_enabled: Optional[bool] = None
+    trailing_stop_atr_mult: Optional[float] = None
+    stop_loss_atr_mult: Optional[float] = None
+    take_profit_atr_mult: Optional[float] = None
+    min_bars_between_trades: Optional[int] = None
+    strategy: Optional[str] = None
+    strategy_name: Optional[str] = None
+
+
+@app.get("/api/execution/tracker")
+def get_execution_tracker_data(response: Response = None):
+    _no_store(response)
+    tracker = get_execution_tracker()
+    return sanitize_for_json({
+        "success": True,
+        "active_position": tracker.get_open_position(),
+        "open_position": tracker.get_open_position(),
+        "orders": tracker.get_orders(limit=50),
+        "recent_orders": tracker.get_orders(limit=50),
+        "closed_trades": tracker.get_closed_positions(limit=50),
+        "stats": tracker.get_summary_stats(),
+    })
+
+
+@app.get("/api/alerts/config")
+def get_alerts_config_endpoint(response: Response = None):
+    _no_store(response)
+    dispatcher = get_alert_dispatcher()
+    return sanitize_for_json({
+        "success": True,
+        "config": dispatcher.get_config_summary(),
+        "recent_alerts": dispatcher.alert_history[-20:],
+    })
+
+
+@app.post("/api/alerts/test")
+def test_alert_endpoint():
+    dispatcher = get_alert_dispatcher()
+    sent = dispatcher.send_alert(
+        "TEST_ALERT",
+        "Test Notification from Trading Bot",
+        "Alert routing verified successfully across configured channels.",
+        level="info",
+        details={"time": datetime.now(timezone.utc).isoformat(), "environment": "Production/Live"},
+        force=True,
+    )
+    return {
+        "success": sent,
+        "message": "Test alert sent to configured channels (webhook/telegram/logs)" if sent else "Failed to send test alert. Check webhook/telegram settings in .env."
+    }
+
+
+@app.get("/api/exchange/fee-info")
+def get_fee_info_endpoint(exchange: str = "binance", symbol: str = "BTC/USDT"):
+    exch_client = runner.bot.exchange if (runner.bot and runner.bot.exchange) else None
+    exch_obj = exch_client.exchange if exch_client else None
+    info = get_exchange_fee_info(exchange, exchange_obj=exch_obj, symbol=symbol)
+    return sanitize_for_json({"success": True, "fee_info": info})
+
+
+@app.post("/api/risk/validate-sizing")
+def validate_sizing_endpoint(req: SizingValidationRequest):
+    cfg_risk = RiskConfig(risk_per_trade_pct=req.risk_per_trade_pct)
+    rm = RiskManager(cfg_risk, req.equity)
+    size = rm.position_size(req.price, req.stop_price)
+    notional = round(size * req.price, 2)
+    clears, reason = rm.validate_min_notional(req.price, size, min_notional=req.min_notional)
+    return sanitize_for_json({
+        "success": True,
+        "equity": req.equity,
+        "risk_pct": req.risk_per_trade_pct,
+        "computed_size": size,
+        "notional_value": notional,
+        "min_notional_required": req.min_notional,
+        "clears_minimum": clears,
+        "status": "APPROVED" if clears else "REJECTED_BELOW_MIN_NOTIONAL",
+        "behavior": "Order will be sent to exchange" if clears else "Order REJECTED by risk engine before exchange submission (trade skipped to protect risk limits)",
+        "explanation": reason,
+    })
+
+
+@app.post("/api/backtest/walk-forward")
+def walk_forward_endpoint(req: WalkForwardRequest):
+    try:
+        exch = req.exchange.strip().lower()
+        if exch not in ccxt.exchanges:
+            raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
+        days = _clamp_days(req.days)
+        starting_equity = max(1.0, float(req.starting_equity))
+        cfg = _build_backtest_config(req, exch, req.symbol, req.timeframe, starting_equity)
+
+        df = fetch_historical(exch, req.symbol, req.timeframe, days)
+        if df is None or len(df) < 120:
+            raise HTTPException(status_code=400, detail=f"Insufficient candles ({0 if df is None else len(df)} < 120) for walk-forward validation.")
+
+        wfo_results = run_walk_forward_validation(df, cfg, n_splits=req.n_splits)
+        return sanitize_for_json({
+            "success": True,
+            "params": req.dict() if hasattr(req, "dict") else req.model_dump(),
+            "results": wfo_results,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Walk-forward validation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
@@ -2079,6 +2230,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       #panel-market-analysis,
       #section-api-keys,
       #section-backtester,
+      #section-execution-tracking,
       #section-bot-activity {
         display: block !important;
       }
@@ -2092,6 +2244,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     @media (max-width: 767px) {
       #section-api-keys,
       #section-backtester,
+      #section-execution-tracking,
       #section-bot-activity,
       #section-account {
         display: none;
@@ -2102,6 +2255,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       body.mobile-view-backtester #dashboard-detail-grid,
       body.mobile-view-keys #section-api-keys,
       body.mobile-view-backtester #section-backtester,
+      body.mobile-view-activity #section-execution-tracking,
       body.mobile-view-activity #section-bot-activity,
       body.mobile-view-account #section-account {
         display: block;
@@ -2619,7 +2773,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="text-slate-600">•</span>
                 <span id="active-tf-tag" class="text-sky-300 font-semibold">Timeframe: 15m</span>
                 <span class="text-slate-600">•</span>
-                <span id="active-mode-tag" class="text-purple-300 font-semibold">Auto Trading</span>
+                <span id="active-mode-tag" class="text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700">
+                  <i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (No Orders Executing)
+                </span>
               </div>
             </div>
           </div>
@@ -2630,6 +2786,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <i class="fa-solid fa-rotate"></i> Refresh
               </button>
             </div>
+          </div>
+        </div>
+
+        <!-- 15m/5m Negative Expectancy Safety Warning Banner (Item 0) -->
+        <div id="tf-warning-banner" class="hidden p-2.5 rounded-lg border border-amber-500/50 bg-amber-950/40 text-amber-200 text-xs flex items-start gap-2.5">
+          <i class="fa-solid fa-triangle-exclamation text-amber-400 text-sm mt-0.5 shrink-0"></i>
+          <div>
+            <span class="font-bold text-amber-300">Caution — 15m/5m Negative Expectancy:</span>
+            Historical backtests across all tested venues on 15m and 5m show negative net expectancy (-10% to -15% returns, sub-1:1 realized R:R). 
+            <span class="font-semibold text-white">Live capital execution is guarded on this timeframe.</span> Switch to 1h, 4h, or 1d for robust trends or test exclusively in Paper Mode.
           </div>
         </div>
 
@@ -2740,8 +2906,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <form id="backtest-form" onsubmit="executeBacktest(event)" class="space-y-3 text-xs">
           <div>
-            <label class="block text-slate-400 mb-1">Exchange</label>
-            <select id="bt-exchange" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+            <div class="flex justify-between items-center mb-1">
+              <label class="block text-slate-400">Exchange</label>
+              <span id="bt-fee-tier-pill" class="text-[10px] text-slate-400 font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-bordercol/60">Taker: 0.10% (Default)</span>
+            </div>
+            <select id="bt-exchange" onchange="loadFeeInfo()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
               <option value="binance" selected>Binance</option>
               <option value="coinbase">Coinbase Advanced</option>
               <option value="kraken">Kraken</option>
@@ -2797,6 +2966,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
 
+          <!-- Fee Tier & Real Rate Indicator (Item 5) -->
+          <div class="flex items-center justify-between text-[11px] p-2 bg-slate-900/60 rounded-lg border border-bordercol/60">
+            <div class="flex items-center gap-1.5">
+              <i class="fa-solid fa-receipt text-amber-400"></i>
+              <span class="text-slate-400">Fee Tier:</span>
+              <span id="bt-fee-badge" class="font-medium text-amber-300">0.100% Taker</span>
+            </div>
+            <span id="bt-fee-source" class="text-[10px] text-slate-500 font-sans">Hardcoded assumption</span>
+          </div>
+
           <div class="flex items-center gap-2 pt-1">
             <input type="checkbox" id="bt-use-fib" checked class="rounded border-bordercol bg-slate-900 text-emerald-500">
             <label for="bt-use-fib" class="text-slate-300">Enable Fibonacci Zone Filter</label>
@@ -2838,12 +3017,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
               <i class="fa-solid fa-play"></i> Run Historical Backtest
             </button>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <button type="button" id="btn-sweep-windows" onclick="executeCompareWindows(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-purple-500/50 text-purple-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
-                <i class="fa-solid fa-table-columns"></i> Compare All Windows
+                <i class="fa-solid fa-table-columns"></i> Compare Windows
               </button>
               <button type="button" id="btn-sweep-timeframes" onclick="executeCompareTimeframes(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-blue-500/50 text-blue-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
                 <i class="fa-solid fa-layer-group"></i> Sweep Timeframes
+              </button>
+              <button type="button" id="btn-walk-forward" onclick="executeWalkForward(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-sky-500/50 text-sky-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
+                <i class="fa-solid fa-arrows-split-up-and-left"></i> Walk-Forward (OOS)
               </button>
             </div>
           </div>
@@ -2867,6 +3049,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <th class="py-1 px-1.5 font-medium">Trades</th>
                   <th class="py-1 px-1.5 font-medium">Win Rate</th>
                   <th class="py-1 px-1.5 font-medium">Return</th>
+                  <th class="py-1 px-1.5 font-medium text-sky-400">B&amp;H %</th>
                   <th class="py-1 px-1.5 font-medium">Sharpe</th>
                   <th class="py-1 px-1.5 font-medium">Realized R:R</th>
                   <th class="py-1 px-1.5 font-medium">Max DD</th>
@@ -2884,9 +3067,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="text-[10px] text-slate-500">A robust strategy maintains positive expectancy across regimes; profitability in only 1 window indicates regime dependency.</div>
         </div>
 
+        <!-- Walk-Forward Validation (Out-of-Sample) Panel (Item 2) -->
+        <div id="bt-wfo-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-sky-500/40 text-xs space-y-2">
+          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-arrows-split-up-and-left text-sky-400"></i>
+              <span id="bt-wfo-title">Sequential Walk-Forward Validation (Out-of-Sample)</span>
+            </div>
+            <span id="bt-wfo-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold">--</span>
+          </div>
+          <div id="bt-wfo-summary" class="text-[11px] text-slate-300">--</div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-[11px] border-collapse">
+              <thead>
+                <tr class="border-b border-bordercol/60 text-slate-400">
+                  <th class="py-1 px-1.5 font-medium">Fold</th>
+                  <th class="py-1 px-1.5 font-medium">Train Window</th>
+                  <th class="py-1 px-1.5 font-medium">In-Sample Ret</th>
+                  <th class="py-1 px-1.5 font-medium">IS Trades</th>
+                  <th class="py-1 px-1.5 font-medium">Test Window (OOS)</th>
+                  <th class="py-1 px-1.5 font-medium">Out-of-Sample Ret</th>
+                  <th class="py-1 px-1.5 font-medium text-sky-400">OOS B&amp;H</th>
+                  <th class="py-1 px-1.5 font-medium">OOS Trades</th>
+                  <th class="py-1 px-1.5 font-medium">Verdict</th>
+                </tr>
+              </thead>
+              <tbody id="bt-wfo-tbody" class="divide-y divide-bordercol/40 font-mono text-[10px]">
+                <!-- Rows injected dynamically -->
+              </tbody>
+            </table>
+          </div>
+          <div class="text-[10px] text-slate-500">Walk-Forward Efficiency (WFE = OOS / IS Return): Measures whether in-sample tuning holds on unseen subsequent market data or suffers from curve-fitting.</div>
+        </div>
+
         <div id="bt-results-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-bordercol text-xs space-y-2">
-          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between">
-            <span>Backtest Results</span>
+          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+              <span>Backtest Results</span>
+              <span id="bt-res-bh-badge" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-normal">B&amp;H: --</span>
+            </div>
             <span id="bt-res-return" class="font-bold">--</span>
           </div>
           <div class="grid grid-cols-2 gap-2 text-[11px]">
@@ -2894,6 +3113,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Win Rate: <span id="bt-res-winrate" class="font-semibold text-white">0%</span></div>
             <div>Final Equity: <span id="bt-res-final" class="font-semibold text-white">$0</span></div>
             <div>Sharpe (approx): <span id="bt-res-sharpe" class="font-semibold text-white">0</span></div>
+            <div>Buy &amp; Hold Ret: <span id="bt-res-bh" class="font-semibold text-sky-400">0%</span></div>
+            <div>Strategy Alpha: <span id="bt-res-alpha" class="font-semibold text-white">0%</span></div>
             <div>Avg Win: <span id="bt-res-avgwin" class="font-semibold text-emerald-400">$0</span></div>
             <div>Avg Loss: <span id="bt-res-avgloss" class="font-semibold text-red-400">$0</span></div>
             <div>Realized R:R: <span id="bt-res-rr" class="font-semibold text-white">0</span></div>
@@ -2917,6 +3138,121 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+    </div>
+
+    <!-- Live/Paper Execution Tracking & Persistent Order Audit Log (Item 1 & 7) -->
+    <div id="section-execution-tracking" class="hidden md:block">
+      <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3 mb-3 md:hidden">
+        <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <span class="text-xs font-bold text-slate-400">Execution Tracking</span>
+      </div>
+
+      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 w-full">
+        <!-- Header & Alert Status Controls -->
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-bordercol/60 pb-3">
+          <div class="flex items-center gap-2.5">
+            <div class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+              <i class="fa-solid fa-satellite-dish text-sm"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="font-bold text-sm text-white">Live &amp; Paper Execution Tracking</h3>
+                <span id="tracker-mode-badge" class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30">AUDIT LOG FORWARD</span>
+              </div>
+              <p class="text-[11px] text-slate-400">Persistent order history, real-time stop &amp; trailing telemetry, fills &amp; rejections.</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span id="tracker-last-refresh" class="text-[10px] text-slate-500">--</span>
+            <button type="button" id="btn-test-alert" onclick="testLiveAlert()" class="text-xs text-amber-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-950/40 hover:bg-amber-900/60 border border-amber-500/40">
+              <i class="fa-solid fa-bell"></i> Test Live Alert
+            </button>
+            <button type="button" id="btn-refresh-tracker" onclick="refreshExecutionTracker(true)" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
+          </div>
+        </div>
+
+        <!-- Real-Time Position Telemetry Card -->
+        <div class="bg-slate-900/80 border border-bordercol/80 rounded-xl p-3 sm:p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-bold text-slate-300 uppercase tracking-wider">Active Position Telemetry</span>
+              <span id="pos-status-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">FLAT</span>
+            </div>
+            <div id="pos-id-display" class="text-[10px] text-slate-500 font-mono">No Active Position</div>
+          </div>
+
+          <!-- Position details grid -->
+          <div id="pos-details-container" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 text-xs">
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Symbol / Side</div>
+              <div id="pos-symbol-side" class="font-bold text-white mt-0.5">Flat</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Entry Price</div>
+              <div id="pos-entry-price" class="font-bold text-white mt-0.5">$0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Current Price</div>
+              <div id="pos-current-price" class="font-bold text-white mt-0.5">$0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Position Size</div>
+              <div id="pos-size-amount" class="font-bold text-white mt-0.5">0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Stop / Trail Level</div>
+              <div id="pos-stop-level" class="font-bold text-amber-400 mt-0.5">--</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Unrealized P&amp;L</div>
+              <div id="pos-unrealized-pnl" class="font-bold text-slate-400 mt-0.5">$0.00 (0.0%)</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Duration / Opened</div>
+              <div id="pos-duration-opened" class="font-medium text-slate-400 mt-0.5">--</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Orders & Audit Log Table (Fills, Rejections, Cancellations) -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-bold text-slate-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-list-check text-slate-400"></i>
+              <span>Order Execution History &amp; Rejection Audit</span>
+            </span>
+            <span id="orders-count-label" class="text-[10px] text-slate-500">0 orders recorded</span>
+          </div>
+
+          <div class="overflow-x-auto rounded-lg border border-bordercol/60 bg-slate-950">
+            <table class="w-full text-left text-[11px] border-collapse">
+              <thead>
+                <tr class="border-b border-bordercol/60 text-slate-400 bg-slate-900/60">
+                  <th class="py-2 px-2.5 font-medium">Time (UTC)</th>
+                  <th class="py-2 px-2 font-medium">Symbol</th>
+                  <th class="py-2 px-2 font-medium">Side</th>
+                  <th class="py-2 px-2 font-medium">Type</th>
+                  <th class="py-2 px-2 font-medium">Price</th>
+                  <th class="py-2 px-2 font-medium">Amount</th>
+                  <th class="py-2 px-2 font-medium">Status</th>
+                  <th class="py-2 px-2.5 font-medium">Reason / Note</th>
+                </tr>
+              </thead>
+              <tbody id="tracker-orders-tbody" class="divide-y divide-bordercol/30 font-mono text-[10px]">
+                <tr>
+                  <td colspan="8" class="py-3 px-3 text-center text-slate-500 italic font-sans">
+                    No orders recorded yet. As orders are placed, filled, or rejected by risk controls, they will appear here in real time.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Live Activity Logs -->
@@ -4162,6 +4498,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       window.scrollTo({ top: 0, behavior: 'smooth' });
       if (activeView === 'activity') {
         refreshLogs();
+        refreshExecutionTracker();
       }
       if (activeView === 'account') {
         renderMobileAccountView();
@@ -4649,8 +4986,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
         if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
         if (activeModeTag) {
-          activeModeTag.innerText = isManual ? 'Manual Trading' : 'Auto Trading';
-          activeModeTag.className = isManual ? 'text-amber-400 font-semibold' : 'text-purple-300 font-semibold';
+          if (!data.running) {
+            activeModeTag.innerHTML = '<i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (No Orders Executing)';
+            activeModeTag.className = 'text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700';
+          } else {
+            const modeLabel = (data.mode || 'paper').toUpperCase();
+            const execType = isManual ? 'Manual Orders' : 'Algorithmic Execution';
+            activeModeTag.innerHTML = `<i class="fa-solid fa-play text-emerald-400 mr-1"></i>Engine: ARMED (${modeLabel} · ${execType})`;
+            activeModeTag.className = isReal ? 'text-emerald-300 font-semibold bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/50 animate-pulse' : 'text-blue-300 font-semibold bg-blue-950/60 px-2 py-0.5 rounded border border-blue-500/50';
+          }
+        }
+        const tfWarnBanner = document.getElementById('tf-warning-banner');
+        if (tfWarnBanner) {
+          if (data.timeframe_warning || ['1m', '3m', '5m', '15m'].includes(data.timeframe)) {
+            tfWarnBanner.classList.remove('hidden');
+          } else {
+            tfWarnBanner.classList.add('hidden');
+          }
         }
         if (manualPanel) {
           manualPanel.classList.toggle('hidden', !isManual);
@@ -5014,6 +5366,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('bt-res-final').innerText = '$' + r.final_equity.toLocaleString();
         const sharpeDisplay = (r.sharpe_approx !== null && r.sharpe_approx !== undefined) ? r.sharpe_approx : '-- (< 20 trades)';
         document.getElementById('bt-res-sharpe').innerText = sharpeDisplay;
+        const bhRet = r.buy_and_hold_return_pct;
+        const bhBadge = document.getElementById('bt-res-bh-badge');
+        if (bhRet !== null && bhRet !== undefined) {
+          const bhSign = bhRet >= 0 ? '+' : '';
+          setIf('bt-res-bh', `${bhSign}${Number(bhRet).toFixed(2)}%`);
+          const alpha = (Number(r.total_return_pct || 0) - Number(bhRet)).toFixed(2);
+          const alphaSign = alpha >= 0 ? '+' : '';
+          const alphaEl = document.getElementById('bt-res-alpha');
+          if (alphaEl) {
+            alphaEl.innerText = `${alphaSign}${alpha}%`;
+            alphaEl.className = alpha >= 0 ? 'font-semibold text-emerald-400' : 'font-semibold text-rose-400';
+          }
+          if (bhBadge) {
+            bhBadge.innerText = `B&H: ${bhSign}${Number(bhRet).toFixed(1)}%`;
+            bhBadge.className = 'text-[10px] px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-500/30 font-semibold';
+          }
+        } else {
+          setIf('bt-res-bh', '--');
+          setIf('bt-res-alpha', '--');
+          if (bhBadge) {
+            bhBadge.innerText = 'B&H: --';
+            bhBadge.className = 'text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-normal';
+          }
+        }
         document.getElementById('bt-res-avgwin').innerText = '$' + r.avg_win;
         document.getElementById('bt-res-avgloss').innerText = '$' + r.avg_loss;
         document.getElementById('bt-res-drawdown').innerText = r.max_drawdown_pct + '%';
@@ -5140,7 +5516,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const label = isTimeframes ? (item.tf + ` (${item.days}d)`) : item.label;
           tr.innerHTML = `
             <td class="py-1.5 px-1.5 font-semibold text-slate-300">${label}</td>
-            <td colspan="10" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
+            <td colspan="11" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
               <i class="fa-solid fa-clock mr-1"></i> Waiting in queue...
             </td>
           `;
@@ -5179,17 +5555,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const textCol = isUnavailable ? 'text-amber-400/90' : 'text-rose-400';
         tr.innerHTML = `
           <td class="py-1.5 px-1.5 font-semibold text-slate-300" ${dateTooltip}>${windowLabel}</td>
-          <td colspan="9" class="py-1.5 px-1.5 ${textCol} text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
+          <td colspan="10" class="py-1.5 px-1.5 ${textCol} text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
             <i class="${iconClass} mr-1"></i> ${escapeHtml(cleanErr)}
           </td>
           <td class="py-1.5 px-1.5">${regimeBadge}</td>
         `;
       } else {
+        const bhText = (row.buy_and_hold_return_pct !== null && row.buy_and_hold_return_pct !== undefined)
+          ? ((row.buy_and_hold_return_pct >= 0 ? '+' : '') + Number(row.buy_and_hold_return_pct).toFixed(2) + '%')
+          : '--';
+        const bhClass = (row.buy_and_hold_return_pct !== null && row.buy_and_hold_return_pct !== undefined)
+          ? (row.buy_and_hold_return_pct >= 0 ? 'text-sky-400' : 'text-slate-400')
+          : 'text-slate-500';
         tr.innerHTML = `
           <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${row.trades}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${(Number(row.win_rate_pct).toFixed(1) + '%')}</td>
           <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
+          <td class="py-1.5 px-1.5 ${bhClass}">${bhText}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${((row.realized_rr ?? 0) + ' : 1')}</td>
           <td class="py-1.5 px-1.5 text-amber-400">${(Number(row.max_drawdown_pct).toFixed(1) + '%')}</td>
@@ -5324,6 +5707,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
+                buy_and_hold_return_pct: r.buy_and_hold_return_pct,
                 final_equity: r.final_equity ?? 0,
                 sharpe_approx: r.sharpe_approx,
                 realized_rr: r.realized_rr ?? 0,
@@ -5446,6 +5830,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
+                buy_and_hold_return_pct: r.buy_and_hold_return_pct,
                 final_equity: r.final_equity ?? 0,
                 sharpe_approx: r.sharpe_approx,
                 realized_rr: r.realized_rr ?? 0,
@@ -5496,6 +5881,287 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           btn.disabled = false;
           btn.innerHTML = '<i class="fa-solid fa-layer-group"></i> Sweep Timeframes';
         }
+      }
+    }
+
+    async function executeWalkForward(e) {
+      if (e && e.preventDefault) e.preventDefault();
+      const btn = document.getElementById('btn-walk-forward');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Validating OOS...';
+      }
+
+      const wfoBox = document.getElementById('bt-wfo-box');
+      const badgeEl = document.getElementById('bt-wfo-badge');
+      const summaryEl = document.getElementById('bt-wfo-summary');
+      const tbody = document.getElementById('bt-wfo-tbody');
+
+      if (wfoBox) wfoBox.classList.remove('hidden');
+      if (badgeEl) {
+        badgeEl.innerText = 'VALIDATING';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-sky-500/20 text-sky-300 border border-sky-500/30';
+      }
+      if (summaryEl) {
+        summaryEl.innerHTML = '<span class="text-sky-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running chronological Walk-Forward Validation across sequential train/test folds...</span>';
+      }
+      if (tbody) {
+        tbody.innerHTML = '<tr><td colspan="9" class="py-2.5 px-2 text-center text-slate-500 italic"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Splitting historical candles into sequential train and unseen out-of-sample test folds...</td></tr>';
+      }
+
+      try {
+        const payload = getBacktestPayloadBase();
+        const askedDays = parseInt((document.getElementById('bt-days') || {}).value, 10) || 90;
+        const tf = (document.getElementById('bt-timeframe') || {}).value || '1h';
+        const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+          ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+        const days = Math.min(askedDays, tfLimit);
+
+        payload.timeframe = tf;
+        payload.days = days;
+        payload.n_splits = 3;
+
+        const res = await fetch('/api/backtest/walk-forward', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error((data && (data.detail || data.error)) || `HTTP ${res.status}`);
+        }
+
+        const results = data.results || {};
+        const folds = results.folds || [];
+        const isVal = results.is_out_of_sample_validated;
+        const wfe = Number(results.walk_forward_efficiency_pct || 0).toFixed(1);
+        const avgIS = Number(results.avg_in_sample_return_pct || 0).toFixed(2);
+        const avgOOS = Number(results.avg_out_of_sample_return_pct || 0).toFixed(2);
+
+        if (badgeEl) {
+          if (isVal) {
+            badgeEl.innerText = 'OUT-OF-SAMPLE VALIDATED';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+          } else {
+            badgeEl.innerText = 'IN-SAMPLE ONLY (UNVERIFIED)';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40';
+          }
+        }
+
+        if (summaryEl) {
+          const valText = isVal
+            ? `<span class="text-emerald-400 font-semibold">\u2714 Robust Parameters:</span> Strategy maintains positive expectancy on unseen market segments (WFE: <b>${wfe}%</b>, Avg In-Sample: ${avgIS}%, Avg OOS: <b>${avgOOS}%</b>).`
+            : `<span class="text-amber-400 font-semibold">\u26a0 Curve-Fitting Warning:</span> Performance drops significantly on unseen data (WFE: <b>${wfe}%</b>, Avg In-Sample: ${avgIS}%, Avg OOS: <b>${avgOOS}%</b>). Parameters may be over-fitted to past noise.`;
+          summaryEl.innerHTML = valText;
+        }
+
+        if (tbody) {
+          tbody.innerHTML = '';
+          folds.forEach(f => {
+            const tr = document.createElement('tr');
+            const isProf = f.out_of_sample_profitable;
+            tr.className = isProf ? 'bg-emerald-950/20 hover:bg-emerald-950/30' : 'bg-rose-950/15 hover:bg-rose-950/25';
+
+            const isRetStr = (f.in_sample_return_pct >= 0 ? '+' : '') + Number(f.in_sample_return_pct).toFixed(2) + '%';
+            const isRetCol = f.in_sample_return_pct >= 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold';
+
+            const oosRetStr = (f.out_of_sample_return_pct >= 0 ? '+' : '') + Number(f.out_of_sample_return_pct).toFixed(2) + '%';
+            const oosRetCol = f.out_of_sample_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+
+            const oosBHStr = (f.out_of_sample_bh_return_pct >= 0 ? '+' : '') + Number(f.out_of_sample_bh_return_pct).toFixed(2) + '%';
+            const oosBHCol = f.out_of_sample_bh_return_pct >= 0 ? 'text-sky-400' : 'text-slate-400';
+
+            const trainRange = (f.train_date_range || []).join(' \u2192 ') || `${f.train_bars} bars`;
+            const testRange = (f.test_date_range || []).join(' \u2192 ') || `${f.test_bars} bars`;
+
+            const verdictBadge = isProf
+              ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">OOS PROFIT</span>`
+              : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">OOS LOSS</span>`;
+
+            tr.innerHTML = `
+              <td class="py-1.5 px-1.5 font-bold text-slate-300">Fold ${f.fold}</td>
+              <td class="py-1.5 px-1.5 text-slate-400 text-[10px]" title="Train: ${trainRange}">${trainRange}</td>
+              <td class="py-1.5 px-1.5 ${isRetCol}">${isRetStr}</td>
+              <td class="py-1.5 px-1.5 text-slate-300">${f.in_sample_trades}</td>
+              <td class="py-1.5 px-1.5 text-slate-400 text-[10px]" title="Test (OOS): ${testRange}">${testRange}</td>
+              <td class="py-1.5 px-1.5 ${oosRetCol}">${oosRetStr}</td>
+              <td class="py-1.5 px-1.5 ${oosBHCol}">${oosBHStr}</td>
+              <td class="py-1.5 px-1.5 text-slate-300">${f.out_of_sample_trades}</td>
+              <td class="py-1.5 px-1.5">${verdictBadge}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+        if (typeof refreshLogs === 'function') await refreshLogs();
+      } catch (err) {
+        console.error('Walk-forward error:', err);
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-arrows-split-up-and-left"></i> Walk-Forward (OOS)';
+        }
+      }
+    }
+
+    async function refreshExecutionTracker(manual) {
+      if (manual) beginRefresh('btn-refresh-tracker', 'Refreshing...');
+      try {
+        const res = await fetch('/api/execution/tracker?limit=25&_ts=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const pos = data.active_position;
+        const orders = data.orders || [];
+
+        const badgeEl = document.getElementById('pos-status-badge');
+        const idEl = document.getElementById('pos-id-display');
+        const symEl = document.getElementById('pos-symbol-side');
+        const entryEl = document.getElementById('pos-entry-price');
+        const currEl = document.getElementById('pos-current-price');
+        const sizeEl = document.getElementById('pos-size-amount');
+        const stopEl = document.getElementById('pos-stop-level');
+        const pnlEl = document.getElementById('pos-unrealized-pnl');
+        const durEl = document.getElementById('pos-duration-opened');
+
+        if (pos) {
+          if (badgeEl) {
+            badgeEl.innerText = `OPEN (${pos.side || 'LONG'})`;
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse';
+          }
+          if (idEl) idEl.innerText = `Pos ID: ${pos.id || '--'}`;
+          if (symEl) symEl.innerHTML = `<span class="text-white">${pos.symbol}</span> <span class="text-emerald-400">(${pos.side})</span>`;
+          if (entryEl) entryEl.innerText = '$' + Number(pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          if (currEl) currEl.innerText = '$' + Number(pos.current_price || pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          if (sizeEl) sizeEl.innerText = `${Number(pos.size || 0).toFixed(4)} (~$${Number(pos.notional || (pos.size * pos.entry_price) || 0).toFixed(2)})`;
+          
+          if (stopEl) {
+            const stopVal = pos.trailing_stop || pos.stop_loss;
+            stopEl.innerText = stopVal ? ('$' + Number(stopVal).toFixed(2)) : '--';
+          }
+
+          if (pnlEl) {
+            const pnl = Number(pos.unrealized_pnl || 0);
+            const pnlPct = Number(pos.unrealized_pnl_pct || 0);
+            const sign = pnl >= 0 ? '+' : '';
+            pnlEl.innerText = `${sign}$${pnl.toFixed(2)} (${sign}${pnlPct.toFixed(2)}%)`;
+            pnlEl.className = pnl >= 0 ? 'font-bold text-emerald-400 mt-0.5' : 'font-bold text-rose-400 mt-0.5';
+          }
+
+          if (durEl) {
+            durEl.innerText = pos.opened_at ? new Date(pos.opened_at).toLocaleTimeString() : '--';
+          }
+        } else {
+          if (badgeEl) {
+            badgeEl.innerText = 'FLAT';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400';
+          }
+          if (idEl) idEl.innerText = 'No Active Position';
+          if (symEl) symEl.innerText = 'Flat';
+          if (entryEl) entryEl.innerText = '$0.00';
+          if (currEl) currEl.innerText = '$0.00';
+          if (sizeEl) sizeEl.innerText = '0.00';
+          if (stopEl) stopEl.innerText = '--';
+          if (pnlEl) {
+            pnlEl.innerText = '$0.00 (0.0%)';
+            pnlEl.className = 'font-bold text-slate-400 mt-0.5';
+          }
+          if (durEl) durEl.innerText = '--';
+        }
+
+        // Render Orders Table
+        const tbody = document.getElementById('tracker-orders-tbody');
+        const countLabel = document.getElementById('orders-count-label');
+        if (countLabel) countLabel.innerText = `${orders.length} order(s) recorded`;
+
+        if (tbody) {
+          if (!orders || orders.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="8" class="py-3 px-3 text-center text-slate-500 italic font-sans">No orders recorded yet. As orders are placed, filled, or rejected by risk controls, they will appear here in real time.</td></tr>`;
+          } else {
+            tbody.innerHTML = '';
+            orders.forEach(o => {
+              const tr = document.createElement('tr');
+              const status = (o.status || '').toUpperCase();
+              let statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400">${escapeHtml(status)}</span>`;
+              if (status === 'FILLED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold">FILLED</span>`;
+              } else if (status === 'REJECTED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold">REJECTED</span>`;
+              } else if (status === 'CANCELLED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-amber-500/20 text-amber-300 font-semibold">CANCELLED</span>`;
+              } else if (status === 'SUBMITTED' || status === 'PENDING') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-blue-500/20 text-blue-300 font-semibold">PENDING</span>`;
+              }
+
+              const sideCol = (o.side || '').toUpperCase() === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+              const timeStr = o.timestamp ? new Date(o.timestamp).toLocaleString() : '--';
+              const reasonStr = o.rejection_reason || o.notes || '--';
+              const reasonClass = o.rejection_reason ? 'text-rose-300 font-sans' : 'text-slate-500 font-sans';
+
+              tr.innerHTML = `
+                <td class="py-1.5 px-2.5 text-slate-400 text-[10px]">${escapeHtml(timeStr)}</td>
+                <td class="py-1.5 px-2 font-semibold text-slate-200">${escapeHtml(o.symbol || '--')}</td>
+                <td class="py-1.5 px-2 ${sideCol}">${escapeHtml(o.side || '--')}</td>
+                <td class="py-1.5 px-2 text-slate-300">${escapeHtml(o.order_type || 'MARKET')}</td>
+                <td class="py-1.5 px-2 text-slate-300">${o.price ? ('$' + Number(o.price).toFixed(2)) : 'Market'}</td>
+                <td class="py-1.5 px-2 text-slate-300">${Number(o.amount || 0).toFixed(4)}</td>
+                <td class="py-1.5 px-2">${statusBadge}</td>
+                <td class="py-1.5 px-2.5 ${reasonClass} truncate max-w-[200px]" title="${escapeHtml(reasonStr)}">${escapeHtml(reasonStr)}</td>
+              `;
+              tbody.appendChild(tr);
+            });
+          }
+        }
+        setRefreshStamp('tracker-last-refresh', 'Updated ' + new Date().toLocaleTimeString(), true);
+      } catch (err) {
+        console.error('Error refreshing execution tracker:', err);
+      } finally {
+        if (manual) endRefresh('btn-refresh-tracker', 'fa-rotate', 'Refresh');
+      }
+    }
+
+    async function testLiveAlert() {
+      const btn = document.getElementById('btn-test-alert');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing Alert...';
+      }
+      try {
+        const res = await fetch('/api/alerts/test', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          showNotice('Live Risk Alert Dispatched', `Test alert dispatched successfully. Channels notified: ${JSON.stringify(data.dispatched_channels)}`, { kind: 'success' });
+          if (typeof refreshLogs === 'function') await refreshLogs();
+        } else {
+          showNotice('Alert Dispatch Failed', (data && data.detail) || 'Failed to dispatch alert test.', { kind: 'error' });
+        }
+      } catch (err) {
+        showNotice('Alert Test Error', err.message || 'Network error', { kind: 'error' });
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-bell"></i> Test Live Alert';
+        }
+      }
+    }
+
+    async function loadFeeInfo() {
+      const exchEl = document.getElementById('bt-exchange');
+      const pillEl = document.getElementById('bt-fee-tier-pill');
+      if (!exchEl || !pillEl) return;
+      const exch = exchEl.value || 'binance';
+      try {
+        const res = await fetch(`/api/exchange/fee-info?exchange=${encodeURIComponent(exch)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const feeInfo = data.fee_info || data;
+        const takerPct = (Number(feeInfo.taker || 0.001) * 100).toFixed(2);
+        const sourceLabel = (feeInfo.source === 'api_account_tier' || feeInfo.source === 'account_verified') ? 'API Tier' : 'Default';
+        pillEl.innerText = `Taker: ${takerPct}% (${sourceLabel})`;
+        pillEl.title = `Fee source: ${feeInfo.source}. Maker: ${(Number(feeInfo.maker || 0.001)*100).toFixed(2)}%, Taker: ${takerPct}%.`;
+      } catch (e) {
+        console.warn('Could not load fee info:', e);
       }
     }
 
@@ -5844,6 +6510,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     fetchStatus();
     refreshAnalysis();
     refreshLogs();
+    refreshExecutionTracker();
+    loadFeeInfo();
     checkEmailStatusBadge();
 
     const urlParams = new URLSearchParams(window.location.search);
@@ -5856,12 +6524,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     setInterval(fetchStatus, 3000);
     setInterval(refreshAnalysis, 15000);
     setInterval(refreshLogs, 5000);
+    setInterval(refreshExecutionTracker, 4000);
     applyTimeframeLimits();
 
     const btnSweepWindows = document.getElementById('btn-sweep-windows');
     if (btnSweepWindows) btnSweepWindows.addEventListener('click', executeCompareWindows);
     const btnSweepTf = document.getElementById('btn-sweep-timeframes');
     if (btnSweepTf) btnSweepTf.addEventListener('click', executeCompareTimeframes);
+    const btnWalkForward = document.getElementById('btn-walk-forward');
+    if (btnWalkForward) btnWalkForward.addEventListener('click', executeWalkForward);
   </script>
 </body>
 </html>

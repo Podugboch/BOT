@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import json
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 import ccxt
@@ -3097,5 +3098,253 @@ globalThis.fetch = async (url, opts) => {
         assert "sweep_tag: 'Sweep ' + item.tf" in html
 
 
+class TestProductionReadinessStructuralGaps:
+    """
+    Tests for the 8 structural gaps addressed prior to deploying real capital:
+    #0: Ambiguity resolution & safety checks on negative-expectancy timeframes (15m/5m)
+    #1: Persistent live/paper execution tracking for positions and orders (fills, rejections, cancellations)
+    #2: Walk-Forward Validation (out-of-sample parameter verification)
+    #3: Buy-and-Hold benchmark on every backtest and sweep row
+    #4: Exchange minimum-notional sizing validation
+    #5: Fee-tier transparency and per-exchange accuracy
+    #6: Complete pipeline candle accounting
+    #7: Automated risk alerting dispatcher
+    """
 
+    def test_item0_negative_expectancy_timeframe_guarded_in_live_mode(self):
+        """Live execution on 15m/5m must be blocked without explicit override."""
+        import web_server
+        from fastapi import HTTPException
 
+        # Mock runner in stopped state
+        web_server.runner.running = False
+        web_server.runner.cfg.mode = "live"
+        web_server.runner.cfg.exchange.timeframe = "15m"
+
+        # Attempt to start in live mode on 15m without force flag -> HTTP 400
+        with pytest.raises(HTTPException) as exc_info:
+            web_server.start_bot(force=False)
+        assert exc_info.value.status_code == 400
+        assert "negative expectancy" in exc_info.value.detail.lower()
+
+        # Starting on 15m with force=True is allowed
+        with mock.patch.object(web_server.runner, "start", return_value=True):
+            res_force = web_server.start_bot(force=True)
+            assert res_force["success"] is True
+
+        # In paper mode, starting on 15m is allowed without force
+        web_server.runner.running = False
+        web_server.runner.cfg.mode = "paper"
+        with mock.patch.object(web_server.runner, "start", return_value=True):
+            res_paper = web_server.start_bot(force=False)
+            assert res_paper["success"] is True
+
+        # Status endpoint reports timeframe_warning on 15m
+        status = web_server.get_status()
+        assert status["timeframe_warning"] is not None
+        assert "15m" in status["timeframe_warning"]
+
+        # Reset timeframe to 1h
+        web_server.runner.cfg.exchange.timeframe = "1h"
+        status_1h = web_server.get_status()
+        assert status_1h["timeframe_warning"] is None
+
+    def test_item1_execution_tracker_orders_and_position_lifecycle(self, tmp_path):
+        """ExecutionTracker records persistent order audits and position telemetry."""
+        from execution_tracker import ExecutionTracker
+        import web_server
+
+        db_path = str(tmp_path / "test_tracker.db")
+        tracker = ExecutionTracker(db_path=db_path)
+
+        # 1. Record orders
+        o1_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="BUY", size=0.05, price=65000.0, status="FILLED")
+        o2_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="BUY", size=0.0001, price=65000.0, status="REJECTED", rejection_reason="Below exchange min notional $10.00")
+        o3_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="SELL", size=0.05, price=66000.0, status="CANCELLED")
+
+        orders = tracker.get_orders(limit=10)
+        assert len(orders) == 3
+        statuses = [o["status"] for o in orders]
+        assert "FILLED" in statuses
+        assert "REJECTED" in statuses
+        assert "CANCELLED" in statuses
+
+        # 2. Position telemetry
+        pos_id = tracker.record_position_opened(
+            symbol="BTC/USDT",
+            timeframe="1h",
+            side="BUY",
+            size=0.05,
+            entry_price=65000.0,
+            stop=64000.0,
+            target=68000.0,
+            fee=3.25,
+            mode="paper"
+        )
+        assert tracker.get_open_position() is not None
+
+        tracker.update_open_position(current_price=66500.0, current_stop=64500.0, trailing_stop=64800.0)
+        open_pos = tracker.get_open_position()
+        assert open_pos["unrealized_pnl"] > 0
+
+        # 3. Close position
+        tracker.record_position_closed(exit_price=67000.0, exit_fee=3.35, realized_pnl=93.4, exit_reason="TAKE_PROFIT")
+        assert tracker.get_open_position() is None
+        assert len(tracker.get_closed_positions()) == 1
+
+        # 4. Verify API endpoint
+        with mock.patch("web_server.get_execution_tracker", return_value=tracker):
+            res = web_server.get_execution_tracker_data()
+            assert res["success"] is True
+            assert len(res["orders"]) == 3
+            assert res["active_position"] is None
+
+    def test_item2_walk_forward_validation(self):
+        """Walk-forward validation generates train/test folds and computes WFE."""
+        import backtester
+        from config import BotConfig
+        import web_server
+
+        df = _wave_ohlcv(n=250)
+        cfg = BotConfig()
+
+        wfo = backtester.run_walk_forward_validation(df, cfg, n_splits=3)
+        assert wfo["success"] is True
+        assert len(wfo["folds"]) == 3
+        assert "walk_forward_efficiency_pct" in wfo
+        assert "status" in wfo
+        assert wfo["status"] in ("OUT_OF_SAMPLE_VALIDATED", "IN_SAMPLE_ONLY_UNVERIFIED")
+
+        for f in wfo["folds"]:
+            assert "in_sample_return_pct" in f
+            assert "out_of_sample_return_pct" in f
+            assert "out_of_sample_bh_return_pct" in f
+            assert "in_sample_trades" in f
+            assert "out_of_sample_trades" in f
+
+        # Test endpoint
+        with mock.patch("web_server.fetch_historical", return_value=df):
+            req = web_server.WalkForwardRequest(
+                exchange="binance",
+                symbol="BTC/USDT",
+                timeframe="1h",
+                days=30,
+                starting_equity=1000.0,
+                n_splits=3
+            )
+            res = web_server.walk_forward_endpoint(req)
+            assert res["success"] is True
+            assert "results" in res
+            assert len(res["results"]["folds"]) == 3
+
+    def test_item3_buy_and_hold_benchmark(self):
+        """Every backtest and sweep row must include zero-fee buy & hold benchmark."""
+        import backtester
+        from config import BotConfig
+        import web_server
+
+        df = _wave_ohlcv(n=200)
+        cfg = BotConfig()
+
+        res = backtester.run_backtest(df, cfg)
+        assert "buy_and_hold_return_pct" in res
+        assert "buy_and_hold_final_equity" in res
+        assert isinstance(res["buy_and_hold_return_pct"], (int, float))
+
+        # Sweep row verification
+        with mock.patch("web_server.fetch_historical", return_value=df):
+            req_win = web_server.CompareWindowsRequest(
+                exchange="binance", symbol="BTC/USDT", timeframe="1h",
+                windows=[30, 60], starting_equity=1000.0,
+            )
+            res_win = web_server.compare_windows_endpoint(req_win)
+            for row in res_win["rows"]:
+                assert "buy_and_hold_return_pct" in row
+
+    def test_item4_exchange_minimum_notional_validation(self):
+        """Computed order size must clear exchange minimum notional/amount limits."""
+        from risk_manager import RiskManager
+        from config import RiskConfig
+        import web_server
+
+        rm = RiskManager(RiskConfig(), starting_equity=1000.0)
+        # Case 1: below min cost ($5 < $10)
+        ok1, err1 = rm.validate_min_notional(entry_price=50000.0, size=0.0001, min_notional=10.0, min_amount=0.00001)
+        assert ok1 is False
+        assert "below exchange minimum" in err1
+
+        # Case 2: above min cost ($50 >= $10)
+        ok2, err2 = rm.validate_min_notional(entry_price=50000.0, size=0.001, min_notional=10.0, min_amount=0.00001)
+        assert ok2 is True
+        assert err2 == "OK"
+
+        # Sizing validation endpoint
+        req_sizing = web_server.SizingValidationRequest(
+            equity=1000.0, risk_per_trade_pct=0.01, price=50000.0, stop_price=49000.0, min_notional=10.0
+        )
+        res = web_server.validate_sizing_endpoint(req_sizing)
+        assert res["success"] is True
+        assert "clears_minimum" in res
+        assert "explanation" in res
+
+    def test_item5_fee_tier_accuracy(self):
+        """Fee tiers must accurately reflect exchange schedule or verified API tier."""
+        from exchange_client import get_exchange_fee_info
+        import web_server
+
+        mexc_fees = get_exchange_fee_info("mexc")
+        assert mexc_fees["taker"] == 0.001  # 0.10% taker
+        assert mexc_fees["taker_fee_pct"] == 0.001
+        assert mexc_fees["source"] == "hardcoded_default"
+
+        binance_fees = get_exchange_fee_info("binance")
+        assert binance_fees["taker"] == 0.001
+
+        res = web_server.get_fee_info_endpoint("mexc")
+        assert res["success"] is True
+        assert res["fee_info"]["taker"] == 0.001
+
+    def test_item6_pipeline_candle_accounting(self):
+        """Pipeline accounting must account for open position candles as well as misses."""
+        import backtester
+        from config import BotConfig
+
+        df = _wave_ohlcv(n=250)
+        cfg = BotConfig()
+
+        res = backtester.run_backtest(df, cfg)
+        diag = res.get("diagnostics", {})
+        candles_eval = diag.get("candles_evaluated", 0)
+
+        # Rejection breakdown
+        misses = diag.get("core_misses", {})
+        total_misses = sum(misses.values())
+        raw_signals = diag.get("raw_signals", 0)
+
+        # Sum of non-signal candles + core signals evaluated
+        assert total_misses + raw_signals == candles_eval
+
+    def test_item7_alert_dispatcher(self, caplog):
+        """AlertDispatcher notifies channels and handles unconfigured endpoints gracefully."""
+        from alerts import AlertDispatcher
+        import web_server
+
+        dispatcher = AlertDispatcher()
+
+        with caplog.at_level("CRITICAL", logger="alerts"):
+            ok = dispatcher.send_alert(
+                event_type="CIRCUIT_BREAKER",
+                title="Daily loss limit hit",
+                message="Daily loss limit hit (-5.0%). Trading halted.",
+                level="critical",
+                details={"current_drawdown_pct": 5.2},
+                force=True,
+            )
+            assert ok is True
+
+        log_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "CIRCUIT_BREAKER" in log_text
+
+        # API test endpoint
+        res = web_server.test_alert_endpoint()
+        assert res["success"] is True

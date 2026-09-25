@@ -83,6 +83,69 @@ def lookback_limits() -> dict:
     }
 
 
+EXCHANGE_DEFAULT_FEES = {
+    "binance": {"maker": 0.0010, "taker": 0.0010, "label": "Binance standard tier (0.10% taker, 0.075% with BNB)"},
+    "mexc": {"maker": 0.0000, "taker": 0.0010, "label": "MEXC standard spot (0.00% maker / 0.10% taker)"},
+    "bybit": {"maker": 0.0010, "taker": 0.0010, "label": "Bybit VIP 0 (0.10% taker)"},
+    "okx": {"maker": 0.0008, "taker": 0.0010, "label": "OKX VIP 0 (0.10% taker)"},
+    "gate": {"maker": 0.0009, "taker": 0.0009, "label": "Gate.io Tier 0 (0.09% taker)"},
+    "kraken": {"maker": 0.0016, "taker": 0.0026, "label": "Kraken Tier 1 (0.26% taker)"},
+    "coinbase": {"maker": 0.0040, "taker": 0.0060, "label": "Coinbase base tier (0.60% taker)"},
+    "deribit": {"maker": 0.0000, "taker": 0.0005, "label": "Deribit standard tier (0.05% taker)"},
+}
+
+
+def get_exchange_fee_info(exchange_id: str, exchange_obj=None, symbol: str = None) -> dict:
+    exch = str(exchange_id or "").strip().lower()
+    default_meta = EXCHANGE_DEFAULT_FEES.get(exch, {"maker": 0.0010, "taker": 0.0010, "label": f"{exch} standard default (0.10% taker)"})
+
+    # If exchange_obj is provided and authenticated, attempt to fetch live tier
+    if exchange_obj and getattr(exchange_obj, "apiKey", None):
+        try:
+            if hasattr(exchange_obj, "fetch_trading_fee") and symbol:
+                fee_data = exchange_obj.fetch_trading_fee(symbol)
+                taker = float(fee_data.get("taker", default_meta["taker"]))
+                maker = float(fee_data.get("maker", default_meta["maker"]))
+                return {
+                    "exchange": exch,
+                    "symbol": symbol,
+                    "maker_fee_pct": maker,
+                    "taker_fee_pct": taker,
+                    "source": "account_verified",
+                    "is_verified": True,
+                    "label": f"{exch.title()} account tier: {taker * 100:.3f}% taker, {maker * 100:.3f}% maker (API Verified)",
+                }
+            elif hasattr(exchange_obj, "fetch_trading_fees"):
+                fees = exchange_obj.fetch_trading_fees()
+                if symbol and symbol in fees:
+                    fee_data = fees[symbol]
+                    taker = float(fee_data.get("taker", default_meta["taker"]))
+                    maker = float(fee_data.get("maker", default_meta["maker"]))
+                    return {
+                        "exchange": exch,
+                        "symbol": symbol,
+                        "maker_fee_pct": maker,
+                        "taker_fee_pct": taker,
+                        "source": "account_verified",
+                        "is_verified": True,
+                        "label": f"{exch.title()} account tier: {taker * 100:.3f}% taker, {maker * 100:.3f}% maker (API Verified)",
+                    }
+        except Exception as e:
+            log.debug("Could not fetch authenticated trading fees: %s", e)
+
+    return {
+        "exchange": exch,
+        "symbol": symbol,
+        "maker": default_meta["maker"],
+        "taker": default_meta["taker"],
+        "maker_fee_pct": default_meta["maker"],
+        "taker_fee_pct": default_meta["taker"],
+        "source": "hardcoded_default",
+        "is_verified": False,
+        "label": f"{default_meta['label']} (Hardcoded Default · Unauthenticated)",
+    }
+
+
 def chunk_limit(exchange, symbol: str) -> int:
     """Candles to request per page, per what the exchange advertises."""
     advertised = 0
@@ -370,6 +433,25 @@ class ExchangeClient:
         price = ticker.get("last") or ticker.get("close") or ticker.get("bid") or 0.0
         return float(price)
 
+    def load_market_limits(self, symbol: str = None) -> dict:
+        sym = symbol or self.cfg.symbol
+        try:
+            self.exchange.load_markets()
+            market = self.exchange.market(sym)
+            limits = market.get("limits") or {}
+            min_cost = float((limits.get("cost") or {}).get("min") or 5.0)
+            min_amount = float((limits.get("amount") or {}).get("min") or 0.00001)
+            return {
+                "symbol": sym,
+                "min_notional": min_cost,
+                "min_amount": min_amount,
+                "precision_amount": (market.get("precision") or {}).get("amount"),
+                "precision_price": (market.get("precision") or {}).get("price"),
+            }
+        except Exception as e:
+            log.warning("Could not load market limits for %s: %s", sym, e)
+            return {"symbol": sym, "min_notional": 5.0, "min_amount": 0.00001}
+
     def place_order(self, side: str, size: float, ref_price: float) -> dict:
         if self.mode == "live":
             return self._place_live_order(side, size)
@@ -387,8 +469,19 @@ class ExchangeClient:
                 fee = float(order["fee"].get("cost", 0) or 0)
             log.info("LIVE %s order placed: id=%s price=%.2f", side, order.get("id"), fill_price)
             return {"side": side, "size": size, "price": fill_price, "fee": fee, "mode": "live"}
-        except Exception:
-            log.exception("Live order execution failed")
+        except Exception as e:
+            log.exception("Live order execution failed: %s", e)
+            try:
+                from alerts import get_alert_dispatcher
+                get_alert_dispatcher().send_alert(
+                    "EXCHANGE_ERROR",
+                    f"Live Order Execution Failed ({self.cfg.symbol})",
+                    f"Order failed on {self.cfg.exchange_id}: {e}",
+                    level="critical",
+                    details={"symbol": self.cfg.symbol, "side": side, "size": size, "error": str(e)}
+                )
+            except Exception:
+                pass
             raise
 
     # -- paper ---------------------------------------------------------------
