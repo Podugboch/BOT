@@ -3565,22 +3565,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </main>
 
-  <!-- Persistent Sticky Manual Trading Dock (Stays fixed on screen when manual trade mode is active) -->
-  <div id="manual-sticky-dock" class="hidden fixed bottom-14 md:bottom-5 left-3 right-3 sm:left-auto sm:right-6 z-50 bg-slate-900/95 backdrop-blur-md border-2 border-amber-500/80 rounded-2xl p-2 sm:p-2.5 shadow-2xl flex items-center gap-2 sm:gap-3 transition-all duration-300 sm:max-w-md">
-    <div class="flex items-center gap-1.5 shrink-0 px-2 py-1 bg-amber-500/20 border border-amber-500/40 rounded-lg hidden xs:flex sm:flex">
-      <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-      <span class="text-[10px] sm:text-xs font-bold text-amber-300">MANUAL</span>
-    </div>
-    <div class="flex items-center gap-2 flex-1">
-      <button type="button" id="btn-sticky-buy" onclick="triggerManualTrade('buy')" class="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
-        <i class="fa-solid fa-arrow-trend-up"></i> BUY Market
-      </button>
-      <button type="button" id="btn-sticky-sell" onclick="triggerManualTrade('sell')" class="flex-1 py-2 px-3 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
-        <i class="fa-solid fa-arrow-trend-down"></i> SELL Market
-      </button>
-    </div>
-  </div>
-
   <!-- Sticky Mobile Bottom Quick-Action Bar -->
   <nav id="mobile-bottom-nav" class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-cardbg/95 backdrop-blur-md border-t border-bordercol py-1.5 px-2 flex items-center justify-around text-center shadow-2xl safe-area-bottom">
     <!-- 1. Bot Start/Stop Quick Action -->
@@ -5289,12 +5273,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
       const manualPanel = document.getElementById('manual-control-panel');
-      const manualDock = document.getElementById('manual-sticky-dock');
       if (manualPanel) {
         manualPanel.classList.toggle('hidden', !isManual);
-      }
-      if (manualDock) {
-        manualDock.classList.toggle('hidden', !isManual);
       }
     }
 
@@ -5340,16 +5320,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!confirm(`Confirm manual ${actName} order execution at current market price?`)) return;
 
       const btn = document.getElementById('btn-manual-' + action.toLowerCase());
-      const btnSticky = document.getElementById('btn-sticky-' + action.toLowerCase());
       const oldHtml = btn ? btn.innerHTML : '';
-      const oldStickyHtml = btnSticky ? btnSticky.innerHTML : '';
       if (btn) {
         btn.disabled = true;
         btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
-      }
-      if (btnSticky) {
-        btnSticky.disabled = true;
-        btnSticky.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
       }
 
       try {
@@ -5372,10 +5346,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (btn) {
           btn.disabled = false;
           btn.innerHTML = oldHtml;
-        }
-        if (btnSticky) {
-          btnSticky.disabled = false;
-          btnSticky.innerHTML = oldStickyHtml;
         }
       }
     }
