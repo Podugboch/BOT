@@ -287,6 +287,7 @@ class BacktestRequest(BaseModel):
     # entry. None derives it from the timeframe (8 bars on 5m/15m, 3 on 1h/4h).
     min_bars_between_trades: Optional[int] = None
     risk_per_trade_pct: float = 0.01
+    sweep_tag: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1414,6 +1415,17 @@ def _build_backtest_config(req, exchange_id: str, symbol: str, timeframe: str, s
     return cfg
 
 
+def _invoke_backtest(df, cfg, sweep_tag: Optional[str] = None) -> dict:
+    if sweep_tag:
+        try:
+            return run_backtest(df, cfg, sweep_tag=sweep_tag)
+        except TypeError as e:
+            if "sweep_tag" in str(e):
+                return run_backtest(df, cfg)
+            raise
+    return run_backtest(df, cfg)
+
+
 @app.post("/api/backtest")
 def run_backtest_endpoint(req: BacktestRequest):
     try:
@@ -1432,12 +1444,13 @@ def run_backtest_endpoint(req: BacktestRequest):
                 f"the exchange returned {0 if df is None else len(df)} candle(s). "
                 f"{lookback_limit_note(req.timeframe)}"))
 
-        results = run_backtest(df, cfg)
+        results = _invoke_backtest(df, cfg, sweep_tag=req.sweep_tag)
         eval_range = results.get("eval_date_range") or [None, None]
         eval_count = results.get("candles_evaluated", 0)
+        prefix = f"[{req.sweep_tag}] " if req.sweep_tag else ""
         logger.info(
-            "Backtest run complete for %s %s (%sd): walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
-            req.symbol, req.timeframe, days, eval_count, eval_range[0], eval_range[1], results.get("num_trades", 0)
+            "%sBacktest run complete for %s %s (%sd): walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+            prefix, req.symbol, req.timeframe, days, eval_count, eval_range[0], eval_range[1], results.get("num_trades", 0)
         )
         return sanitize_for_json({
             "success": True,
@@ -1553,12 +1566,13 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                 })
                 continue
 
-            res = run_backtest(df_slice, cfg)
+            sweep_tag = f"Sweep {w}d"
+            res = _invoke_backtest(df_slice, cfg, sweep_tag=sweep_tag)
             eval_range = res.get("eval_date_range") or [None, None]
             eval_count = res.get("candles_evaluated", 0)
             logger.info(
-                "Sweep window %sd: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
-                w, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+                "[%s] Sweep window %sd: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                sweep_tag, w, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
             )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
@@ -1679,12 +1693,13 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
                 continue
 
             cfg = _build_backtest_config(req, exch, req.symbol, tf_clean, starting_equity)
-            res = run_backtest(df, cfg)
+            sweep_tag = f"Sweep {tf_clean}"
+            res = _invoke_backtest(df, cfg, sweep_tag=sweep_tag)
             eval_range = res.get("eval_date_range") or [None, None]
             eval_count = res.get("candles_evaluated", 0)
             logger.info(
-                "Sweep timeframe %s: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
-                tf_clean, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+                "[%s] Sweep timeframe %s: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                sweep_tag, tf_clean, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
             )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
@@ -2914,18 +2929,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="text-xs font-bold text-slate-400">Bot Activity</span>
       </div>
       <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-3 w-full">
-        <div class="flex items-center justify-between">
+        <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-terminal text-slate-400"></i>
             <h3 class="font-bold text-sm text-white">Live Bot Activity Logs</h3>
           </div>
           <div class="flex items-center gap-2">
-            <div class="flex items-center gap-2">
-              <span id="logs-updated" class="text-[10px] text-slate-500">--</span>
-              <button type="button" id="btn-refresh-logs" onclick="refreshLogs(true)" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol disabled:opacity-60">
-                <i class="fa-solid fa-rotate"></i> Refresh
-              </button>
+            <div class="flex items-center bg-slate-900 border border-bordercol/80 rounded-lg p-0.5 text-[11px]">
+              <button type="button" id="btn-log-filter-all" onclick="setLogFilter('all')" class="px-2 py-0.5 rounded font-medium bg-purple-600 text-white shadow-sm">All</button>
+              <button type="button" id="btn-log-filter-sweep" onclick="setLogFilter('sweep')" class="px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition">Sweep Logs</button>
+              <button type="button" id="btn-log-filter-live" onclick="setLogFilter('live')" class="px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition">Live Engine</button>
             </div>
+            <span id="logs-updated" class="text-[10px] text-slate-500">--</span>
+            <button type="button" id="btn-refresh-logs" onclick="refreshLogs(true)" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol disabled:opacity-60">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
           </div>
         </div>
         <div id="log-container" class="bg-slate-950 font-mono text-[11px] p-3 rounded-lg border border-bordercol/60 h-56 md:h-40 overflow-y-auto space-y-1 text-slate-300">
@@ -5050,6 +5068,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               trail + ' ' + debounce;
           }
         }
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         // Say it inside the page in one short sentence; the raw exchange text
         // stays one tap away instead of being dumped by a browser alert().
@@ -5284,7 +5303,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           if (stEl) stEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.label} backtest...</span>`;
 
-          const payload = { ...basePayload, days: item.days };
+          const payload = { ...basePayload, days: item.days, sweep_tag: 'Sweep ' + item.label };
           let rowData = null;
           try {
             const res = await fetch('/api/backtest', {
@@ -5340,10 +5359,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           rows.push(rowData);
           updateSweepTableRow(i, false, rowData);
+          if (typeof refreshLogs === 'function') await refreshLogs();
           const progEl = document.getElementById('bt-sweep-progress');
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         console.error('Multi-window sweep error:', err);
         const failure = describeBacktestError(err);
@@ -5404,7 +5425,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           if (stEl) stEl.innerHTML = `<span class="text-blue-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.tf} backtest (${item.days}d)...</span>`;
 
-          const payload = { ...basePayload, timeframe: item.tf, days: item.days };
+          const payload = { ...basePayload, timeframe: item.tf, days: item.days, sweep_tag: 'Sweep ' + item.tf + ' (' + item.days + 'd)' };
           let rowData = null;
           try {
             const res = await fetch('/api/backtest', {
@@ -5460,10 +5481,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           rows.push(rowData);
           updateSweepTableRow(i, true, rowData);
+          if (typeof refreshLogs === 'function') await refreshLogs();
           const progEl = document.getElementById('bt-sweep-progress');
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         console.error('Timeframe sweep error:', err);
         const failure = describeBacktestError(err);
@@ -5477,35 +5500,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     let logsInFlight = false;
+    let currentLogFilter = 'all';
+    let rawLogsCache = [];
+
+    function setLogFilter(filter) {
+      currentLogFilter = filter;
+      ['all', 'sweep', 'live'].forEach(f => {
+        const el = document.getElementById(`btn-log-filter-${f}`);
+        if (el) {
+          if (f === filter) {
+            el.className = 'px-2 py-0.5 rounded font-medium bg-purple-600 text-white shadow-sm';
+          } else {
+            el.className = 'px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition';
+          }
+        }
+      });
+      renderLogs();
+    }
+
+    function renderLogs() {
+      const container = document.getElementById('log-container');
+      if (!container) return;
+      container.innerHTML = '';
+
+      let filtered = rawLogsCache;
+      if (currentLogFilter === 'sweep') {
+        filtered = rawLogsCache.filter(l => l.includes('[Sweep '));
+      } else if (currentLogFilter === 'live') {
+        filtered = rawLogsCache.filter(l => !l.includes('[Sweep '));
+      }
+
+      if (filtered && filtered.length) {
+        filtered.forEach(l => {
+          const div = document.createElement('div');
+          div.className = 'py-0.5 leading-relaxed';
+          if (l.includes('[CRITICAL]')) {
+            div.className += ' text-rose-400 font-bold';
+          } else if (l.includes('[WARNING]')) {
+            div.className += ' text-amber-400';
+          } else if (l.includes('[Sweep ')) {
+            div.className += ' text-purple-300 font-medium bg-purple-950/20 px-1.5 py-0.5 rounded border-l-2 border-purple-500/50';
+          } else if (l.includes('BUY') || l.includes('Closed position')) {
+            div.className += ' text-emerald-400';
+          } else {
+            div.className += ' text-slate-300';
+          }
+          div.innerText = l;
+          container.appendChild(div);
+        });
+        container.scrollTop = container.scrollHeight;
+      } else {
+        const msg = currentLogFilter === 'sweep'
+          ? 'No sweep logs recorded yet. Run a multi-window or timeframe sweep above.'
+          : (currentLogFilter === 'live'
+              ? 'No live engine logs recorded yet.'
+              : 'No logs recorded yet. Start the bot or run a backtest to generate activity.');
+        container.innerHTML = `<div class="text-slate-500 italic py-2">${escapeHtml(msg)}</div>`;
+      }
+    }
 
     async function refreshLogs(manual) {
       if (logsInFlight) return;
       logsInFlight = true;
       if (manual) beginRefresh('btn-refresh-logs', 'Refreshing...');
       try {
-        const res = await fetch('/api/logs?lines=40&_ts=' + Date.now(), { cache: 'no-store' });
+        const res = await fetch('/api/logs?lines=100&_ts=' + Date.now(), { cache: 'no-store' });
         if (!res.ok) {
           setRefreshStamp('logs-updated', `Could not refresh logs (HTTP ${res.status}).`, false);
           return;
         }
         const data = await res.json();
-        const container = document.getElementById('log-container');
-        if (!container) return;
-        container.innerHTML = '';
-        if (data.logs && data.logs.length) {
-          data.logs.forEach(l => {
-            const div = document.createElement('div');
-            if (l.includes('[CRITICAL]')) div.className = 'text-rose-400 font-bold';
-            else if (l.includes('[WARNING]')) div.className = 'text-amber-400';
-            else if (l.includes('BUY') || l.includes('Closed position')) div.className = 'text-emerald-400';
-            else div.className = 'text-slate-300';
-            div.innerText = l;
-            container.appendChild(div);
-          });
-          container.scrollTop = container.scrollHeight;
-        } else {
-          container.innerHTML = '<div class="text-slate-500">No logs recorded yet.</div>';
-        }
+        rawLogsCache = data.logs || [];
+        renderLogs();
         setRefreshStamp('logs-updated', 'Updated ' + new Date().toLocaleTimeString(), true);
       } catch (e) {
         setRefreshStamp('logs-updated', 'Could not refresh logs: ' + (e && e.message ? e.message : e), false);

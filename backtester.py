@@ -125,24 +125,25 @@ def format_pipeline_report(results: dict) -> str:
     return "\n".join(lines)
 
 
-def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int, eval_date_range: list = None) -> None:
+def _log_pipeline_summary(diag: dict, fib_filter_enabled: bool, warmup: int, eval_date_range: list = None, sweep_tag: str = None) -> None:
     """Echo the pipeline outcome to the activity log (bot.log -> dashboard)."""
+    pfx = f"[{sweep_tag}] " if sweep_tag else ""
     eval_start, eval_end = (eval_date_range or [None, None])[:2]
     eval_str = f" from {eval_start} to {eval_end}" if eval_start and eval_end else ""
-    log.info("Strategy loop walked %s post-warmup candle(s) evaluated for signals%s (skipped %s warmup candle(s))",
-             f"{diag['candles_evaluated']:,}", eval_str, f"{warmup:,}")
+    log.info("%sStrategy loop walked %s post-warmup candle(s) evaluated for signals%s (skipped %s warmup candle(s))",
+             pfx, f"{diag['candles_evaluated']:,}", eval_str, f"{warmup:,}")
     for entry in diag["rejection_log"][:REJECTION_LOG_LINES]:
-        log.info("%s", entry)
+        log.info("%s%s", pfx, entry)
     hidden = len(diag["rejection_log"]) - REJECTION_LOG_LINES
     if hidden > 0:
-        log.info("... %d more rejection(s) suppressed — full list in the run report", hidden)
-    log.info("Backtest summary: %s candle(s) evaluated, %s raw signal(s), %s rejected (%s), %s trade(s) executed",
-             f"{diag['candles_evaluated']:,}", f"{diag['core_signals_detected']:,}",
+        log.info("%s... %d more rejection(s) suppressed — full list in the run report", pfx, hidden)
+    log.info("%sBacktest summary: %s candle(s) evaluated, %s raw signal(s), %s rejected (%s), %s trade(s) executed",
+             pfx, f"{diag['candles_evaluated']:,}", f"{diag['core_signals_detected']:,}",
              f"{sum(diag['rejections'].values()):,}", _fmt_counts(diag["rejections"]),
              f"{diag['trades_executed']:,}")
-    log.info("Backtest stages: fib filter %s (%s passed / %s blocked), debounce %s suppressed "
+    log.info("%sBacktest stages: fib filter %s (%s passed / %s blocked), debounce %s suppressed "
              "(%s bar(s) required), sizing %s passed / %s blocked, no-signal candles by rule: %s",
-             "on" if fib_filter_enabled else "off",
+             pfx, "on" if fib_filter_enabled else "off",
              f"{diag['fib_filter_passed']:,}", f"{diag['fib_filter_blocked']:,}",
              f"{diag.get('debounce_blocked', 0):,}",
              f"{diag.get('min_bars_between_trades', 0)}",
@@ -252,7 +253,7 @@ def fetch_historical(exchange_id: str, symbol: str, timeframe: str, days: int,
     return df
 
 
-def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
+def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dict:
     candles_tested = int(len(df))
     date_range = _date_range(df)
     df = add_indicators(df, cfg.strategy)
@@ -414,7 +415,7 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     eval_first_ts = eval_first_row.isoformat() if hasattr(eval_first_row, "isoformat") else (str(eval_first_row) if eval_first_row is not None else None)
     eval_date_range = [eval_first_ts, date_range[1] if date_range else None]
 
-    _log_pipeline_summary(diag, fib_filter_enabled, warmup, eval_date_range)
+    _log_pipeline_summary(diag, fib_filter_enabled, warmup, eval_date_range, sweep_tag=sweep_tag)
 
     results = summarize(trades, equity_curve, cfg.starting_equity, cfg.exchange.timeframe)
     results["fib_filter_enabled"] = fib_filter_enabled
@@ -452,6 +453,9 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig) -> dict:
     results["candles_warmup"] = warmup
     results["taker_fee_pct"] = float(cfg.taker_fee_pct)
     results["slippage_pct"] = float(cfg.slippage_pct)
+    if sweep_tag:
+        results["sweep_tag"] = sweep_tag
+        diag["sweep_tag"] = sweep_tag
     diag["candles_warmup"] = warmup
     diag["indicator_date_range"] = date_range
     diag["eval_date_range"] = eval_date_range
