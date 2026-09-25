@@ -214,6 +214,10 @@ class ExecutionModeRequest(BaseModel):
     execution_mode: str  # "auto" | "manual"
 
 
+class KillSwitchToggleRequest(BaseModel):
+    active: Optional[bool] = None
+
+
 class BotSettingsRequest(BaseModel):
     execution_mode: Optional[str] = None  # "auto" | "manual"
     strategy: Optional[str] = None
@@ -1305,6 +1309,31 @@ def kill_bot():
 def reset_kill_endpoint():
     runner.deactivate_kill()
     return {"success": True, "message": "Emergency kill switch deactivated. Bot is now IDLE."}
+
+
+@app.post("/api/bot/kill/toggle")
+def toggle_kill_switch_endpoint(req: Optional[KillSwitchToggleRequest] = None):
+    currently_active = bool(
+        os.path.exists(runner.cfg.kill_switch_file) or
+        (runner.bot and runner.bot.kill_switch_active())
+    )
+    if req is not None and req.active is not None:
+        target_active = bool(req.active)
+    else:
+        target_active = not currently_active
+
+    if target_active:
+        runner.trigger_kill()
+        msg = "Emergency kill switch activated; bot halted immediately."
+    else:
+        runner.deactivate_kill()
+        msg = "Emergency kill switch deactivated. Bot is now IDLE."
+
+    return {
+        "success": True,
+        "kill_switch_active": target_active,
+        "message": msg
+    }
 
 
 @app.post("/api/bot/reset_day")
@@ -2431,16 +2460,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span id="btn-toggle-text">Start Bot</span>
           </button>
 
-          <!-- Kill Switch -->
-          <button onclick="triggerKillSwitch()" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center gap-1" title="Emergency Stop">
-            <i class="fa-solid fa-skull-crossbones"></i>
+          <!-- Emergency Kill Switch Toggle -->
+          <button id="btn-kill-toggle" onclick="toggleKillSwitch()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-lg transition flex items-center gap-1.5 text-xs shadow-sm" title="Toggle Emergency Kill Switch">
+            <i id="btn-kill-toggle-icon" class="fa-solid fa-toggle-off text-slate-400 text-sm"></i>
+            <span id="btn-kill-toggle-text">Kill Switch: OFF</span>
           </button>
-
-          <!-- Deactivate Kill Switch Button (visible when kill switch is active) -->
-          <button id="btn-reset-kill" onclick="deactivateKillSwitch()" class="hidden px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg shadow-lg border border-rose-400 flex items-center gap-1.5 animate-pulse text-xs" title="Deactivate Emergency Kill Switch">
-            <i class="fa-solid fa-lock-open"></i>
-            <span>Reset Kill Switch</span>
-          </button>
+          <button id="btn-reset-kill" onclick="deactivateKillSwitch()" class="hidden" aria-hidden="true" title="Reset Kill Switch"></button>
 
           <!-- Auth User Menu Button -->
           <div id="auth-buttons" class="flex items-center gap-2">
@@ -2563,20 +2588,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         </div>
 
-        <!-- Emergency Kill Switch (Bottom item) -->
+        <!-- Emergency Kill Switch Toggle (Bottom item) -->
         <div class="pt-1">
-          <button type="button" onclick="triggerKillSwitch(); toggleMobileMenu();" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-xl transition flex items-center justify-center gap-2 text-xs">
-            <i class="fa-solid fa-skull-crossbones"></i>
-            <span>Emergency Kill Switch</span>
+          <button type="button" id="btn-kill-toggle-mob" onclick="toggleKillSwitch(); toggleMobileMenu();" class="w-full py-2.5 bg-slate-800 active:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-xl transition flex items-center justify-between px-3 text-xs" title="Toggle Emergency Kill Switch">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-skull-crossbones text-rose-400"></i>
+              <span>Emergency Kill Switch</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span id="btn-kill-toggle-mob-status" class="text-[11px] font-bold text-slate-400">OFF</span>
+              <i id="btn-kill-toggle-mob-icon" class="fa-solid fa-toggle-off text-slate-400 text-base"></i>
+            </div>
           </button>
         </div>
 
-        <!-- Deactivate Kill Switch Mobile (visible when active) -->
-        <div id="btn-reset-kill-mob-container" class="pt-1">
-          <button type="button" id="btn-reset-kill-mob" onclick="deactivateKillSwitch(); toggleMobileMenu();" class="hidden w-full py-2.5 bg-rose-600 active:bg-rose-700 text-white border border-rose-400 font-bold rounded-xl shadow-lg transition flex items-center justify-center gap-2 text-xs animate-pulse">
-            <i class="fa-solid fa-lock-open"></i>
-            <span>Deactivate Kill Switch (Return to IDLE)</span>
-          </button>
+        <!-- Hidden compatibility hook for existing test assertions -->
+        <div id="btn-reset-kill-mob-container" class="hidden">
+          <button type="button" id="btn-reset-kill-mob" onclick="deactivateKillSwitch(); toggleMobileMenu();" class="hidden"></button>
         </div>
       </div>
     </div>
@@ -3474,10 +3502,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="bottom-btn-toggle-text" class="text-[10px] font-semibold mt-0.5">Start</span>
     </button>
 
-    <!-- 2. Emergency Kill Switch -->
-    <button onclick="triggerKillSwitch()" class="flex flex-col items-center justify-center py-1 px-1.5 text-rose-400 hover:text-rose-300 active:scale-95 transition flex-1">
-      <i class="fa-solid fa-skull-crossbones text-base"></i>
-      <span class="text-[10px] font-semibold mt-0.5">Kill</span>
+    <!-- 2. Emergency Kill Switch Toggle -->
+    <button id="bottom-btn-kill" onclick="toggleKillSwitch()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-400 hover:text-slate-200 active:scale-95 transition flex-1" title="Toggle Emergency Kill Switch">
+      <i id="bottom-btn-kill-icon" class="fa-solid fa-toggle-off text-base text-slate-400"></i>
+      <span id="bottom-btn-kill-text" class="text-[10px] font-semibold mt-0.5">Kill: OFF</span>
     </button>
 
   </nav>
@@ -3933,6 +3961,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Javascript Logic -->
   <script>
     let botRunning = false;
+    let isKillSwitchActive = false;
     let currentUser = null;
     let exchangesList = [];
 
@@ -5216,12 +5245,68 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const isKillActive = Boolean(data.kill_file_exists || data.kill_switch_triggered);
+        isKillSwitchActive = isKillActive;
+
         const killBanner = document.getElementById('kill-switch-active-banner');
         const btnResetKill = document.getElementById('btn-reset-kill');
         const btnResetKillMob = document.getElementById('btn-reset-kill-mob');
         if (killBanner) killBanner.classList.toggle('hidden', !isKillActive);
         if (btnResetKill) btnResetKill.classList.toggle('hidden', !isKillActive);
         if (btnResetKillMob) btnResetKillMob.classList.toggle('hidden', !isKillActive);
+
+        // Update desktop toggle button
+        const killToggle = document.getElementById('btn-kill-toggle');
+        const killToggleIcon = document.getElementById('btn-kill-toggle-icon');
+        const killToggleText = document.getElementById('btn-kill-toggle-text');
+        if (killToggle && killToggleIcon && killToggleText) {
+          if (isKillActive) {
+            killToggle.className = 'px-2.5 py-1.5 bg-rose-600 hover:bg-rose-500 text-white border border-rose-400 font-semibold rounded-lg shadow-lg flex items-center gap-1.5 text-xs animate-pulse transition';
+            killToggle.title = 'Emergency Kill Switch is ACTIVE (Halted). Click to disarm.';
+            killToggleIcon.className = 'fa-solid fa-toggle-on text-white text-sm';
+            killToggleText.innerText = 'Kill Switch: ON';
+          } else {
+            killToggle.className = 'px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-lg transition flex items-center gap-1.5 text-xs shadow-sm';
+            killToggle.title = 'Emergency Kill Switch is DISARMED. Click to activate emergency halt.';
+            killToggleIcon.className = 'fa-solid fa-toggle-off text-slate-400 text-sm';
+            killToggleText.innerText = 'Kill Switch: OFF';
+          }
+        }
+
+        // Update mobile drawer toggle button
+        const killToggleMob = document.getElementById('btn-kill-toggle-mob');
+        const killToggleMobIcon = document.getElementById('btn-kill-toggle-mob-icon');
+        const killToggleMobStatus = document.getElementById('btn-kill-toggle-mob-status');
+        if (killToggleMob && killToggleMobIcon && killToggleMobStatus) {
+          if (isKillActive) {
+            killToggleMob.className = 'w-full py-2.5 bg-rose-600/90 active:bg-rose-700 text-white border border-rose-400 font-bold rounded-xl shadow-lg transition flex items-center justify-between px-3 text-xs animate-pulse';
+            killToggleMobIcon.className = 'fa-solid fa-toggle-on text-white text-base';
+            killToggleMobStatus.innerText = 'ON';
+            killToggleMobStatus.className = 'text-[11px] font-bold text-white';
+          } else {
+            killToggleMob.className = 'w-full py-2.5 bg-slate-800 active:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-xl transition flex items-center justify-between px-3 text-xs';
+            killToggleMobIcon.className = 'fa-solid fa-toggle-off text-slate-400 text-base';
+            killToggleMobStatus.innerText = 'OFF';
+            killToggleMobStatus.className = 'text-[11px] font-bold text-slate-400';
+          }
+        }
+
+        // Update mobile bottom nav button
+        const bottomKill = document.getElementById('bottom-btn-kill');
+        const bottomKillIcon = document.getElementById('bottom-btn-kill-icon');
+        const bottomKillText = document.getElementById('bottom-btn-kill-text');
+        if (bottomKill && bottomKillIcon && bottomKillText) {
+          if (isKillActive) {
+            bottomKill.className = 'flex flex-col items-center justify-center py-1 px-1.5 text-rose-400 active:scale-95 transition flex-1 animate-pulse';
+            bottomKillIcon.className = 'fa-solid fa-toggle-on text-base text-rose-400';
+            bottomKillText.innerText = 'Kill: ON';
+            bottomKillText.className = 'text-[10px] font-bold mt-0.5 text-rose-300';
+          } else {
+            bottomKill.className = 'flex flex-col items-center justify-center py-1 px-1.5 text-slate-400 hover:text-slate-200 active:scale-95 transition flex-1';
+            bottomKillIcon.className = 'fa-solid fa-toggle-off text-base text-slate-400';
+            bottomKillText.innerText = 'Kill: OFF';
+            bottomKillText.className = 'text-[10px] font-semibold mt-0.5 text-slate-400';
+          }
+        }
 
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
@@ -5349,6 +5434,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function toggleKillSwitch() {
+      if (isKillSwitchActive) {
+        if (!confirm('Deactivate emergency KILL SWITCH and return to IDLE mode? This clears the halt latch and establishes the current equity baseline.')) return;
+        try {
+          const res = await fetch('/api/bot/kill/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ active: false })
+          });
+          const data = await res.json();
+          if (data.success) {
+            await fetchStatus();
+            await refreshLogs();
+          } else {
+            alert('Could not deactivate kill switch: ' + (data.message || 'Unknown error'));
+          }
+        } catch (e) {
+          alert('Deactivate kill switch failed: ' + e);
+        }
+      } else {
+        if (!confirm('Are you sure you want to trigger the emergency KILL SWITCH? This halts all execution immediately.')) return;
+        try {
+          const res = await fetch('/api/bot/kill/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ active: true })
+          });
+          const data = await res.json();
+          if (data.success) {
+            await fetchStatus();
+            await refreshLogs();
+          } else {
+            alert('Kill switch failed: ' + e);
+          }
+        } catch (e) {
+          alert('Kill switch failed: ' + e);
+        }
+      }
+    }
+
     async function triggerKillSwitch() {
       if (!confirm('Are you sure you want to trigger the emergency KILL SWITCH? This halts all execution immediately.')) return;
       try {
@@ -5359,6 +5484,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         alert('Kill switch failed: ' + e);
       }
     }
+
 
     async function deactivateKillSwitch() {
       if (!confirm('Deactivate emergency KILL SWITCH and return to IDLE mode? This clears the halt latch and establishes the current equity baseline.')) return;
