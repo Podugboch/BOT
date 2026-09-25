@@ -830,6 +830,61 @@ class TestNewIndicatorsAndMultiStrategy:
             if os.path.exists(test_kill_file):
                 os.remove(test_kill_file)
 
+    def test_execution_mode_persistence_and_dedicated_endpoint(self, monkeypatch, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        assert 'id="btn-exec-auto"' in DASHBOARD_HTML
+        assert 'id="btn-exec-manual"' in DASHBOARD_HTML
+        assert '/api/bot/execution_mode' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        orig_mode = runner.cfg.execution_mode
+        try:
+            # 1. Switch to manual via dedicated endpoint
+            res = client.post("/api/bot/execution_mode", json={"execution_mode": "manual"})
+            assert res.status_code == 200
+            assert res.json()["execution_mode"] == "manual"
+            assert runner.cfg.execution_mode == "manual"
+            assert client.get("/api/status").json()["execution_mode"] == "manual"
+
+            # 2. Start bot - verify runner.start() does NOT reset execution_mode to auto
+            started = runner.start()
+            try:
+                assert runner.cfg.execution_mode == "manual"
+                if runner.bot:
+                    assert runner.bot.cfg.execution_mode == "manual"
+                assert client.get("/api/status").json()["execution_mode"] == "manual"
+            finally:
+                runner.stop()
+
+            assert runner.cfg.execution_mode == "manual"
+
+            # 3. Switching environment mode (paper / live) does NOT reset execution_mode
+            m_res = client.post("/api/bot/mode", json={"trading_mode": "real"})
+            assert m_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            t_res = client.post("/api/bot/mode", json={"trading_mode": "testnet"})
+            assert t_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            # 4. Partial settings update does NOT reset execution_mode
+            p_res = client.post("/api/bot/settings", json={"fast_ema": 14})
+            assert p_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            # 5. Switch back to auto
+            a_res = client.post("/api/bot/execution_mode", json={"execution_mode": "auto"})
+            assert a_res.status_code == 200
+            assert a_res.json()["execution_mode"] == "auto"
+            assert runner.cfg.execution_mode == "auto"
+            assert client.get("/api/status").json()["execution_mode"] == "auto"
+        finally:
+            runner.cfg.execution_mode = orig_mode
+            if runner.bot:
+                runner.bot.cfg.execution_mode = orig_mode
+
 
 # ============================================================================
 # FIBONACCI ZONE FILTER — STARVATION FIXES

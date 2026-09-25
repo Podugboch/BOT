@@ -114,8 +114,10 @@ class BotRunner:
             except Exception:
                 pass
 
-        self.cfg = BotConfig()
-        self.bot = TradingBot(self.cfg)
+        if self.bot is None:
+            self.bot = TradingBot(self.cfg)
+        else:
+            self.bot.cfg = self.cfg
         self.running = True
         self.last_error = None
 
@@ -199,6 +201,8 @@ class BotRunner:
     def get_or_create_bot(self) -> TradingBot:
         if self.bot is None:
             self.bot = TradingBot(self.cfg)
+        else:
+            self.bot.cfg = self.cfg
         return self.bot
 
 
@@ -206,20 +210,24 @@ runner = BotRunner()
 
 
 # --- Pydantic Request Models ---
+class ExecutionModeRequest(BaseModel):
+    execution_mode: str  # "auto" | "manual"
+
+
 class BotSettingsRequest(BaseModel):
-    execution_mode: Optional[str] = "auto"  # "auto" | "manual"
-    strategy: Optional[str] = "ema_cross_fib"
-    timeframe: Optional[str] = "15m"
-    symbol: Optional[str] = "BTC/USDT"
-    use_fib_filter: Optional[bool] = True
-    fast_ema: Optional[int] = 12
-    slow_ema: Optional[int] = 26
-    rsi_period: Optional[int] = 14
-    rsi_overbought: Optional[float] = 65.0
-    adx_trend_threshold: Optional[float] = 20.0
-    risk_per_trade_pct: Optional[float] = 0.01
-    stop_loss_atr_mult: Optional[float] = 2.0
-    take_profit_atr_mult: Optional[float] = 4.0
+    execution_mode: Optional[str] = None  # "auto" | "manual"
+    strategy: Optional[str] = None
+    timeframe: Optional[str] = None
+    symbol: Optional[str] = None
+    use_fib_filter: Optional[bool] = None
+    fast_ema: Optional[int] = None
+    slow_ema: Optional[int] = None
+    rsi_period: Optional[int] = None
+    rsi_overbought: Optional[float] = None
+    adx_trend_threshold: Optional[float] = None
+    risk_per_trade_pct: Optional[float] = None
+    stop_loss_atr_mult: Optional[float] = None
+    take_profit_atr_mult: Optional[float] = None
 
 
 class ManualTradeRequest(BaseModel):
@@ -879,8 +887,18 @@ def save_exchange_credentials(
         except Exception as e:
             logger.warning(f"Failed updating .env with exchange metadata: {e}")
 
-    # Refresh runner exchange config
-    runner.cfg = BotConfig()
+    # Refresh runner exchange config while preserving user settings
+    runner.cfg.exchange.exchange_id = req.exchange_id
+    runner.cfg.exchange.testnet = req.testnet
+    runner.cfg.exchange.api_key = req.api_key
+    runner.cfg.exchange.api_secret = req.api_secret
+    runner.cfg.exchange.api_passphrase = req.api_passphrase or ""
+    if runner.bot and runner.bot.exchange:
+        runner.bot.exchange.cfg.exchange_id = req.exchange_id
+        runner.bot.exchange.cfg.testnet = req.testnet
+        runner.bot.exchange.cfg.api_key = req.api_key
+        runner.bot.exchange.cfg.api_secret = req.api_secret
+        runner.bot.exchange.cfg.api_passphrase = req.api_passphrase or ""
     return {
         "success": True,
         "message": f"API keys for {req.exchange_id} saved securely to encrypted vault and applied to active configuration.",
@@ -1061,20 +1079,23 @@ def get_bot_settings():
 
 @app.post("/api/bot/settings")
 def save_bot_settings(req: BotSettingsRequest):
-    exec_mode = (req.execution_mode or "auto").strip().lower()
-    if exec_mode not in ["auto", "manual"]:
-        raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+    if req.execution_mode is not None:
+        exec_mode = req.execution_mode.strip().lower()
+        if exec_mode not in ["auto", "manual"]:
+            raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+    else:
+        exec_mode = getattr(runner.cfg, "execution_mode", "auto")
 
-    timeframe = (req.timeframe or "15m").strip().lower()
+    timeframe = (req.timeframe or runner.cfg.exchange.timeframe or "15m").strip().lower()
     if timeframe not in AVAILABLE_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe '{timeframe}'. Supported: {', '.join(AVAILABLE_TIMEFRAMES)}")
 
     valid_strat_ids = [s["id"] for s in STRATEGIES]
-    strategy_id = (req.strategy or "ema_cross_fib").strip().lower()
+    strategy_id = (req.strategy or runner.cfg.strategy.strategy_name or "ema_cross_fib").strip().lower()
     if strategy_id not in valid_strat_ids:
         raise HTTPException(status_code=400, detail=f"Invalid strategy '{strategy_id}'. Supported: {', '.join(valid_strat_ids)}")
 
-    symbol = (req.symbol or "BTC/USDT").strip().upper()
+    symbol = (req.symbol or runner.cfg.exchange.symbol or "BTC/USDT").strip().upper()
     if not re.match(r"^[A-Z0-9/_-]{2,20}$", symbol):
         raise HTTPException(status_code=400, detail=f"Invalid trading pair symbol '{symbol}'. Must match pattern like BTC/USDT.")
 
@@ -1179,6 +1200,44 @@ def save_bot_settings(req: BotSettingsRequest):
         "strategy_name": strat_meta["name"],
         "timeframe": timeframe,
         "symbol": symbol,
+    }
+
+
+@app.post("/api/bot/execution_mode")
+def set_execution_mode_endpoint(req: ExecutionModeRequest):
+    mode = (req.execution_mode or "").strip().lower()
+    if mode not in ["auto", "manual"]:
+        raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+
+    runner.cfg.execution_mode = mode
+    if runner.bot:
+        runner.bot.cfg.execution_mode = mode
+
+    os.environ["EXECUTION_MODE"] = mode
+    try:
+        env_file = Path(".env")
+        if env_file.exists():
+            lines = env_file.read_text().splitlines(keepends=True)
+            written = False
+            new_lines = []
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and s.split("=", 1)[0].strip() == "EXECUTION_MODE":
+                    new_lines.append(f"EXECUTION_MODE={mode}\n")
+                    written = True
+                else:
+                    new_lines.append(l)
+            if not written:
+                new_lines.append(f"EXECUTION_MODE={mode}\n")
+            env_file.write_text("".join(new_lines))
+    except Exception as e:
+        logger.warning(f"Failed updating .env with execution_mode: {e}")
+
+    logger.info("Bot execution mode explicitly updated to: %s", mode.upper())
+    return {
+        "success": True,
+        "execution_mode": mode,
+        "message": f"Execution mode set to {mode.upper()}."
     }
 
 
@@ -1294,14 +1353,19 @@ def set_trading_mode_endpoint(req: TradingModeRequest):
     except Exception as e:
         print(f"[CONFIG ERROR] Failed updating .env file for trading mode: {e}")
 
-    # Re-apply to active runner config
+    # Re-apply to active runner config while preserving execution_mode and strategy settings
     was_running = runner.running
     if was_running:
         runner.stop()
 
-    runner.cfg = BotConfig()
     runner.cfg.mode = new_mode
     runner.cfg.exchange.testnet = new_testnet
+    if runner.bot:
+        runner.bot.cfg.mode = new_mode
+        runner.bot.cfg.exchange.testnet = new_testnet
+        if hasattr(runner.bot, "exchange") and runner.bot.exchange:
+            runner.bot.exchange.mode = new_mode
+            runner.bot.exchange.cfg.testnet = new_testnet
 
     if was_running:
         runner.start()
@@ -2761,12 +2825,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 w-full sm:w-auto">
-            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5">
+            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5" title="Switch to Testnet / Paper Trading">
               <i class="fa-solid fa-flask"></i> Testnet Mode
             </button>
-            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5">
+            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5" title="Switch to Real Trading (LIVE)">
               <i class="fa-solid fa-bolt text-rose-400"></i> Real Trading (LIVE)
             </button>
+
+            <!-- 1-Click Execution Mode Toggle (Auto vs Manual) -->
+            <div class="flex items-center rounded-lg bg-slate-900 border border-bordercol p-0.5" title="Execution Mode: Switch between Automated and Manual Trading">
+              <button type="button" onclick="quickSetExecutionMode('auto')" id="btn-exec-auto" class="px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5" title="Auto Trading: Bot places entries and exits automatically">
+                <i class="fa-solid fa-robot"></i> Auto
+              </button>
+              <button type="button" onclick="quickSetExecutionMode('manual')" id="btn-exec-manual" class="px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5" title="Manual Trading: Bot generates signals only; you trade manually">
+                <i class="fa-solid fa-hand-pointer text-amber-400"></i> Manual
+              </button>
+            </div>
+
             <button type="button" onclick="openSettingsModal()" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 text-xs font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
               <i class="fa-solid fa-gear"></i> Settings
             </button>
@@ -3734,7 +3809,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <label class="block text-slate-300 font-bold mb-2">1. Trading Execution Mode</label>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             <label id="opt-mode-auto-card" class="p-3 rounded-xl border border-purple-500/60 bg-purple-950/30 cursor-pointer transition flex items-start gap-2.5">
-              <input type="radio" name="settings-exec-mode" id="radio-mode-auto" value="auto" checked onchange="onExecutionModeOptionChange()" class="mt-0.5 text-purple-500 focus:ring-0">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-auto" value="auto" checked onchange="onExecutionModeOptionChange(true)" class="mt-0.5 text-purple-500 focus:ring-0">
               <div>
                 <div class="font-bold text-white flex items-center gap-1.5">
                   <i class="fa-solid fa-robot text-purple-400"></i> Auto Trading
@@ -3744,7 +3819,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </label>
 
             <label id="opt-mode-manual-card" class="p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600">
-              <input type="radio" name="settings-exec-mode" id="radio-mode-manual" value="manual" onchange="onExecutionModeOptionChange()" class="mt-0.5 text-amber-500 focus:ring-0">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-manual" value="manual" onchange="onExecutionModeOptionChange(true)" class="mt-0.5 text-amber-500 focus:ring-0">
               <div>
                 <div class="font-bold text-white flex items-center gap-1.5">
                   <i class="fa-solid fa-hand-pointer text-amber-400"></i> Manual Trading
@@ -4868,7 +4943,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function onExecutionModeOptionChange() {
+    function onExecutionModeOptionChange(autoSave = false) {
       const autoRadio = document.getElementById('radio-mode-auto');
       const isAuto = autoRadio ? autoRadio.checked : true;
       const autoCard = document.getElementById('opt-mode-auto-card');
@@ -4880,6 +4955,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } else {
         if (autoCard) autoCard.className = 'p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600';
         if (manualCard) manualCard.className = 'p-3 rounded-xl border border-amber-500/60 bg-amber-950/30 cursor-pointer transition flex items-start gap-2.5';
+      }
+
+      if (autoSave) {
+        quickSetExecutionMode(isAuto ? 'auto' : 'manual');
       }
     }
 
@@ -5015,7 +5094,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function quickSetExecutionMode(targetMode) {
       try {
-        const res = await fetch('/api/bot/settings', {
+        const res = await fetch('/api/bot/execution_mode', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ execution_mode: targetMode })
@@ -5099,14 +5178,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
         if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
         if (activeModeTag) {
+          const modeLabel = (data.mode || 'paper').toUpperCase();
+          const execType = isManual ? 'Manual Orders' : 'Algorithmic Execution';
           if (!data.running) {
-            activeModeTag.innerHTML = '<i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (No Orders Executing)';
-            activeModeTag.className = 'text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700';
+            activeModeTag.innerHTML = `<i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (${execType})`;
+            activeModeTag.className = isManual ? 'text-amber-300 font-semibold bg-amber-950/60 px-2 py-0.5 rounded border border-amber-500/50' : 'text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700';
           } else {
-            const modeLabel = (data.mode || 'paper').toUpperCase();
-            const execType = isManual ? 'Manual Orders' : 'Algorithmic Execution';
             activeModeTag.innerHTML = `<i class="fa-solid fa-play text-emerald-400 mr-1"></i>Engine: ARMED (${modeLabel} · ${execType})`;
-            activeModeTag.className = isReal ? 'text-emerald-300 font-semibold bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/50 animate-pulse' : 'text-blue-300 font-semibold bg-blue-950/60 px-2 py-0.5 rounded border border-blue-500/50';
+            activeModeTag.className = isReal ? 'text-emerald-300 font-semibold bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/50 animate-pulse' : (isManual ? 'text-amber-300 font-semibold bg-amber-950/60 px-2 py-0.5 rounded border border-amber-500/50' : 'text-blue-300 font-semibold bg-blue-950/60 px-2 py-0.5 rounded border border-blue-500/50');
+          }
+        }
+
+        const btnExecAuto = document.getElementById('btn-exec-auto');
+        const btnExecManual = document.getElementById('btn-exec-manual');
+        if (btnExecAuto && btnExecManual) {
+          if (isManual) {
+            btnExecManual.className = 'px-2.5 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+            btnExecAuto.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
+          } else {
+            btnExecAuto.className = 'px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+            btnExecManual.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
           }
         }
         const tfWarnBanner = document.getElementById('tf-warning-banner');
