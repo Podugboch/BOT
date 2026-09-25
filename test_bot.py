@@ -830,6 +830,70 @@ class TestNewIndicatorsAndMultiStrategy:
             if os.path.exists(test_kill_file):
                 os.remove(test_kill_file)
 
+    def test_api_kill_switch_toggle_and_ui(self, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        # Assert all toggle button elements are present on desktop and mobile
+        assert 'id="btn-kill-toggle"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-icon"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-text"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob-icon"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob-status"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill-icon"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill-text"' in DASHBOARD_HTML
+        assert 'toggleKillSwitch()' in DASHBOARD_HTML
+        assert '/api/bot/kill/toggle' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        old_kill_file = runner.cfg.kill_switch_file
+        test_kill_file = str(tmp_path / "TOGGLE_KILL")
+        runner.cfg.kill_switch_file = test_kill_file
+        try:
+            # Ensure starting state is inactive
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
+            if runner.bot:
+                runner.bot.risk.state.kill_switch_triggered = False
+
+            # 1. Toggle ON with empty body
+            res1 = client.post("/api/bot/kill/toggle")
+            assert res1.status_code == 200
+            data1 = res1.json()
+            assert data1["success"] is True
+            assert data1["kill_switch_active"] is True
+            assert os.path.exists(test_kill_file)
+
+            # 2. Toggle OFF with empty body
+            res2 = client.post("/api/bot/kill/toggle")
+            assert res2.status_code == 200
+            data2 = res2.json()
+            assert data2["success"] is True
+            assert data2["kill_switch_active"] is False
+            assert not os.path.exists(test_kill_file)
+
+            # 3. Explicit active=True
+            res3 = client.post("/api/bot/kill/toggle", json={"active": True})
+            assert res3.status_code == 200
+            data3 = res3.json()
+            assert data3["success"] is True
+            assert data3["kill_switch_active"] is True
+            assert os.path.exists(test_kill_file)
+
+            # 4. Explicit active=False
+            res4 = client.post("/api/bot/kill/toggle", json={"active": False})
+            assert res4.status_code == 200
+            data4 = res4.json()
+            assert data4["success"] is True
+            assert data4["kill_switch_active"] is False
+            assert not os.path.exists(test_kill_file)
+        finally:
+            runner.cfg.kill_switch_file = old_kill_file
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
+
     def test_execution_mode_persistence_and_dedicated_endpoint(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
         from web_server import app, runner, DASHBOARD_HTML
