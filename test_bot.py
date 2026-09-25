@@ -3730,3 +3730,63 @@ class TestCCXTEnhancements:
         assert "max_spread_pct" in res
         assert res["wallet"]["mode"] in ("paper", "live")
 
+
+class TestExchangeKeyRemovalAndExecutionMode:
+    """Verifies that API keys can be removed safely and execution mode state behaves correctly."""
+
+    def test_ui_contains_key_removal_button_and_execution_toggle(self):
+        from web_server import DASHBOARD_HTML
+        assert 'id="btn-remove-key"' in DASHBOARD_HTML
+        assert 'deleteSavedExchangeKey' in DASHBOARD_HTML
+        assert 'deleteCurrentExchangeKey' in DASHBOARD_HTML
+        assert 'toggleExecutionMode' in DASHBOARD_HTML
+        assert 'updateExecutionModeUI' in DASHBOARD_HTML
+        assert 'id="btn-exec-auto"' in DASHBOARD_HTML
+        assert 'id="btn-exec-manual"' in DASHBOARD_HTML
+
+    def test_delete_exchange_key_endpoint_requires_auth(self):
+        from fastapi.testclient import TestClient
+        from web_server import app
+        client = TestClient(app)
+        res = client.post("/api/exchange/delete", json={"exchange_id": "binance"})
+        assert res.status_code == 401
+
+    def test_delete_exchange_key_endpoint_success(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+        from auth import AuthService, init_auth_db
+
+        init_auth_db()
+        reg = AuthService.register("test_key_user", "keyuser@example.com", "Password123!")
+        from auth import get_db_connection
+        conn = get_db_connection()
+        tok = conn.execute("SELECT activation_token FROM users WHERE username = 'test_key_user'").fetchone()["activation_token"]
+        conn.close()
+        AuthService.activate_account(tok)
+        login_res = AuthService.login("test_key_user", "Password123!")
+        token = login_res["token"]
+        user_id = login_res["user"]["id"]
+
+        AuthService.save_exchange_key(user_id, "binance", "TEST_KEY_123", "TEST_SECRET_456", "", testnet=False)
+        keys_before = AuthService.get_exchange_keys(user_id)
+        assert any(k["exchange_id"] == "binance" for k in keys_before)
+
+        runner.cfg.exchange.exchange_id = "binance"
+        runner.cfg.exchange.api_key = "TEST_KEY_123"
+        runner.cfg.exchange.api_secret = "TEST_SECRET_456"
+
+        client = TestClient(app)
+        res = client.post(
+            "/api/exchange/delete",
+            json={"exchange_id": "binance"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert res.status_code == 200
+        assert res.json()["success"] is True
+
+        keys_after = AuthService.get_exchange_keys(user_id)
+        assert not any(k["exchange_id"] == "binance" for k in keys_after)
+        assert runner.cfg.exchange.api_key == ""
+        assert runner.cfg.exchange.api_secret == ""
+
+

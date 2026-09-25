@@ -42,6 +42,7 @@ from storage_adapter import (
     remote_save_latest_exchange_key,
     remote_get_latest_exchange_key,
     remote_get_exchange_keys,
+    remote_delete_exchange_key,
     remote_delete_account,
     remote_delete_all_accounts,
 )
@@ -1786,6 +1787,19 @@ class AuthService:
                 "testnet": bool(row["testnet"]),
             }
         return _latest_exchange_key_from_remote()
+
+    @staticmethod
+    def delete_exchange_key(user_id: int, exchange_id: str) -> Dict[str, Any]:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM exchange_keys WHERE user_id = ? AND LOWER(exchange_id) = LOWER(?)", (user_id, exchange_id))
+        conn.commit()
+        conn.close()
+        try:
+            remote_delete_exchange_key(user_id, exchange_id)
+        except Exception as e:
+            logger.warning("Remote exchange key deletion warning: %s", e)
+        return {"success": True, "message": f"API keys for {exchange_id.upper()} deleted successfully"}
 
     @staticmethod
     def delete_all_accounts() -> Dict[str, Any]:
