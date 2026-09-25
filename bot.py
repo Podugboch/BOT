@@ -91,6 +91,26 @@ class TradingBot:
     def kill_switch_active(self) -> bool:
         return os.path.exists(self.cfg.kill_switch_file) or getattr(self.risk.state, "kill_switch_triggered", False)
 
+    def deactivate_kill_switch(self) -> bool:
+        """Deactivate the kill switch by removing the trigger file and clearing risk manager latch."""
+        if os.path.exists(self.cfg.kill_switch_file):
+            try:
+                os.remove(self.cfg.kill_switch_file)
+                log.info("Kill switch file '%s' removed.", self.cfg.kill_switch_file)
+            except Exception as e:
+                log.warning("Could not remove kill switch file '%s': %s", self.cfg.kill_switch_file, e)
+
+        self.risk.reset_kill_switch(reset_peak=True)
+        if self.alerts:
+            self.alerts.send_alert(
+                "KILL_SWITCH_RESET",
+                "Kill Switch Deactivated",
+                "Emergency kill switch has been cleared. System returned to IDLE / ready state.",
+                level="info"
+            )
+        log.info("Emergency kill switch deactivated. Bot is ready.")
+        return True
+
     @staticmethod
     def _last_bar_ts(df):
         """Bar timestamp of the newest candle, falling back to wall-clock time."""
