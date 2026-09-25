@@ -433,6 +433,119 @@ class ExchangeClient:
         price = ticker.get("last") or ticker.get("close") or ticker.get("bid") or 0.0
         return float(price)
 
+    def amount_to_precision(self, size: float, symbol: str = None) -> float:
+        """Format an order size according to the exchange's precision and lot sizing rules.
+        Uses CCXT amount_to_precision when markets are loaded, with graceful fallback.
+        """
+        sym = symbol or self.cfg.symbol
+        try:
+            if hasattr(self.exchange, "amount_to_precision") and getattr(self.exchange, "markets", None) and sym in self.exchange.markets:
+                formatted = self.exchange.amount_to_precision(sym, size)
+                return float(formatted)
+        except Exception as e:
+            log.debug("amount_to_precision fallback for %s: %s", sym, e)
+        return float(round(size, 6))
+
+    def price_to_precision(self, price: float, symbol: str = None) -> float:
+        """Format an order price according to the exchange's price precision rules.
+        Uses CCXT price_to_precision when markets are loaded, with graceful fallback.
+        """
+        sym = symbol or self.cfg.symbol
+        try:
+            if hasattr(self.exchange, "price_to_precision") and getattr(self.exchange, "markets", None) and sym in self.exchange.markets:
+                formatted = self.exchange.price_to_precision(sym, price)
+                return float(formatted)
+        except Exception as e:
+            log.debug("price_to_precision fallback for %s: %s", sym, e)
+        return float(round(price, 2))
+
+    def fetch_wallet_balance(self, symbol: str = None) -> dict:
+        """Fetch available and total wallet balances for the trading pair's base and quote assets.
+        In paper mode or unauthenticated mode, mirrors the paper ledger.
+        """
+        sym = symbol or self.cfg.symbol
+        parts = sym.split("/") if "/" in sym else [sym, "USDT"]
+        base_curr = parts[0]
+        quote_curr = parts[1] if len(parts) > 1 else "USDT"
+
+        if self.mode == "live" and getattr(self.cfg, "api_key", None):
+            try:
+                balance = self.exchange.fetch_balance()
+                free_dict = balance.get("free") or {}
+                total_dict = balance.get("total") or {}
+
+                free_quote = float(free_dict.get(quote_curr, 0.0) or (balance.get(quote_curr, {}) or {}).get("free", 0.0) or 0.0)
+                free_base = float(free_dict.get(base_curr, 0.0) or (balance.get(base_curr, {}) or {}).get("free", 0.0) or 0.0)
+                total_quote = float(total_dict.get(quote_curr, 0.0) or (balance.get(quote_curr, {}) or {}).get("total", 0.0) or 0.0)
+                total_base = float(total_dict.get(base_curr, 0.0) or (balance.get(base_curr, {}) or {}).get("total", 0.0) or 0.0)
+
+                return {
+                    "mode": "live",
+                    "base_currency": base_curr,
+                    "quote_currency": quote_curr,
+                    "free_quote": free_quote,
+                    "free_base": free_base,
+                    "total_quote": total_quote,
+                    "total_base": total_base,
+                    "is_live": True,
+                }
+            except Exception as e:
+                log.warning("Could not fetch live wallet balance: %s", e)
+
+        # Fallback / paper trading mode
+        return {
+            "mode": "paper",
+            "base_currency": base_curr,
+            "quote_currency": quote_curr,
+            "free_quote": float(self.paper_cash),
+            "free_base": float(self.paper_position),
+            "total_quote": float(self.paper_cash),
+            "total_base": float(self.paper_position),
+            "is_live": False,
+        }
+
+    def fetch_order_book_spread(self, symbol: str = None) -> dict:
+        """Fetch top-of-book bid/ask spread and calculate percentage spread.
+        Guards against high slippage and illiquid trading pairs.
+        """
+        sym = symbol or self.cfg.symbol
+        try:
+            ob = self.exchange.fetch_order_book(sym, limit=5)
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if bids and asks:
+                bid = float(bids[0][0])
+                ask = float(asks[0][0])
+                spread = max(0.0, ask - bid)
+                mid = (bid + ask) / 2.0
+                spread_pct = (spread / ask * 100.0) if ask > 0 else 0.0
+                return {
+                    "symbol": sym,
+                    "bid": bid,
+                    "ask": ask,
+                    "spread": spread,
+                    "spread_pct": spread_pct,
+                    "mid": mid,
+                    "valid": True,
+                }
+        except Exception as e:
+            log.debug("fetch_order_book_spread failed for %s: %s", sym, e)
+
+        # Fallback to current ticker price if order book unavailable
+        try:
+            curr = self.current_price()
+        except Exception:
+            curr = 0.0
+        return {
+            "symbol": sym,
+            "bid": curr,
+            "ask": curr,
+            "spread": 0.0,
+            "spread_pct": 0.0,
+            "mid": curr,
+            "valid": False,
+        }
+
     def load_market_limits(self, symbol: str = None) -> dict:
         sym = symbol or self.cfg.symbol
         try:
@@ -457,47 +570,75 @@ class ExchangeClient:
             return self._place_live_order(side, size)
         return self._simulate_fill(side, size, ref_price)
 
+    def _notify_alert(self, event_type: str, title: str, message: str, level: str = "warning", details: dict = None):
+        try:
+            from alerts import get_alert_dispatcher
+            get_alert_dispatcher().send_alert(event_type, title, message, level=level, details=details)
+        except Exception:
+            pass
+
     # -- live --------------------------------------------------------------
     def _place_live_order(self, side: str, size: float) -> dict:
+        sym = self.cfg.symbol
+        norm_size = self.amount_to_precision(size, sym)
+        if norm_size <= 0:
+            raise ValueError(f"Normalized order size {norm_size} is <= 0 for {sym} (original size: {size})")
+
         try:
-            order = self.exchange.create_order(self.cfg.symbol, "market", side.lower(), size)
+            order = self.exchange.create_order(sym, "market", side.lower(), norm_size)
             fill_price = order.get("average") or order.get("price") or self.current_price()
+            fill_price = self.price_to_precision(fill_price, sym)
             fee = 0.0
             if order.get("fees"):
                 fee = sum(float(f.get("cost", 0) or 0) for f in order["fees"] if isinstance(f, dict))
             elif isinstance(order.get("fee"), dict):
                 fee = float(order["fee"].get("cost", 0) or 0)
-            log.info("LIVE %s order placed: id=%s price=%.2f", side, order.get("id"), fill_price)
-            return {"side": side, "size": size, "price": fill_price, "fee": fee, "mode": "live"}
+            log.info("LIVE %s order placed: id=%s price=%.2f size=%.6f", side, order.get("id"), fill_price, norm_size)
+            return {"side": side, "size": norm_size, "price": fill_price, "fee": fee, "mode": "live", "id": order.get("id")}
+        except ccxt.InsufficientFunds as e:
+            log.error("Live order rejected - Insufficient Funds on %s: %s", self.cfg.exchange_id, e)
+            self._notify_alert("INSUFFICIENT_FUNDS", f"Insufficient Funds ({sym})", str(e), level="critical",
+                               details={"symbol": sym, "side": side, "size": norm_size, "error": str(e)})
+            raise
+        except ccxt.InvalidOrder as e:
+            log.error("Live order rejected - Invalid Order on %s: %s", self.cfg.exchange_id, e)
+            self._notify_alert("INVALID_ORDER", f"Invalid Order Rejected ({sym})", str(e), level="critical",
+                               details={"symbol": sym, "side": side, "size": norm_size, "error": str(e)})
+            raise
+        except ccxt.RateLimitExceeded as e:
+            log.error("Live order rejected - Rate Limit Exceeded on %s: %s", self.cfg.exchange_id, e)
+            self._notify_alert("RATE_LIMIT", f"Rate Limit Exceeded ({self.cfg.exchange_id})", str(e), level="critical",
+                               details={"symbol": sym, "side": side, "size": norm_size, "error": str(e)})
+            raise
+        except ccxt.AuthenticationError as e:
+            log.error("Live order rejected - Authentication Error on %s: %s", self.cfg.exchange_id, e)
+            self._notify_alert("AUTH_ERROR", f"Exchange Auth Failure ({self.cfg.exchange_id})", str(e), level="critical",
+                               details={"symbol": sym, "side": side, "size": norm_size, "error": str(e)})
+            raise
         except Exception as e:
             log.exception("Live order execution failed: %s", e)
-            try:
-                from alerts import get_alert_dispatcher
-                get_alert_dispatcher().send_alert(
-                    "EXCHANGE_ERROR",
-                    f"Live Order Execution Failed ({self.cfg.symbol})",
-                    f"Order failed on {self.cfg.exchange_id}: {e}",
-                    level="critical",
-                    details={"symbol": self.cfg.symbol, "side": side, "size": size, "error": str(e)}
-                )
-            except Exception:
-                pass
+            self._notify_alert("EXCHANGE_ERROR", f"Live Order Execution Failed ({sym})",
+                               f"Order failed on {self.cfg.exchange_id}: {e}", level="critical",
+                               details={"symbol": sym, "side": side, "size": norm_size, "error": str(e)})
             raise
 
     # -- paper ---------------------------------------------------------------
     def _simulate_fill(self, side: str, size: float, ref_price: float) -> dict:
         """Fill against ref_price with the same slippage direction a real market
-        order would suffer (worse price, never better)."""
+        order would suffer (worse price, never better), respecting precision."""
+        sym = self.cfg.symbol
+        norm_size = self.amount_to_precision(size, sym)
         slip = ref_price * self.slippage_pct * (1 if side == "BUY" else -1)
-        fill_price = ref_price + slip
-        fee = fill_price * size * self.fee_pct
+        raw_fill_price = ref_price + slip
+        fill_price = self.price_to_precision(raw_fill_price, sym)
+        fee = fill_price * norm_size * self.fee_pct
 
         if side == "BUY":
-            self.paper_cash -= fill_price * size + fee
-            self.paper_position += size
+            self.paper_cash -= fill_price * norm_size + fee
+            self.paper_position += norm_size
         else:
-            self.paper_cash += fill_price * size - fee
-            self.paper_position -= size
+            self.paper_cash += fill_price * norm_size - fee
+            self.paper_position -= norm_size
 
-        log.info("PAPER %s %.6f @ %.2f (fee %.4f)", side, size, fill_price, fee)
-        return {"side": side, "size": size, "price": fill_price, "fee": fee, "mode": "paper"}
+        log.info("PAPER %s %.6f @ %.2f (fee %.4f)", side, norm_size, fill_price, fee)
+        return {"side": side, "size": norm_size, "price": fill_price, "fee": fee, "mode": "paper"}

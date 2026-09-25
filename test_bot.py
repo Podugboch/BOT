@@ -3348,3 +3348,205 @@ class TestProductionReadinessStructuralGaps:
         # API test endpoint
         res = web_server.test_alert_endpoint()
         assert res["success"] is True
+
+
+# ============================================================================
+# CCXT ENHANCEMENTS TESTS
+# ============================================================================
+class TestCCXTEnhancements:
+    def test_amount_and_price_precision(self):
+        """Precision helpers use CCXT formatting or graceful fallbacks."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+        # Fallback when markets are not loaded
+        assert client.amount_to_precision(0.123456789) == 0.123457
+        assert client.price_to_precision(50000.12345) == 50000.12
+
+        # When exchange methods are present and markets loaded
+        client.exchange.markets = {"BTC/USDT": {"precision": {"amount": 3, "price": 1}}}
+        client.exchange.amount_to_precision = mock.MagicMock(return_value="0.123")
+        client.exchange.price_to_precision = mock.MagicMock(return_value="50000.1")
+
+        assert client.amount_to_precision(0.123456, "BTC/USDT") == 0.123
+        assert client.price_to_precision(50000.123, "BTC/USDT") == 50000.1
+        client.exchange.amount_to_precision.assert_called_with("BTC/USDT", 0.123456)
+        client.exchange.price_to_precision.assert_called_with("BTC/USDT", 50000.123)
+
+    def test_fetch_wallet_balance_paper_and_live(self):
+        """Wallet balance reflects paper accounting or live CCXT fetch_balance."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1250.0)
+        client.paper_position = 0.05
+
+        # Paper mode
+        bal_paper = client.fetch_wallet_balance("BTC/USDT")
+        assert bal_paper["mode"] == "paper"
+        assert bal_paper["is_live"] is False
+        assert bal_paper["free_quote"] == 1250.0
+        assert bal_paper["free_base"] == 0.05
+        assert bal_paper["quote_currency"] == "USDT"
+        assert bal_paper["base_currency"] == "BTC"
+
+        # Live mode
+        cfg_live = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT", api_key="test_key", api_secret="test_sec")
+        client_live = ExchangeClient(cfg=cfg_live, mode="live", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+        client_live.exchange.fetch_balance = mock.MagicMock(return_value={
+            "free": {"USDT": 4500.50, "BTC": 0.25},
+            "total": {"USDT": 5000.00, "BTC": 0.25},
+        })
+
+        bal_live = client_live.fetch_wallet_balance("BTC/USDT")
+        assert bal_live["mode"] == "live"
+        assert bal_live["is_live"] is True
+        assert bal_live["free_quote"] == 4500.50
+        assert bal_live["free_base"] == 0.25
+        assert bal_live["total_quote"] == 5000.00
+
+    def test_fetch_order_book_spread(self):
+        """Order book spread extracts top-of-book and computes spread percentage."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+        # Mock order book with 0.1% spread
+        client.exchange.fetch_order_book = mock.MagicMock(return_value={
+            "bids": [[50000.0, 1.5]],
+            "asks": [[50050.0, 2.0]],
+        })
+
+        ob_data = client.fetch_order_book_spread("BTC/USDT")
+        assert ob_data["valid"] is True
+        assert ob_data["bid"] == 50000.0
+        assert ob_data["ask"] == 50050.0
+        assert ob_data["spread"] == 50.0
+        assert ob_data["mid"] == 50025.0
+        assert ob_data["spread_pct"] == pytest.approx(0.0999, rel=1e-2)
+
+        # Failure / empty fallback
+        client.exchange.fetch_order_book = mock.MagicMock(side_effect=Exception("Timeout"))
+        client.current_price = mock.MagicMock(return_value=50000.0)
+        fallback = client.fetch_order_book_spread("BTC/USDT")
+        assert fallback["valid"] is False
+        assert fallback["spread"] == 0.0
+
+    def test_sync_live_balance_updates_equity(self):
+        """sync_live_balance updates RiskManager equity in live mode."""
+        cfg = BotConfig(mode="live")
+        cfg.exchange.api_key = "live_key"
+        cfg.exchange.api_secret = "live_secret"
+
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            bot = TradingBot(cfg)
+            assert bot.risk.state.equity == 1000.0
+
+            with mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                "mode": "live",
+                "is_live": True,
+                "free_quote": 8500.0,
+                "total_quote": 9200.0,
+                "free_base": 0.1,
+                "quote_currency": "USDT",
+                "base_currency": "BTC",
+            }):
+                wallet = bot.sync_live_balance()
+                assert wallet["is_live"] is True
+                assert bot.risk.state.equity == 9200.0
+
+    def test_order_book_spread_guard_blocks_entry(self):
+        """Spread exceeding max_spread_pct suppresses BUY order entry."""
+        from strategy import Signal
+
+        cfg = BotConfig(mode="paper")
+        cfg.risk.max_spread_pct = 0.35
+        bot = TradingBot(cfg)
+
+        df = _wave_ohlcv(n=100)
+        price = 50000.0
+
+        # Mock signal to BUY with wide spread
+        with mock.patch("bot.generate_signal", return_value=Signal.BUY), \
+             mock.patch.object(bot.exchange, "fetch_order_book_spread", return_value={
+                 "valid": True,
+                 "bid": 49700.0,
+                 "ask": 50000.0,
+                 "spread": 300.0,
+                 "spread_pct": 0.60,
+                 "mid": 49850.0,
+             }), \
+             mock.patch.object(bot.exchange, "place_order") as mock_place:
+            bot._maybe_enter(df, price)
+            mock_place.assert_not_called()
+            assert bot.position is None
+
+    def test_insufficient_wallet_balance_blocks_entry(self):
+        """Insufficient free quote currency suppresses/rejects BUY order."""
+        from strategy import Signal
+
+        cfg = BotConfig(mode="live")
+        cfg.exchange.api_key = "live_key"
+
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            bot = TradingBot(cfg)
+
+            df = _wave_ohlcv(n=100)
+            price = 50000.0
+
+            with mock.patch("bot.generate_signal", return_value=Signal.BUY), \
+                 mock.patch.object(bot.exchange, "fetch_order_book_spread", return_value={"valid": True, "spread_pct": 0.05}), \
+                 mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                     "mode": "live",
+                     "is_live": True,
+                     "free_quote": 5.0,
+                     "total_quote": 5.0,
+                     "quote_currency": "USDT",
+                 }), \
+                 mock.patch.object(bot.exchange, "place_order") as mock_place:
+                bot._maybe_enter(df, price)
+                mock_place.assert_not_called()
+                assert bot.position is None
+
+            # manual_buy raises RuntimeError
+            with mock.patch.object(bot.exchange, "fetch_ohlcv", return_value=df), \
+                 mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                     "mode": "live",
+                     "is_live": True,
+                     "free_quote": 5.0,
+                     "total_quote": 5.0,
+                     "quote_currency": "USDT",
+                 }):
+                with pytest.raises(RuntimeError, match="Insufficient wallet balance"):
+                    bot.manual_buy(custom_size=0.01)
+
+    def test_typed_ccxt_exceptions_on_live_order(self):
+        """_place_live_order catches typed CCXT exceptions and sends alerts."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT", api_key="k", api_secret="s")
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            client = ExchangeClient(cfg=cfg, mode="live", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+            # InsufficientFunds
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.InsufficientFunds("Account has insufficient balance"))
+            with pytest.raises(ccxt.InsufficientFunds):
+                client._place_live_order("BUY", 0.01)
+
+            # InvalidOrder
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.InvalidOrder("Filter failure: LOT_SIZE"))
+            with pytest.raises(ccxt.InvalidOrder):
+                client._place_live_order("BUY", 0.01)
+
+            # RateLimitExceeded
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.RateLimitExceeded("Too many requests"))
+            with pytest.raises(ccxt.RateLimitExceeded):
+                client._place_live_order("BUY", 0.01)
+
+    def test_api_exchange_wallet_endpoint(self):
+        """GET /api/exchange/wallet returns wallet balances and spread info."""
+        import web_server
+
+        res = web_server.get_exchange_wallet_endpoint()
+        assert res["success"] is True
+        assert "wallet" in res
+        assert "spread" in res
+        assert "limits" in res
+        assert "max_spread_pct" in res
+        assert res["wallet"]["mode"] in ("paper", "live")
+
