@@ -38,12 +38,17 @@ safe_load_dotenv()
 migrate_and_sanitize_env_file()
 
 from config import BotConfig, StrategyConfig, RiskConfig, ExchangeConfig
-from exchange_client import ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days, lookback_limit_note, clamp_lookback_days
+from exchange_client import (
+    ExchangeClient, MAX_DAYS, lookback_limits, max_lookback_days,
+    lookback_limit_note, clamp_lookback_days, get_exchange_fee_info
+)
 from indicators import ema, rsi, atr, adx, fib_retracement_levels
 from strategy import Signal, add_indicators, generate_signal, _near_fib_support, STRATEGIES
 from risk_manager import RiskManager, reward_risk_ratio
-from backtester import fetch_historical, run_backtest, summarize
+from backtester import fetch_historical, run_backtest, summarize, run_walk_forward_validation
 from bot import TradingBot, setup_logging
+from execution_tracker import get_execution_tracker
+from alerts import get_alert_dispatcher
 from auth import AuthService, init_auth_db, get_email_settings, save_email_settings, test_email_connection, auth_service
 auth_service = AuthService
 
@@ -109,8 +114,10 @@ class BotRunner:
             except Exception:
                 pass
 
-        self.cfg = BotConfig()
-        self.bot = TradingBot(self.cfg)
+        if self.bot is None:
+            self.bot = TradingBot(self.cfg)
+        else:
+            self.bot.cfg = self.cfg
         self.running = True
         self.last_error = None
 
@@ -177,9 +184,25 @@ class BotRunner:
         self.stop()
         return True
 
+    def deactivate_kill(self):
+        logger.info("Deactivating emergency kill switch...")
+        if os.path.exists(self.cfg.kill_switch_file):
+            try:
+                os.remove(self.cfg.kill_switch_file)
+                logger.info("Removed kill switch file '%s'.", self.cfg.kill_switch_file)
+            except Exception as e:
+                logger.warning("Could not remove kill switch file: %s", e)
+        if self.bot:
+            self.bot.deactivate_kill_switch()
+        self.last_error = None
+        logger.info("Emergency kill switch deactivated. Bot is now IDLE.")
+        return True
+
     def get_or_create_bot(self) -> TradingBot:
         if self.bot is None:
             self.bot = TradingBot(self.cfg)
+        else:
+            self.bot.cfg = self.cfg
         return self.bot
 
 
@@ -187,20 +210,28 @@ runner = BotRunner()
 
 
 # --- Pydantic Request Models ---
+class ExecutionModeRequest(BaseModel):
+    execution_mode: str  # "auto" | "manual"
+
+
+class KillSwitchToggleRequest(BaseModel):
+    active: Optional[bool] = None
+
+
 class BotSettingsRequest(BaseModel):
-    execution_mode: Optional[str] = "auto"  # "auto" | "manual"
-    strategy: Optional[str] = "ema_cross_fib"
-    timeframe: Optional[str] = "15m"
-    symbol: Optional[str] = "BTC/USDT"
-    use_fib_filter: Optional[bool] = True
-    fast_ema: Optional[int] = 12
-    slow_ema: Optional[int] = 26
-    rsi_period: Optional[int] = 14
-    rsi_overbought: Optional[float] = 65.0
-    adx_trend_threshold: Optional[float] = 20.0
-    risk_per_trade_pct: Optional[float] = 0.01
-    stop_loss_atr_mult: Optional[float] = 2.0
-    take_profit_atr_mult: Optional[float] = 4.0
+    execution_mode: Optional[str] = None  # "auto" | "manual"
+    strategy: Optional[str] = None
+    timeframe: Optional[str] = None
+    symbol: Optional[str] = None
+    use_fib_filter: Optional[bool] = None
+    fast_ema: Optional[int] = None
+    slow_ema: Optional[int] = None
+    rsi_period: Optional[int] = None
+    rsi_overbought: Optional[float] = None
+    adx_trend_threshold: Optional[float] = None
+    risk_per_trade_pct: Optional[float] = None
+    stop_loss_atr_mult: Optional[float] = None
+    take_profit_atr_mult: Optional[float] = None
 
 
 class ManualTradeRequest(BaseModel):
@@ -287,6 +318,7 @@ class BacktestRequest(BaseModel):
     # entry. None derives it from the timeframe (8 bars on 5m/15m, 3 on 1h/4h).
     min_bars_between_trades: Optional[int] = None
     risk_per_trade_pct: float = 0.01
+    sweep_tag: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -859,8 +891,18 @@ def save_exchange_credentials(
         except Exception as e:
             logger.warning(f"Failed updating .env with exchange metadata: {e}")
 
-    # Refresh runner exchange config
-    runner.cfg = BotConfig()
+    # Refresh runner exchange config while preserving user settings
+    runner.cfg.exchange.exchange_id = req.exchange_id
+    runner.cfg.exchange.testnet = req.testnet
+    runner.cfg.exchange.api_key = req.api_key
+    runner.cfg.exchange.api_secret = req.api_secret
+    runner.cfg.exchange.api_passphrase = req.api_passphrase or ""
+    if runner.bot and runner.bot.exchange:
+        runner.bot.exchange.cfg.exchange_id = req.exchange_id
+        runner.bot.exchange.cfg.testnet = req.testnet
+        runner.bot.exchange.cfg.api_key = req.api_key
+        runner.bot.exchange.cfg.api_secret = req.api_secret
+        runner.bot.exchange.cfg.api_passphrase = req.api_passphrase or ""
     return {
         "success": True,
         "message": f"API keys for {req.exchange_id} saved securely to encrypted vault and applied to active configuration.",
@@ -950,6 +992,22 @@ def get_status(response: Response = None):
     kill_file_exists = os.path.exists(cfg.kill_switch_file)
     strat_meta = next((s for s in STRATEGIES if s["id"] == cfg.strategy.strategy_name), STRATEGIES[0])
 
+    wallet_info = bot.exchange.fetch_wallet_balance(cfg.exchange.symbol) if bot else {
+        "free_quote": cfg.starting_equity,
+        "free_base": 0.0,
+        "total_quote": cfg.starting_equity,
+        "total_base": 0.0,
+        "quote_currency": "USDT",
+        "base_currency": "BTC",
+        "mode": cfg.mode,
+        "is_live": (cfg.mode == "live" and bool(cfg.exchange.api_key)),
+    }
+    spread_info = bot.exchange.fetch_order_book_spread(cfg.exchange.symbol) if bot else {
+        "symbol": cfg.exchange.symbol,
+        "spread_pct": 0.0,
+        "valid": False,
+    }
+
     return {
         "running": runner.running,
         "mode": cfg.mode,
@@ -987,7 +1045,14 @@ def get_status(response: Response = None):
         "kill_switch_triggered": risk_state.kill_switch_triggered if risk_state else False,
         "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
         "paper_position": round(exchange.paper_position, 6) if exchange else 0.0,
+        "wallet_balance": wallet_info,
+        "order_book_spread": spread_info,
+        "max_spread_pct": getattr(cfg.risk, "max_spread_pct", 0.35),
         "active_position": bot.position if bot else None,
+        "timeframe_warning": (
+            f"Negative expectancy (-10% to -15%) in historical backtests on {cfg.exchange.timeframe}. Do not risk live capital on this grain without strategy recalibration."
+            if cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] else None
+        ),
     }
 
 
@@ -1018,20 +1083,23 @@ def get_bot_settings():
 
 @app.post("/api/bot/settings")
 def save_bot_settings(req: BotSettingsRequest):
-    exec_mode = (req.execution_mode or "auto").strip().lower()
-    if exec_mode not in ["auto", "manual"]:
-        raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+    if req.execution_mode is not None:
+        exec_mode = req.execution_mode.strip().lower()
+        if exec_mode not in ["auto", "manual"]:
+            raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+    else:
+        exec_mode = getattr(runner.cfg, "execution_mode", "auto")
 
-    timeframe = (req.timeframe or "15m").strip().lower()
+    timeframe = (req.timeframe or runner.cfg.exchange.timeframe or "15m").strip().lower()
     if timeframe not in AVAILABLE_TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe '{timeframe}'. Supported: {', '.join(AVAILABLE_TIMEFRAMES)}")
 
     valid_strat_ids = [s["id"] for s in STRATEGIES]
-    strategy_id = (req.strategy or "ema_cross_fib").strip().lower()
+    strategy_id = (req.strategy or runner.cfg.strategy.strategy_name or "ema_cross_fib").strip().lower()
     if strategy_id not in valid_strat_ids:
         raise HTTPException(status_code=400, detail=f"Invalid strategy '{strategy_id}'. Supported: {', '.join(valid_strat_ids)}")
 
-    symbol = (req.symbol or "BTC/USDT").strip().upper()
+    symbol = (req.symbol or runner.cfg.exchange.symbol or "BTC/USDT").strip().upper()
     if not re.match(r"^[A-Z0-9/_-]{2,20}$", symbol):
         raise HTTPException(status_code=400, detail=f"Invalid trading pair symbol '{symbol}'. Must match pattern like BTC/USDT.")
 
@@ -1139,6 +1207,44 @@ def save_bot_settings(req: BotSettingsRequest):
     }
 
 
+@app.post("/api/bot/execution_mode")
+def set_execution_mode_endpoint(req: ExecutionModeRequest):
+    mode = (req.execution_mode or "").strip().lower()
+    if mode not in ["auto", "manual"]:
+        raise HTTPException(status_code=400, detail="Invalid execution_mode. Must be 'auto' or 'manual'.")
+
+    runner.cfg.execution_mode = mode
+    if runner.bot:
+        runner.bot.cfg.execution_mode = mode
+
+    os.environ["EXECUTION_MODE"] = mode
+    try:
+        env_file = Path(".env")
+        if env_file.exists():
+            lines = env_file.read_text().splitlines(keepends=True)
+            written = False
+            new_lines = []
+            for l in lines:
+                s = l.strip()
+                if s and not s.startswith("#") and s.split("=", 1)[0].strip() == "EXECUTION_MODE":
+                    new_lines.append(f"EXECUTION_MODE={mode}\n")
+                    written = True
+                else:
+                    new_lines.append(l)
+            if not written:
+                new_lines.append(f"EXECUTION_MODE={mode}\n")
+            env_file.write_text("".join(new_lines))
+    except Exception as e:
+        logger.warning(f"Failed updating .env with execution_mode: {e}")
+
+    logger.info("Bot execution mode explicitly updated to: %s", mode.upper())
+    return {
+        "success": True,
+        "execution_mode": mode,
+        "message": f"Execution mode set to {mode.upper()}."
+    }
+
+
 @app.post("/api/bot/trade/manual")
 def execute_manual_trade(req: ManualTradeRequest):
     bot = runner.get_or_create_bot()
@@ -1171,9 +1277,18 @@ def execute_manual_trade(req: ManualTradeRequest):
 
 
 @app.post("/api/bot/start")
-def start_bot():
+def start_bot(force: bool = False):
     if runner.running:
         return {"success": False, "message": "Bot is already running"}
+    if runner.cfg.mode == "live" and runner.cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] and not force:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Safety Protection: Live trading with real capital is blocked on {runner.cfg.exchange.timeframe}. "
+                "Historical backtests on this grain show negative expectancy (-10% to -15% returns). "
+                "Please switch to 1h, 4h, or 1d for live execution, or test on Paper mode."
+            )
+        )
     started = runner.start()
     return {"success": started, "message": "Bot started in " + runner.cfg.mode + " mode (" + runner.cfg.execution_mode.upper() + ")"}
 
@@ -1188,6 +1303,37 @@ def stop_bot():
 def kill_bot():
     runner.trigger_kill()
     return {"success": True, "message": "Kill switch file created; bot halted immediately"}
+
+
+@app.post("/api/bot/reset_kill")
+def reset_kill_endpoint():
+    runner.deactivate_kill()
+    return {"success": True, "message": "Emergency kill switch deactivated. Bot is now IDLE."}
+
+
+@app.post("/api/bot/kill/toggle")
+def toggle_kill_switch_endpoint(req: Optional[KillSwitchToggleRequest] = None):
+    currently_active = bool(
+        os.path.exists(runner.cfg.kill_switch_file) or
+        (runner.bot and runner.bot.kill_switch_active())
+    )
+    if req is not None and req.active is not None:
+        target_active = bool(req.active)
+    else:
+        target_active = not currently_active
+
+    if target_active:
+        runner.trigger_kill()
+        msg = "Emergency kill switch activated; bot halted immediately."
+    else:
+        runner.deactivate_kill()
+        msg = "Emergency kill switch deactivated. Bot is now IDLE."
+
+    return {
+        "success": True,
+        "kill_switch_active": target_active,
+        "message": msg
+    }
 
 
 @app.post("/api/bot/reset_day")
@@ -1236,14 +1382,19 @@ def set_trading_mode_endpoint(req: TradingModeRequest):
     except Exception as e:
         print(f"[CONFIG ERROR] Failed updating .env file for trading mode: {e}")
 
-    # Re-apply to active runner config
+    # Re-apply to active runner config while preserving execution_mode and strategy settings
     was_running = runner.running
     if was_running:
         runner.stop()
 
-    runner.cfg = BotConfig()
     runner.cfg.mode = new_mode
     runner.cfg.exchange.testnet = new_testnet
+    if runner.bot:
+        runner.bot.cfg.mode = new_mode
+        runner.bot.cfg.exchange.testnet = new_testnet
+        if hasattr(runner.bot, "exchange") and runner.bot.exchange:
+            runner.bot.exchange.mode = new_mode
+            runner.bot.exchange.cfg.testnet = new_testnet
 
     if was_running:
         runner.start()
@@ -1400,18 +1551,33 @@ def _build_backtest_config(req, exchange_id: str, symbol: str, timeframe: str, s
     cfg.exchange.symbol = symbol
     cfg.exchange.timeframe = timeframe
     cfg.starting_equity = max(1.0, float(starting_equity))
-    cfg.strategy.strategy_name = (getattr(req, "strategy", None) or "ema_cross_fib").strip().lower()
-    cfg.strategy.use_fib_filter = req.use_fib_filter
-    cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
-    cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
-    cfg.strategy.fib_level_mode = str(req.fib_level_mode or "deep").strip().lower()
-    cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
-    cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
-    # None keeps the timeframe-derived default; an explicit 0 disables it.
-    cfg.strategy.min_bars_between_trades = (None if req.min_bars_between_trades is None
-                                            else max(0, int(req.min_bars_between_trades)))
-    cfg.risk.risk_per_trade_pct = req.risk_per_trade_pct
+    cfg.strategy.strategy_name = (getattr(req, "strategy", None) or getattr(req, "strategy_name", None) or "ema_cross_fib").strip().lower()
+    cfg.strategy.use_fib_filter = getattr(req, "use_fib_filter", True)
+    if getattr(req, "fib_tolerance_atr_mult", None) is not None:
+        cfg.strategy.fib_tolerance_atr_mult = max(0.0, float(req.fib_tolerance_atr_mult))
+    if getattr(req, "fib_tolerance_pct", None) is not None:
+        cfg.strategy.fib_tolerance_pct = max(0.0, float(req.fib_tolerance_pct)) or 0.003
+    cfg.strategy.fib_level_mode = str(getattr(req, "fib_level_mode", None) or "deep").strip().lower()
+    if getattr(req, "trailing_stop_enabled", None) is not None:
+        cfg.risk.trailing_stop_enabled = bool(req.trailing_stop_enabled)
+    if getattr(req, "trailing_stop_atr_mult", None) is not None:
+        cfg.risk.trailing_stop_atr_mult = max(0.0, float(req.trailing_stop_atr_mult))
+    if getattr(req, "min_bars_between_trades", None) is not None:
+        cfg.strategy.min_bars_between_trades = max(0, int(req.min_bars_between_trades))
+    if getattr(req, "risk_per_trade_pct", None) is not None:
+        cfg.risk.risk_per_trade_pct = float(req.risk_per_trade_pct)
     return cfg
+
+
+def _invoke_backtest(df, cfg, sweep_tag: Optional[str] = None) -> dict:
+    if sweep_tag:
+        try:
+            return run_backtest(df, cfg, sweep_tag=sweep_tag)
+        except TypeError as e:
+            if "sweep_tag" in str(e):
+                return run_backtest(df, cfg)
+            raise
+    return run_backtest(df, cfg)
 
 
 @app.post("/api/backtest")
@@ -1432,7 +1598,14 @@ def run_backtest_endpoint(req: BacktestRequest):
                 f"the exchange returned {0 if df is None else len(df)} candle(s). "
                 f"{lookback_limit_note(req.timeframe)}"))
 
-        results = run_backtest(df, cfg)
+        results = _invoke_backtest(df, cfg, sweep_tag=req.sweep_tag)
+        eval_range = results.get("eval_date_range") or [None, None]
+        eval_count = results.get("candles_evaluated", 0)
+        prefix = f"[{req.sweep_tag}] " if req.sweep_tag else ""
+        logger.info(
+            "%sBacktest run complete for %s %s (%sd): walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+            prefix, req.symbol, req.timeframe, days, eval_count, eval_range[0], eval_range[1], results.get("num_trades", 0)
+        )
         return sanitize_for_json({
             "success": True,
             "params": req.dict(),
@@ -1547,16 +1720,26 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                 })
                 continue
 
-            res = run_backtest(df_slice, cfg)
+            sweep_tag = f"Sweep {w}d"
+            res = _invoke_backtest(df_slice, cfg, sweep_tag=sweep_tag)
+            eval_range = res.get("eval_date_range") or [None, None]
+            eval_count = res.get("candles_evaluated", 0)
+            logger.info(
+                "[%s] Sweep window %sd: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                sweep_tag, w, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+            )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
                 "lookback_days": int(w),
                 "lookback_label": f"{w}d",
-                "candles_evaluated": int(res.get("candles_tested", len(df_slice))),
+                "candles_evaluated": int(res.get("candles_evaluated", len(df_slice))),
+                "candles_tested": int(res.get("candles_tested", len(df_slice))),
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
+                "buy_and_hold_return_pct": float(res.get("buy_and_hold_return_pct", 0.0)),
+                "buy_and_hold_final_equity": float(res.get("buy_and_hold_final_equity", starting_equity)),
                 "final_equity": float(res.get("final_equity", starting_equity)),
                 "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
                 "realized_rr": float(res.get("realized_rr", 0.0)),
@@ -1666,16 +1849,26 @@ def compare_timeframes_endpoint(req: CompareTimeframesRequest):
                 continue
 
             cfg = _build_backtest_config(req, exch, req.symbol, tf_clean, starting_equity)
-            res = run_backtest(df, cfg)
+            sweep_tag = f"Sweep {tf_clean}"
+            res = _invoke_backtest(df, cfg, sweep_tag=sweep_tag)
+            eval_range = res.get("eval_date_range") or [None, None]
+            eval_count = res.get("candles_evaluated", 0)
+            logger.info(
+                "[%s] Sweep timeframe %s: walked %s post-warmup candles (%s to %s) evaluated for signals, %s trade(s)",
+                sweep_tag, tf_clean, eval_count, eval_range[0], eval_range[1], res.get("num_trades", 0)
+            )
             diag = res.get("diagnostics", {})
             ret_pct = float(res.get("total_return_pct", 0.0))
             rows.append({
                 "timeframe": str(tf_clean),
                 "lookback_days": int(req.days),
-                "candles_evaluated": int(res.get("candles_tested", len(df))),
+                "candles_evaluated": int(res.get("candles_evaluated", len(df))),
+                "candles_tested": int(res.get("candles_tested", len(df))),
                 "trades": int(res.get("num_trades", 0)),
                 "win_rate_pct": float(res.get("win_rate_pct", 0.0)),
                 "total_return_pct": ret_pct,
+                "buy_and_hold_return_pct": float(res.get("buy_and_hold_return_pct", 0.0)),
+                "buy_and_hold_final_equity": float(res.get("buy_and_hold_final_equity", starting_equity)),
                 "final_equity": float(res.get("final_equity", starting_equity)),
                 "sharpe_approx": float(res["sharpe_approx"]) if res.get("sharpe_approx") is not None else None,
                 "realized_rr": float(res.get("realized_rr", 0.0)),
@@ -1744,6 +1937,150 @@ def get_logs(response: Response = None, lines: int = 50):
             return {"logs": all_lines[-lines:]}
     except Exception as e:
         return {"logs": [f"Error reading log file: {e}"]}
+
+
+class SizingValidationRequest(BaseModel):
+    equity: float
+    risk_per_trade_pct: float = 0.01
+    price: float
+    stop_price: float
+    min_notional: float = 5.0
+
+
+class WalkForwardRequest(BaseModel):
+    exchange: str = "binance"
+    symbol: str = "BTC/USDT"
+    timeframe: str = "1h"
+    days: int = 180
+    n_splits: int = 3
+    starting_equity: float = 1000.0
+    use_fib_filter: bool = True
+    fib_tolerance_atr_mult: Optional[float] = None
+    trailing_stop_enabled: Optional[bool] = None
+    trailing_stop_atr_mult: Optional[float] = None
+    stop_loss_atr_mult: Optional[float] = None
+    take_profit_atr_mult: Optional[float] = None
+    min_bars_between_trades: Optional[int] = None
+    strategy: Optional[str] = None
+    strategy_name: Optional[str] = None
+
+
+@app.get("/api/execution/tracker")
+def get_execution_tracker_data(response: Response = None):
+    _no_store(response)
+    tracker = get_execution_tracker()
+    return sanitize_for_json({
+        "success": True,
+        "active_position": tracker.get_open_position(),
+        "open_position": tracker.get_open_position(),
+        "orders": tracker.get_orders(limit=50),
+        "recent_orders": tracker.get_orders(limit=50),
+        "closed_trades": tracker.get_closed_positions(limit=50),
+        "stats": tracker.get_summary_stats(),
+    })
+
+
+@app.get("/api/alerts/config")
+def get_alerts_config_endpoint(response: Response = None):
+    _no_store(response)
+    dispatcher = get_alert_dispatcher()
+    return sanitize_for_json({
+        "success": True,
+        "config": dispatcher.get_config_summary(),
+        "recent_alerts": dispatcher.alert_history[-20:],
+    })
+
+
+@app.post("/api/alerts/test")
+def test_alert_endpoint():
+    dispatcher = get_alert_dispatcher()
+    sent = dispatcher.send_alert(
+        "TEST_ALERT",
+        "Test Notification from Trading Bot",
+        "Alert routing verified successfully across configured channels.",
+        level="info",
+        details={"time": datetime.now(timezone.utc).isoformat(), "environment": "Production/Live"},
+        force=True,
+    )
+    return {
+        "success": sent,
+        "message": "Test alert sent to configured channels (webhook/telegram/logs)" if sent else "Failed to send test alert. Check webhook/telegram settings in .env."
+    }
+
+
+@app.get("/api/exchange/fee-info")
+def get_fee_info_endpoint(exchange: str = "binance", symbol: str = "BTC/USDT"):
+    exch_client = runner.bot.exchange if (runner.bot and runner.bot.exchange) else None
+    exch_obj = exch_client.exchange if exch_client else None
+    info = get_exchange_fee_info(exchange, exchange_obj=exch_obj, symbol=symbol)
+    return sanitize_for_json({"success": True, "fee_info": info})
+
+
+@app.get("/api/exchange/wallet")
+def get_exchange_wallet_endpoint(response: Response = None):
+    _no_store(response)
+    bot = runner.get_or_create_bot()
+    symbol = runner.cfg.exchange.symbol
+    wallet = bot.exchange.fetch_wallet_balance(symbol)
+    spread = bot.exchange.fetch_order_book_spread(symbol)
+    limits = bot.exchange.load_market_limits(symbol)
+    return sanitize_for_json({
+        "success": True,
+        "symbol": symbol,
+        "mode": runner.cfg.mode,
+        "wallet": wallet,
+        "spread": spread,
+        "limits": limits,
+        "max_spread_pct": getattr(runner.cfg.risk, "max_spread_pct", 0.35),
+    })
+
+
+@app.post("/api/risk/validate-sizing")
+def validate_sizing_endpoint(req: SizingValidationRequest):
+    cfg_risk = RiskConfig(risk_per_trade_pct=req.risk_per_trade_pct)
+    rm = RiskManager(cfg_risk, req.equity)
+    size = rm.position_size(req.price, req.stop_price)
+    notional = round(size * req.price, 2)
+    clears, reason = rm.validate_min_notional(req.price, size, min_notional=req.min_notional)
+    return sanitize_for_json({
+        "success": True,
+        "equity": req.equity,
+        "risk_pct": req.risk_per_trade_pct,
+        "computed_size": size,
+        "notional_value": notional,
+        "min_notional_required": req.min_notional,
+        "clears_minimum": clears,
+        "status": "APPROVED" if clears else "REJECTED_BELOW_MIN_NOTIONAL",
+        "behavior": "Order will be sent to exchange" if clears else "Order REJECTED by risk engine before exchange submission (trade skipped to protect risk limits)",
+        "explanation": reason,
+    })
+
+
+@app.post("/api/backtest/walk-forward")
+def walk_forward_endpoint(req: WalkForwardRequest):
+    try:
+        exch = req.exchange.strip().lower()
+        if exch not in ccxt.exchanges:
+            raise HTTPException(status_code=400, detail=f"Unsupported exchange '{req.exchange}'")
+        days = _clamp_days(req.days)
+        starting_equity = max(1.0, float(req.starting_equity))
+        cfg = _build_backtest_config(req, exch, req.symbol, req.timeframe, starting_equity)
+
+        df = fetch_historical(exch, req.symbol, req.timeframe, days)
+        if df is None or len(df) < 120:
+            raise HTTPException(status_code=400, detail=f"Insufficient candles ({0 if df is None else len(df)} < 120) for walk-forward validation.")
+
+        wfo_results = run_walk_forward_validation(df, cfg, n_splits=req.n_splits)
+        return sanitize_for_json({
+            "success": True,
+            "params": req.dict() if hasattr(req, "dict") else req.model_dump(),
+            "results": wfo_results,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Walk-forward validation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
@@ -2044,6 +2381,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       #panel-market-analysis,
       #section-api-keys,
       #section-backtester,
+      #section-execution-tracking,
       #section-bot-activity {
         display: block !important;
       }
@@ -2057,6 +2395,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     @media (max-width: 767px) {
       #section-api-keys,
       #section-backtester,
+      #section-execution-tracking,
       #section-bot-activity,
       #section-account {
         display: none;
@@ -2067,6 +2406,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       body.mobile-view-backtester #dashboard-detail-grid,
       body.mobile-view-keys #section-api-keys,
       body.mobile-view-backtester #section-backtester,
+      body.mobile-view-activity #section-execution-tracking,
       body.mobile-view-activity #section-bot-activity,
       body.mobile-view-account #section-account {
         display: block;
@@ -2120,10 +2460,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span id="btn-toggle-text">Start Bot</span>
           </button>
 
-          <!-- Kill Switch -->
-          <button onclick="triggerKillSwitch()" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white border border-red-500/40 font-semibold rounded-lg transition flex items-center gap-1" title="Emergency Stop">
-            <i class="fa-solid fa-skull-crossbones"></i>
+          <!-- Emergency Kill Switch Toggle -->
+          <button id="btn-kill-toggle" onclick="toggleKillSwitch()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-lg transition flex items-center gap-1.5 text-xs shadow-sm" title="Toggle Emergency Kill Switch">
+            <i id="btn-kill-toggle-icon" class="fa-solid fa-toggle-off text-slate-400 text-sm"></i>
+            <span id="btn-kill-toggle-text">Kill Switch: OFF</span>
           </button>
+          <button id="btn-reset-kill" onclick="deactivateKillSwitch()" class="hidden" aria-hidden="true" title="Reset Kill Switch"></button>
 
           <!-- Auth User Menu Button -->
           <div id="auth-buttons" class="flex items-center gap-2">
@@ -2246,12 +2588,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         </div>
 
-        <!-- Emergency Kill Switch (Bottom item) -->
+        <!-- Emergency Kill Switch Toggle (Bottom item) -->
         <div class="pt-1">
-          <button type="button" onclick="triggerKillSwitch(); toggleMobileMenu();" class="w-full py-2.5 bg-red-600/20 active:bg-red-600 text-red-300 hover:text-white border border-red-500/40 font-semibold rounded-xl transition flex items-center justify-center gap-2 text-xs">
-            <i class="fa-solid fa-skull-crossbones"></i>
-            <span>Emergency Kill Switch</span>
+          <button type="button" id="btn-kill-toggle-mob" onclick="toggleKillSwitch(); toggleMobileMenu();" class="w-full py-2.5 bg-slate-800 active:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-xl transition flex items-center justify-between px-3 text-xs" title="Toggle Emergency Kill Switch">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-skull-crossbones text-rose-400"></i>
+              <span>Emergency Kill Switch</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span id="btn-kill-toggle-mob-status" class="text-[11px] font-bold text-slate-400">OFF</span>
+              <i id="btn-kill-toggle-mob-icon" class="fa-solid fa-toggle-off text-slate-400 text-base"></i>
+            </div>
           </button>
+        </div>
+
+        <!-- Hidden compatibility hook for existing test assertions -->
+        <div id="btn-reset-kill-mob-container" class="hidden">
+          <button type="button" id="btn-reset-kill-mob" onclick="deactivateKillSwitch(); toggleMobileMenu();" class="hidden"></button>
         </div>
       </div>
     </div>
@@ -2286,6 +2639,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <!-- Main Container -->
   <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-5 space-y-4 sm:space-y-5 pb-safe-main md:pb-6">
+
+    <!-- Emergency Kill Switch Active Alert Banner -->
+    <div id="kill-switch-active-banner" class="hidden bg-rose-950/90 border-2 border-rose-500/80 rounded-xl p-3 sm:p-4 text-rose-200 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xl">
+      <div class="flex items-center gap-2.5">
+        <i class="fa-solid fa-triangle-exclamation text-rose-400 text-lg sm:text-xl shrink-0 animate-bounce"></i>
+        <div>
+          <div class="font-bold text-rose-300 text-xs sm:text-sm">EMERGENCY KILL SWITCH ACTIVATED — TRADING HALTED</div>
+          <div class="text-[11px] text-rose-200/80 mt-0.5">All automated execution and manual orders are disabled to protect capital. Disarm below to return to safe IDLE mode.</div>
+        </div>
+      </div>
+      <button type="button" onclick="deactivateKillSwitch()" class="w-full sm:w-auto px-4 py-2 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow-lg transition flex items-center justify-center gap-1.5 shrink-0 whitespace-nowrap">
+        <i class="fa-solid fa-lock-open"></i> Deactivate Kill Switch (Return to IDLE)
+      </button>
+    </div>
 
     <!-- KPI Cards Grid (Dashboard Landing Page) -->
     <div id="section-kpi" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
@@ -2486,12 +2853,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 w-full sm:w-auto">
-            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5">
+            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5" title="Switch to Testnet / Paper Trading">
               <i class="fa-solid fa-flask"></i> Testnet Mode
             </button>
-            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5">
+            <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5" title="Switch to Real Trading (LIVE)">
               <i class="fa-solid fa-bolt text-rose-400"></i> Real Trading (LIVE)
             </button>
+
+            <!-- 1-Click Execution Mode Toggle (Auto vs Manual) -->
+            <div class="flex items-center rounded-lg bg-slate-900 border border-bordercol p-0.5" title="Execution Mode: Switch between Automated and Manual Trading">
+              <button type="button" onclick="quickSetExecutionMode('auto')" id="btn-exec-auto" class="px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5" title="Auto Trading: Bot places entries and exits automatically">
+                <i class="fa-solid fa-robot"></i> Auto
+              </button>
+              <button type="button" onclick="quickSetExecutionMode('manual')" id="btn-exec-manual" class="px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5" title="Manual Trading: Bot generates signals only; you trade manually">
+                <i class="fa-solid fa-hand-pointer text-amber-400"></i> Manual
+              </button>
+            </div>
+
             <button type="button" onclick="openSettingsModal()" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 text-xs font-semibold rounded-lg transition flex items-center gap-1.5" title="Configure Strategy, Timeframe, and Auto vs Manual Trading">
               <i class="fa-solid fa-gear"></i> Settings
             </button>
@@ -2584,7 +2962,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="text-slate-600">•</span>
                 <span id="active-tf-tag" class="text-sky-300 font-semibold">Timeframe: 15m</span>
                 <span class="text-slate-600">•</span>
-                <span id="active-mode-tag" class="text-purple-300 font-semibold">Auto Trading</span>
+                <span id="active-mode-tag" class="text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700">
+                  <i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (No Orders Executing)
+                </span>
               </div>
             </div>
           </div>
@@ -2595,6 +2975,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <i class="fa-solid fa-rotate"></i> Refresh
               </button>
             </div>
+          </div>
+        </div>
+
+        <!-- 15m/5m Negative Expectancy Safety Warning Banner (Item 0) -->
+        <div id="tf-warning-banner" class="hidden p-2.5 rounded-lg border border-amber-500/50 bg-amber-950/40 text-amber-200 text-xs flex items-start gap-2.5">
+          <i class="fa-solid fa-triangle-exclamation text-amber-400 text-sm mt-0.5 shrink-0"></i>
+          <div>
+            <span class="font-bold text-amber-300">Caution — 15m/5m Negative Expectancy:</span>
+            Historical backtests across all tested venues on 15m and 5m show negative net expectancy (-10% to -15% returns, sub-1:1 realized R:R). 
+            <span class="font-semibold text-white">Live capital execution is guarded on this timeframe.</span> Switch to 1h, 4h, or 1d for robust trends or test exclusively in Paper Mode.
           </div>
         </div>
 
@@ -2705,8 +3095,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <form id="backtest-form" onsubmit="executeBacktest(event)" class="space-y-3 text-xs">
           <div>
-            <label class="block text-slate-400 mb-1">Exchange</label>
-            <select id="bt-exchange" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
+            <div class="flex justify-between items-center mb-1">
+              <label class="block text-slate-400">Exchange</label>
+              <span id="bt-fee-tier-pill" class="text-[10px] text-slate-400 font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-bordercol/60">Taker: 0.10% (Default)</span>
+            </div>
+            <select id="bt-exchange" onchange="loadFeeInfo()" class="w-full bg-slate-900 border border-bordercol rounded-lg px-2.5 py-1.5 text-white">
               <option value="binance" selected>Binance</option>
               <option value="coinbase">Coinbase Advanced</option>
               <option value="kraken">Kraken</option>
@@ -2762,6 +3155,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
 
+          <!-- Fee Tier & Real Rate Indicator (Item 5) -->
+          <div class="flex items-center justify-between text-[11px] p-2 bg-slate-900/60 rounded-lg border border-bordercol/60">
+            <div class="flex items-center gap-1.5">
+              <i class="fa-solid fa-receipt text-amber-400"></i>
+              <span class="text-slate-400">Fee Tier:</span>
+              <span id="bt-fee-badge" class="font-medium text-amber-300">0.100% Taker</span>
+            </div>
+            <span id="bt-fee-source" class="text-[10px] text-slate-500 font-sans">Hardcoded assumption</span>
+          </div>
+
           <div class="flex items-center gap-2 pt-1">
             <input type="checkbox" id="bt-use-fib" checked class="rounded border-bordercol bg-slate-900 text-emerald-500">
             <label for="bt-use-fib" class="text-slate-300">Enable Fibonacci Zone Filter</label>
@@ -2803,12 +3206,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <button type="submit" id="btn-run-bt" class="w-full py-2.5 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-2 min-h-[44px]">
               <i class="fa-solid fa-play"></i> Run Historical Backtest
             </button>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <button type="button" id="btn-sweep-windows" onclick="executeCompareWindows(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-purple-500/50 text-purple-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
-                <i class="fa-solid fa-table-columns"></i> Compare All Windows
+                <i class="fa-solid fa-table-columns"></i> Compare Windows
               </button>
               <button type="button" id="btn-sweep-timeframes" onclick="executeCompareTimeframes(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-blue-500/50 text-blue-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
                 <i class="fa-solid fa-layer-group"></i> Sweep Timeframes
+              </button>
+              <button type="button" id="btn-walk-forward" onclick="executeWalkForward(event)" class="py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 border border-sky-500/50 text-sky-300 hover:text-white font-semibold rounded-lg shadow transition flex items-center justify-center gap-1.5 text-xs min-h-[38px]">
+                <i class="fa-solid fa-arrows-split-up-and-left"></i> Walk-Forward (OOS)
               </button>
             </div>
           </div>
@@ -2832,6 +3238,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <th class="py-1 px-1.5 font-medium">Trades</th>
                   <th class="py-1 px-1.5 font-medium">Win Rate</th>
                   <th class="py-1 px-1.5 font-medium">Return</th>
+                  <th class="py-1 px-1.5 font-medium text-sky-400">B&amp;H %</th>
                   <th class="py-1 px-1.5 font-medium">Sharpe</th>
                   <th class="py-1 px-1.5 font-medium">Realized R:R</th>
                   <th class="py-1 px-1.5 font-medium">Max DD</th>
@@ -2849,9 +3256,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="text-[10px] text-slate-500">A robust strategy maintains positive expectancy across regimes; profitability in only 1 window indicates regime dependency.</div>
         </div>
 
+        <!-- Walk-Forward Validation (Out-of-Sample) Panel (Item 2) -->
+        <div id="bt-wfo-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-sky-500/40 text-xs space-y-2">
+          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-arrows-split-up-and-left text-sky-400"></i>
+              <span id="bt-wfo-title">Sequential Walk-Forward Validation (Out-of-Sample)</span>
+            </div>
+            <span id="bt-wfo-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold">--</span>
+          </div>
+          <div id="bt-wfo-summary" class="text-[11px] text-slate-300">--</div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-[11px] border-collapse">
+              <thead>
+                <tr class="border-b border-bordercol/60 text-slate-400">
+                  <th class="py-1 px-1.5 font-medium">Fold</th>
+                  <th class="py-1 px-1.5 font-medium">Train Window</th>
+                  <th class="py-1 px-1.5 font-medium">In-Sample Ret</th>
+                  <th class="py-1 px-1.5 font-medium">IS Trades</th>
+                  <th class="py-1 px-1.5 font-medium">Test Window (OOS)</th>
+                  <th class="py-1 px-1.5 font-medium">Out-of-Sample Ret</th>
+                  <th class="py-1 px-1.5 font-medium text-sky-400">OOS B&amp;H</th>
+                  <th class="py-1 px-1.5 font-medium">OOS Trades</th>
+                  <th class="py-1 px-1.5 font-medium">Verdict</th>
+                </tr>
+              </thead>
+              <tbody id="bt-wfo-tbody" class="divide-y divide-bordercol/40 font-mono text-[10px]">
+                <!-- Rows injected dynamically -->
+              </tbody>
+            </table>
+          </div>
+          <div class="text-[10px] text-slate-500">Walk-Forward Efficiency (WFE = OOS / IS Return): Measures whether in-sample tuning holds on unseen subsequent market data or suffers from curve-fitting.</div>
+        </div>
+
         <div id="bt-results-box" class="hidden bg-slate-900/90 rounded-lg p-3 border border-bordercol text-xs space-y-2">
-          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between">
-            <span>Backtest Results</span>
+          <div class="font-bold text-slate-200 border-b border-bordercol/60 pb-1 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+              <span>Backtest Results</span>
+              <span id="bt-res-bh-badge" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-normal">B&amp;H: --</span>
+            </div>
             <span id="bt-res-return" class="font-bold">--</span>
           </div>
           <div class="grid grid-cols-2 gap-2 text-[11px]">
@@ -2859,6 +3302,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div>Win Rate: <span id="bt-res-winrate" class="font-semibold text-white">0%</span></div>
             <div>Final Equity: <span id="bt-res-final" class="font-semibold text-white">$0</span></div>
             <div>Sharpe (approx): <span id="bt-res-sharpe" class="font-semibold text-white">0</span></div>
+            <div>Buy &amp; Hold Ret: <span id="bt-res-bh" class="font-semibold text-sky-400">0%</span></div>
+            <div>Strategy Alpha: <span id="bt-res-alpha" class="font-semibold text-white">0%</span></div>
             <div>Avg Win: <span id="bt-res-avgwin" class="font-semibold text-emerald-400">$0</span></div>
             <div>Avg Loss: <span id="bt-res-avgloss" class="font-semibold text-red-400">$0</span></div>
             <div>Realized R:R: <span id="bt-res-rr" class="font-semibold text-white">0</span></div>
@@ -2884,6 +3329,121 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     </div>
 
+    <!-- Live/Paper Execution Tracking & Persistent Order Audit Log (Item 1 & 7) -->
+    <div id="section-execution-tracking" class="hidden md:block">
+      <div class="mobile-only-header flex items-center justify-between border-b border-bordercol pb-3 mb-3 md:hidden">
+        <button type="button" onclick="showMobileView('dashboard')" class="text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-bordercol flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <span class="text-xs font-bold text-slate-400">Execution Tracking</span>
+      </div>
+
+      <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-4 w-full">
+        <!-- Header & Alert Status Controls -->
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-bordercol/60 pb-3">
+          <div class="flex items-center gap-2.5">
+            <div class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+              <i class="fa-solid fa-satellite-dish text-sm"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="font-bold text-sm text-white">Live &amp; Paper Execution Tracking</h3>
+                <span id="tracker-mode-badge" class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30">AUDIT LOG FORWARD</span>
+              </div>
+              <p class="text-[11px] text-slate-400">Persistent order history, real-time stop &amp; trailing telemetry, fills &amp; rejections.</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span id="tracker-last-refresh" class="text-[10px] text-slate-500">--</span>
+            <button type="button" id="btn-test-alert" onclick="testLiveAlert()" class="text-xs text-amber-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-950/40 hover:bg-amber-900/60 border border-amber-500/40">
+              <i class="fa-solid fa-bell"></i> Test Live Alert
+            </button>
+            <button type="button" id="btn-refresh-tracker" onclick="refreshExecutionTracker(true)" class="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
+          </div>
+        </div>
+
+        <!-- Real-Time Position Telemetry Card -->
+        <div class="bg-slate-900/80 border border-bordercol/80 rounded-xl p-3 sm:p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-bold text-slate-300 uppercase tracking-wider">Active Position Telemetry</span>
+              <span id="pos-status-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">FLAT</span>
+            </div>
+            <div id="pos-id-display" class="text-[10px] text-slate-500 font-mono">No Active Position</div>
+          </div>
+
+          <!-- Position details grid -->
+          <div id="pos-details-container" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 text-xs">
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Symbol / Side</div>
+              <div id="pos-symbol-side" class="font-bold text-white mt-0.5">Flat</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Entry Price</div>
+              <div id="pos-entry-price" class="font-bold text-white mt-0.5">$0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Current Price</div>
+              <div id="pos-current-price" class="font-bold text-white mt-0.5">$0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Position Size</div>
+              <div id="pos-size-amount" class="font-bold text-white mt-0.5">0.00</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Stop / Trail Level</div>
+              <div id="pos-stop-level" class="font-bold text-amber-400 mt-0.5">--</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Unrealized P&amp;L</div>
+              <div id="pos-unrealized-pnl" class="font-bold text-slate-400 mt-0.5">$0.00 (0.0%)</div>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded border border-bordercol/40">
+              <div class="text-[10px] text-slate-500">Duration / Opened</div>
+              <div id="pos-duration-opened" class="font-medium text-slate-400 mt-0.5">--</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Orders & Audit Log Table (Fills, Rejections, Cancellations) -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-bold text-slate-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-list-check text-slate-400"></i>
+              <span>Order Execution History &amp; Rejection Audit</span>
+            </span>
+            <span id="orders-count-label" class="text-[10px] text-slate-500">0 orders recorded</span>
+          </div>
+
+          <div class="overflow-x-auto rounded-lg border border-bordercol/60 bg-slate-950">
+            <table class="w-full text-left text-[11px] border-collapse">
+              <thead>
+                <tr class="border-b border-bordercol/60 text-slate-400 bg-slate-900/60">
+                  <th class="py-2 px-2.5 font-medium">Time (UTC)</th>
+                  <th class="py-2 px-2 font-medium">Symbol</th>
+                  <th class="py-2 px-2 font-medium">Side</th>
+                  <th class="py-2 px-2 font-medium">Type</th>
+                  <th class="py-2 px-2 font-medium">Price</th>
+                  <th class="py-2 px-2 font-medium">Amount</th>
+                  <th class="py-2 px-2 font-medium">Status</th>
+                  <th class="py-2 px-2.5 font-medium">Reason / Note</th>
+                </tr>
+              </thead>
+              <tbody id="tracker-orders-tbody" class="divide-y divide-bordercol/30 font-mono text-[10px]">
+                <tr>
+                  <td colspan="8" class="py-3 px-3 text-center text-slate-500 italic font-sans">
+                    No orders recorded yet. As orders are placed, filled, or rejected by risk controls, they will appear here in real time.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Live Activity Logs -->
     <!-- Desktop: in-page card | Mobile: separate hamburger page view -->
     <div id="section-bot-activity" class="hidden md:block">
@@ -2894,18 +3454,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="text-xs font-bold text-slate-400">Bot Activity</span>
       </div>
       <div class="bg-cardbg border border-bordercol rounded-xl p-4 sm:p-5 space-y-3 w-full">
-        <div class="flex items-center justify-between">
+        <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-terminal text-slate-400"></i>
             <h3 class="font-bold text-sm text-white">Live Bot Activity Logs</h3>
           </div>
           <div class="flex items-center gap-2">
-            <div class="flex items-center gap-2">
-              <span id="logs-updated" class="text-[10px] text-slate-500">--</span>
-              <button type="button" id="btn-refresh-logs" onclick="refreshLogs(true)" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol disabled:opacity-60">
-                <i class="fa-solid fa-rotate"></i> Refresh
-              </button>
+            <div class="flex items-center bg-slate-900 border border-bordercol/80 rounded-lg p-0.5 text-[11px]">
+              <button type="button" id="btn-log-filter-all" onclick="setLogFilter('all')" class="px-2 py-0.5 rounded font-medium bg-purple-600 text-white shadow-sm">All</button>
+              <button type="button" id="btn-log-filter-sweep" onclick="setLogFilter('sweep')" class="px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition">Sweep Logs</button>
+              <button type="button" id="btn-log-filter-live" onclick="setLogFilter('live')" class="px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition">Live Engine</button>
             </div>
+            <span id="logs-updated" class="text-[10px] text-slate-500">--</span>
+            <button type="button" id="btn-refresh-logs" onclick="refreshLogs(true)" class="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-bordercol disabled:opacity-60">
+              <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
           </div>
         </div>
         <div id="log-container" class="bg-slate-950 font-mono text-[11px] p-3 rounded-lg border border-bordercol/60 h-56 md:h-40 overflow-y-auto space-y-1 text-slate-300">
@@ -2915,6 +3478,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </main>
 
+  <!-- Persistent Sticky Manual Trading Dock (Stays fixed on screen when manual trade mode is active) -->
+  <div id="manual-sticky-dock" class="hidden fixed bottom-14 md:bottom-5 left-3 right-3 sm:left-auto sm:right-6 z-50 bg-slate-900/95 backdrop-blur-md border-2 border-amber-500/80 rounded-2xl p-2 sm:p-2.5 shadow-2xl flex items-center gap-2 sm:gap-3 transition-all duration-300 sm:max-w-md">
+    <div class="flex items-center gap-1.5 shrink-0 px-2 py-1 bg-amber-500/20 border border-amber-500/40 rounded-lg hidden xs:flex sm:flex">
+      <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+      <span class="text-[10px] sm:text-xs font-bold text-amber-300">MANUAL</span>
+    </div>
+    <div class="flex items-center gap-2 flex-1">
+      <button type="button" id="btn-sticky-buy" onclick="triggerManualTrade('buy')" class="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
+        <i class="fa-solid fa-arrow-trend-up"></i> BUY Market
+      </button>
+      <button type="button" id="btn-sticky-sell" onclick="triggerManualTrade('sell')" class="flex-1 py-2 px-3 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
+        <i class="fa-solid fa-arrow-trend-down"></i> SELL Market
+      </button>
+    </div>
+  </div>
+
   <!-- Sticky Mobile Bottom Quick-Action Bar -->
   <nav id="mobile-bottom-nav" class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-cardbg/95 backdrop-blur-md border-t border-bordercol py-1.5 px-2 flex items-center justify-around text-center shadow-2xl safe-area-bottom">
     <!-- 1. Bot Start/Stop Quick Action -->
@@ -2923,10 +3502,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="bottom-btn-toggle-text" class="text-[10px] font-semibold mt-0.5">Start</span>
     </button>
 
-    <!-- 2. Emergency Kill Switch -->
-    <button onclick="triggerKillSwitch()" class="flex flex-col items-center justify-center py-1 px-1.5 text-rose-400 hover:text-rose-300 active:scale-95 transition flex-1">
-      <i class="fa-solid fa-skull-crossbones text-base"></i>
-      <span class="text-[10px] font-semibold mt-0.5">Kill</span>
+    <!-- 2. Emergency Kill Switch Toggle -->
+    <button id="bottom-btn-kill" onclick="toggleKillSwitch()" class="flex flex-col items-center justify-center py-1 px-1.5 text-slate-400 hover:text-slate-200 active:scale-95 transition flex-1" title="Toggle Emergency Kill Switch">
+      <i id="bottom-btn-kill-icon" class="fa-solid fa-toggle-off text-base text-slate-400"></i>
+      <span id="bottom-btn-kill-text" class="text-[10px] font-semibold mt-0.5">Kill: OFF</span>
     </button>
 
   </nav>
@@ -3258,7 +3837,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <label class="block text-slate-300 font-bold mb-2">1. Trading Execution Mode</label>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             <label id="opt-mode-auto-card" class="p-3 rounded-xl border border-purple-500/60 bg-purple-950/30 cursor-pointer transition flex items-start gap-2.5">
-              <input type="radio" name="settings-exec-mode" id="radio-mode-auto" value="auto" checked onchange="onExecutionModeOptionChange()" class="mt-0.5 text-purple-500 focus:ring-0">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-auto" value="auto" checked onchange="onExecutionModeOptionChange(true)" class="mt-0.5 text-purple-500 focus:ring-0">
               <div>
                 <div class="font-bold text-white flex items-center gap-1.5">
                   <i class="fa-solid fa-robot text-purple-400"></i> Auto Trading
@@ -3268,7 +3847,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </label>
 
             <label id="opt-mode-manual-card" class="p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600">
-              <input type="radio" name="settings-exec-mode" id="radio-mode-manual" value="manual" onchange="onExecutionModeOptionChange()" class="mt-0.5 text-amber-500 focus:ring-0">
+              <input type="radio" name="settings-exec-mode" id="radio-mode-manual" value="manual" onchange="onExecutionModeOptionChange(true)" class="mt-0.5 text-amber-500 focus:ring-0">
               <div>
                 <div class="font-bold text-white flex items-center gap-1.5">
                   <i class="fa-solid fa-hand-pointer text-amber-400"></i> Manual Trading
@@ -3382,6 +3961,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Javascript Logic -->
   <script>
     let botRunning = false;
+    let isKillSwitchActive = false;
     let currentUser = null;
     let exchangesList = [];
 
@@ -4124,6 +4704,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       window.scrollTo({ top: 0, behavior: 'smooth' });
       if (activeView === 'activity') {
         refreshLogs();
+        refreshExecutionTracker();
       }
       if (activeView === 'account') {
         renderMobileAccountView();
@@ -4391,7 +4972,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function onExecutionModeOptionChange() {
+    function onExecutionModeOptionChange(autoSave = false) {
       const autoRadio = document.getElementById('radio-mode-auto');
       const isAuto = autoRadio ? autoRadio.checked : true;
       const autoCard = document.getElementById('opt-mode-auto-card');
@@ -4403,6 +4984,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } else {
         if (autoCard) autoCard.className = 'p-3 rounded-xl border border-bordercol bg-slate-900/80 cursor-pointer transition flex items-start gap-2.5 hover:border-slate-600';
         if (manualCard) manualCard.className = 'p-3 rounded-xl border border-amber-500/60 bg-amber-950/30 cursor-pointer transition flex items-start gap-2.5';
+      }
+
+      if (autoSave) {
+        quickSetExecutionMode(isAuto ? 'auto' : 'manual');
       }
     }
 
@@ -4538,7 +5123,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function quickSetExecutionMode(targetMode) {
       try {
-        const res = await fetch('/api/bot/settings', {
+        const res = await fetch('/api/bot/execution_mode', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ execution_mode: targetMode })
@@ -4560,10 +5145,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!confirm(`Confirm manual ${actName} order execution at current market price?`)) return;
 
       const btn = document.getElementById('btn-manual-' + action.toLowerCase());
+      const btnSticky = document.getElementById('btn-sticky-' + action.toLowerCase());
       const oldHtml = btn ? btn.innerHTML : '';
+      const oldStickyHtml = btnSticky ? btnSticky.innerHTML : '';
       if (btn) {
         btn.disabled = true;
         btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
+      }
+      if (btnSticky) {
+        btnSticky.disabled = true;
+        btnSticky.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
       }
 
       try {
@@ -4587,6 +5178,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           btn.disabled = false;
           btn.innerHTML = oldHtml;
         }
+        if (btnSticky) {
+          btnSticky.disabled = false;
+          btnSticky.innerHTML = oldStickyHtml;
+        }
       }
     }
 
@@ -4607,15 +5202,110 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const activeTfTag = document.getElementById('active-tf-tag');
         const activeModeTag = document.getElementById('active-mode-tag');
         const manualPanel = document.getElementById('manual-control-panel');
+        const manualDock = document.getElementById('manual-sticky-dock');
 
         if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
         if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
         if (activeModeTag) {
-          activeModeTag.innerText = isManual ? 'Manual Trading' : 'Auto Trading';
-          activeModeTag.className = isManual ? 'text-amber-400 font-semibold' : 'text-purple-300 font-semibold';
+          const modeLabel = (data.mode || 'paper').toUpperCase();
+          const execType = isManual ? 'Manual Orders' : 'Algorithmic Execution';
+          if (!data.running) {
+            activeModeTag.innerHTML = `<i class="fa-solid fa-pause text-slate-400 mr-1"></i>Engine: IDLE (${execType})`;
+            activeModeTag.className = isManual ? 'text-amber-300 font-semibold bg-amber-950/60 px-2 py-0.5 rounded border border-amber-500/50' : 'text-slate-400 font-semibold bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700';
+          } else {
+            activeModeTag.innerHTML = `<i class="fa-solid fa-play text-emerald-400 mr-1"></i>Engine: ARMED (${modeLabel} · ${execType})`;
+            activeModeTag.className = isReal ? 'text-emerald-300 font-semibold bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/50 animate-pulse' : (isManual ? 'text-amber-300 font-semibold bg-amber-950/60 px-2 py-0.5 rounded border border-amber-500/50' : 'text-blue-300 font-semibold bg-blue-950/60 px-2 py-0.5 rounded border border-blue-500/50');
+          }
+        }
+
+        const btnExecAuto = document.getElementById('btn-exec-auto');
+        const btnExecManual = document.getElementById('btn-exec-manual');
+        if (btnExecAuto && btnExecManual) {
+          if (isManual) {
+            btnExecManual.className = 'px-2.5 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+            btnExecAuto.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
+          } else {
+            btnExecAuto.className = 'px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+            btnExecManual.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
+          }
+        }
+        const tfWarnBanner = document.getElementById('tf-warning-banner');
+        if (tfWarnBanner) {
+          if (data.timeframe_warning || ['1m', '3m', '5m', '15m'].includes(data.timeframe)) {
+            tfWarnBanner.classList.remove('hidden');
+          } else {
+            tfWarnBanner.classList.add('hidden');
+          }
         }
         if (manualPanel) {
           manualPanel.classList.toggle('hidden', !isManual);
+        }
+        if (manualDock) {
+          manualDock.classList.toggle('hidden', !isManual);
+        }
+
+        const isKillActive = Boolean(data.kill_file_exists || data.kill_switch_triggered);
+        isKillSwitchActive = isKillActive;
+
+        const killBanner = document.getElementById('kill-switch-active-banner');
+        const btnResetKill = document.getElementById('btn-reset-kill');
+        const btnResetKillMob = document.getElementById('btn-reset-kill-mob');
+        if (killBanner) killBanner.classList.toggle('hidden', !isKillActive);
+        if (btnResetKill) btnResetKill.classList.toggle('hidden', !isKillActive);
+        if (btnResetKillMob) btnResetKillMob.classList.toggle('hidden', !isKillActive);
+
+        // Update desktop toggle button
+        const killToggle = document.getElementById('btn-kill-toggle');
+        const killToggleIcon = document.getElementById('btn-kill-toggle-icon');
+        const killToggleText = document.getElementById('btn-kill-toggle-text');
+        if (killToggle && killToggleIcon && killToggleText) {
+          if (isKillActive) {
+            killToggle.className = 'px-2.5 py-1.5 bg-rose-600 hover:bg-rose-500 text-white border border-rose-400 font-semibold rounded-lg shadow-lg flex items-center gap-1.5 text-xs animate-pulse transition';
+            killToggle.title = 'Emergency Kill Switch is ACTIVE (Halted). Click to disarm.';
+            killToggleIcon.className = 'fa-solid fa-toggle-on text-white text-sm';
+            killToggleText.innerText = 'Kill Switch: ON';
+          } else {
+            killToggle.className = 'px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-lg transition flex items-center gap-1.5 text-xs shadow-sm';
+            killToggle.title = 'Emergency Kill Switch is DISARMED. Click to activate emergency halt.';
+            killToggleIcon.className = 'fa-solid fa-toggle-off text-slate-400 text-sm';
+            killToggleText.innerText = 'Kill Switch: OFF';
+          }
+        }
+
+        // Update mobile drawer toggle button
+        const killToggleMob = document.getElementById('btn-kill-toggle-mob');
+        const killToggleMobIcon = document.getElementById('btn-kill-toggle-mob-icon');
+        const killToggleMobStatus = document.getElementById('btn-kill-toggle-mob-status');
+        if (killToggleMob && killToggleMobIcon && killToggleMobStatus) {
+          if (isKillActive) {
+            killToggleMob.className = 'w-full py-2.5 bg-rose-600/90 active:bg-rose-700 text-white border border-rose-400 font-bold rounded-xl shadow-lg transition flex items-center justify-between px-3 text-xs animate-pulse';
+            killToggleMobIcon.className = 'fa-solid fa-toggle-on text-white text-base';
+            killToggleMobStatus.innerText = 'ON';
+            killToggleMobStatus.className = 'text-[11px] font-bold text-white';
+          } else {
+            killToggleMob.className = 'w-full py-2.5 bg-slate-800 active:bg-slate-700 text-slate-300 border border-slate-700 font-semibold rounded-xl transition flex items-center justify-between px-3 text-xs';
+            killToggleMobIcon.className = 'fa-solid fa-toggle-off text-slate-400 text-base';
+            killToggleMobStatus.innerText = 'OFF';
+            killToggleMobStatus.className = 'text-[11px] font-bold text-slate-400';
+          }
+        }
+
+        // Update mobile bottom nav button
+        const bottomKill = document.getElementById('bottom-btn-kill');
+        const bottomKillIcon = document.getElementById('bottom-btn-kill-icon');
+        const bottomKillText = document.getElementById('bottom-btn-kill-text');
+        if (bottomKill && bottomKillIcon && bottomKillText) {
+          if (isKillActive) {
+            bottomKill.className = 'flex flex-col items-center justify-center py-1 px-1.5 text-rose-400 active:scale-95 transition flex-1 animate-pulse';
+            bottomKillIcon.className = 'fa-solid fa-toggle-on text-base text-rose-400';
+            bottomKillText.innerText = 'Kill: ON';
+            bottomKillText.className = 'text-[10px] font-bold mt-0.5 text-rose-300';
+          } else {
+            bottomKill.className = 'flex flex-col items-center justify-center py-1 px-1.5 text-slate-400 hover:text-slate-200 active:scale-95 transition flex-1';
+            bottomKillIcon.className = 'fa-solid fa-toggle-off text-base text-slate-400';
+            bottomKillText.innerText = 'Kill: OFF';
+            bottomKillText.className = 'text-[10px] font-semibold mt-0.5 text-slate-400';
+          }
         }
 
         const dot = document.getElementById('status-dot');
@@ -4657,15 +5347,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (bottomBtnText) { bottomBtnText.innerText = 'Stop'; bottomBtnText.className = 'text-[10px] font-semibold mt-0.5 text-amber-400'; }
           if (bottomBtnIcon) { bottomBtnIcon.className = 'fa-solid fa-stop text-amber-400 text-base'; }
         } else {
-          if (dot) dot.className = 'inline-block w-2 h-2 rounded-full bg-slate-500';
+          if (dot) dot.className = isKillActive ? 'inline-block w-2 h-2 rounded-full bg-rose-500 animate-pulse' : 'inline-block w-2 h-2 rounded-full bg-slate-500';
           if (text) {
-            text.innerText = data.kill_file_exists ? 'HALTED (KILL SWITCH)' : 'IDLE';
-            text.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+            text.innerText = isKillActive ? 'HALTED (KILL SWITCH)' : 'IDLE';
+            text.className = isKillActive ? 'font-semibold text-rose-400' : 'font-semibold text-slate-400';
           }
-          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full ' + (data.kill_file_exists ? 'bg-red-500' : 'bg-slate-500');
+          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full ' + (isKillActive ? 'bg-rose-500 animate-pulse' : 'bg-slate-500');
           if (textMob) {
-            textMob.innerText = data.kill_file_exists ? 'HALTED' : 'IDLE';
-            textMob.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+            textMob.innerText = isKillActive ? 'HALTED' : 'IDLE';
+            textMob.className = isKillActive ? 'font-semibold text-rose-400' : 'font-semibold text-slate-400';
           }
 
           if (btnToggleText) btnToggleText.innerText = 'Start Bot';
@@ -4682,8 +5372,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         document.getElementById('val-equity').innerText = '$' + data.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
         document.getElementById('val-peak').innerText = '$' + data.peak_equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('val-cash').innerText = '$' + data.paper_cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('val-pos').innerText = data.paper_position.toFixed(6);
+
+        const cashLbl = document.getElementById('val-cash-label');
+        if (data.mode === 'live' && data.wallet_balance && data.wallet_balance.is_live) {
+          if (cashLbl) cashLbl.innerText = `Live ${data.wallet_balance.quote_currency || 'Quote'}`;
+          document.getElementById('val-cash').innerText = '$' + (data.wallet_balance.free_quote ?? data.paper_cash).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+          document.getElementById('val-pos').innerText = (data.wallet_balance.free_base ?? data.paper_position).toFixed(6);
+        } else {
+          if (cashLbl) cashLbl.innerText = 'Paper Cash';
+          document.getElementById('val-cash').innerText = '$' + data.paper_cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+          document.getElementById('val-pos').innerText = data.paper_position.toFixed(6);
+        }
+
+        const symTag = document.getElementById('val-symbol-tag');
+        if (symTag) {
+          let extra = '';
+          if (data.order_book_spread && data.order_book_spread.valid) {
+            extra = ` · Spr: ${data.order_book_spread.spread_pct.toFixed(2)}%`;
+          }
+          symTag.innerText = `${data.symbol} ${data.timeframe}${extra}`;
+        }
+
         document.getElementById('val-drawdown').innerText = data.drawdown_pct.toFixed(1) + '%';
         document.getElementById('val-daily-loss').innerText = data.daily_loss_pct.toFixed(1) + '%';
         document.getElementById('val-streak').innerText = `${data.consecutive_losses} / ${data.max_consecutive_losses ?? 8}`;
@@ -4725,6 +5434,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function toggleKillSwitch() {
+      if (isKillSwitchActive) {
+        if (!confirm('Deactivate emergency KILL SWITCH and return to IDLE mode? This clears the halt latch and establishes the current equity baseline.')) return;
+        try {
+          const res = await fetch('/api/bot/kill/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ active: false })
+          });
+          const data = await res.json();
+          if (data.success) {
+            await fetchStatus();
+            await refreshLogs();
+          } else {
+            alert('Could not deactivate kill switch: ' + (data.message || 'Unknown error'));
+          }
+        } catch (e) {
+          alert('Deactivate kill switch failed: ' + e);
+        }
+      } else {
+        if (!confirm('Are you sure you want to trigger the emergency KILL SWITCH? This halts all execution immediately.')) return;
+        try {
+          const res = await fetch('/api/bot/kill/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ active: true })
+          });
+          const data = await res.json();
+          if (data.success) {
+            await fetchStatus();
+            await refreshLogs();
+          } else {
+            alert('Kill switch failed: ' + e);
+          }
+        } catch (e) {
+          alert('Kill switch failed: ' + e);
+        }
+      }
+    }
+
     async function triggerKillSwitch() {
       if (!confirm('Are you sure you want to trigger the emergency KILL SWITCH? This halts all execution immediately.')) return;
       try {
@@ -4733,6 +5482,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await refreshLogs();
       } catch (e) {
         alert('Kill switch failed: ' + e);
+      }
+    }
+
+
+    async function deactivateKillSwitch() {
+      if (!confirm('Deactivate emergency KILL SWITCH and return to IDLE mode? This clears the halt latch and establishes the current equity baseline.')) return;
+      try {
+        const res = await fetch('/api/bot/reset_kill', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert('Could not deactivate kill switch: ' + (data.message || 'Unknown error'));
+        }
+      } catch (e) {
+        alert('Deactivate kill switch failed: ' + e);
       }
     }
 
@@ -4976,6 +5742,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('bt-res-final').innerText = '$' + r.final_equity.toLocaleString();
         const sharpeDisplay = (r.sharpe_approx !== null && r.sharpe_approx !== undefined) ? r.sharpe_approx : '-- (< 20 trades)';
         document.getElementById('bt-res-sharpe').innerText = sharpeDisplay;
+        const bhRet = r.buy_and_hold_return_pct;
+        const bhBadge = document.getElementById('bt-res-bh-badge');
+        if (bhRet !== null && bhRet !== undefined) {
+          const bhSign = bhRet >= 0 ? '+' : '';
+          setIf('bt-res-bh', `${bhSign}${Number(bhRet).toFixed(2)}%`);
+          const alpha = (Number(r.total_return_pct || 0) - Number(bhRet)).toFixed(2);
+          const alphaSign = alpha >= 0 ? '+' : '';
+          const alphaEl = document.getElementById('bt-res-alpha');
+          if (alphaEl) {
+            alphaEl.innerText = `${alphaSign}${alpha}%`;
+            alphaEl.className = alpha >= 0 ? 'font-semibold text-emerald-400' : 'font-semibold text-rose-400';
+          }
+          if (bhBadge) {
+            bhBadge.innerText = `B&H: ${bhSign}${Number(bhRet).toFixed(1)}%`;
+            bhBadge.className = 'text-[10px] px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-500/30 font-semibold';
+          }
+        } else {
+          setIf('bt-res-bh', '--');
+          setIf('bt-res-alpha', '--');
+          if (bhBadge) {
+            bhBadge.innerText = 'B&H: --';
+            bhBadge.className = 'text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-normal';
+          }
+        }
         document.getElementById('bt-res-avgwin').innerText = '$' + r.avg_win;
         document.getElementById('bt-res-avgloss').innerText = '$' + r.avg_loss;
         document.getElementById('bt-res-drawdown').innerText = r.max_drawdown_pct + '%';
@@ -5030,6 +5820,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               trail + ' ' + debounce;
           }
         }
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         // Say it inside the page in one short sentence; the raw exchange text
         // stays one tap away instead of being dumped by a browser alert().
@@ -5101,7 +5892,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const label = isTimeframes ? (item.tf + ` (${item.days}d)`) : item.label;
           tr.innerHTML = `
             <td class="py-1.5 px-1.5 font-semibold text-slate-300">${label}</td>
-            <td colspan="10" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
+            <td colspan="11" class="py-1.5 px-1.5 text-slate-500 text-left font-sans italic" id="bt-sweep-status-${idx}">
               <i class="fa-solid fa-clock mr-1"></i> Waiting in queue...
             </td>
           `;
@@ -5140,17 +5931,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const textCol = isUnavailable ? 'text-amber-400/90' : 'text-rose-400';
         tr.innerHTML = `
           <td class="py-1.5 px-1.5 font-semibold text-slate-300" ${dateTooltip}>${windowLabel}</td>
-          <td colspan="9" class="py-1.5 px-1.5 ${textCol} text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
+          <td colspan="10" class="py-1.5 px-1.5 ${textCol} text-left font-sans text-[10px] truncate" title="${escapeHtml(row.error)}">
             <i class="${iconClass} mr-1"></i> ${escapeHtml(cleanErr)}
           </td>
           <td class="py-1.5 px-1.5">${regimeBadge}</td>
         `;
       } else {
+        const bhText = (row.buy_and_hold_return_pct !== null && row.buy_and_hold_return_pct !== undefined)
+          ? ((row.buy_and_hold_return_pct >= 0 ? '+' : '') + Number(row.buy_and_hold_return_pct).toFixed(2) + '%')
+          : '--';
+        const bhClass = (row.buy_and_hold_return_pct !== null && row.buy_and_hold_return_pct !== undefined)
+          ? (row.buy_and_hold_return_pct >= 0 ? 'text-sky-400' : 'text-slate-400')
+          : 'text-slate-500';
         tr.innerHTML = `
           <td class="py-1.5 px-1.5 font-semibold text-slate-200" ${dateTooltip}>${windowLabel}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${row.trades}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${(Number(row.win_rate_pct).toFixed(1) + '%')}</td>
           <td class="py-1.5 px-1.5 ${returnClass}">${returnText}</td>
+          <td class="py-1.5 px-1.5 ${bhClass}">${bhText}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${sharpeText}</td>
           <td class="py-1.5 px-1.5 text-slate-300">${((row.realized_rr ?? 0) + ' : 1')}</td>
           <td class="py-1.5 px-1.5 text-amber-400">${(Number(row.max_drawdown_pct).toFixed(1) + '%')}</td>
@@ -5264,7 +6062,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           if (stEl) stEl.innerHTML = `<span class="text-purple-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.label} backtest...</span>`;
 
-          const payload = { ...basePayload, days: item.days };
+          const payload = { ...basePayload, days: item.days, sweep_tag: 'Sweep ' + item.label };
           let rowData = null;
           try {
             const res = await fetch('/api/backtest', {
@@ -5280,10 +6078,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               rowData = {
                 lookback_days: item.days,
                 lookback_label: item.label,
-                candles_evaluated: r.candles_tested ?? 0,
+                candles_evaluated: r.candles_evaluated ?? r.candles_tested ?? 0,
+                candles_tested: r.candles_tested ?? 0,
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
+                buy_and_hold_return_pct: r.buy_and_hold_return_pct,
                 final_equity: r.final_equity ?? 0,
                 sharpe_approx: r.sharpe_approx,
                 realized_rr: r.realized_rr ?? 0,
@@ -5319,10 +6119,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           rows.push(rowData);
           updateSweepTableRow(i, false, rowData);
+          if (typeof refreshLogs === 'function') await refreshLogs();
           const progEl = document.getElementById('bt-sweep-progress');
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         console.error('Multi-window sweep error:', err);
         const failure = describeBacktestError(err);
@@ -5383,7 +6185,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           if (stEl) stEl.innerHTML = `<span class="text-blue-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running ${item.tf} backtest (${item.days}d)...</span>`;
 
-          const payload = { ...basePayload, timeframe: item.tf, days: item.days };
+          const payload = { ...basePayload, timeframe: item.tf, days: item.days, sweep_tag: 'Sweep ' + item.tf + ' (' + item.days + 'd)' };
           let rowData = null;
           try {
             const res = await fetch('/api/backtest', {
@@ -5399,10 +6201,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               rowData = {
                 timeframe: item.tf,
                 lookback_days: item.days,
-                candles_evaluated: r.candles_tested ?? 0,
+                candles_evaluated: r.candles_evaluated ?? r.candles_tested ?? 0,
+                candles_tested: r.candles_tested ?? 0,
                 trades: r.num_trades ?? 0,
                 win_rate_pct: r.win_rate_pct ?? 0,
                 total_return_pct: r.total_return_pct ?? 0,
+                buy_and_hold_return_pct: r.buy_and_hold_return_pct,
                 final_equity: r.final_equity ?? 0,
                 sharpe_approx: r.sharpe_approx,
                 realized_rr: r.realized_rr ?? 0,
@@ -5438,10 +6242,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           rows.push(rowData);
           updateSweepTableRow(i, true, rowData);
+          if (typeof refreshLogs === 'function') await refreshLogs();
           const progEl = document.getElementById('bt-sweep-progress');
           if (progEl) progEl.innerText = String(i + 1);
         }
         finalizeSweepSummary(rows);
+        if (typeof refreshLogs === 'function') await refreshLogs();
       } catch (err) {
         console.error('Timeframe sweep error:', err);
         const failure = describeBacktestError(err);
@@ -5454,36 +6260,360 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function executeWalkForward(e) {
+      if (e && e.preventDefault) e.preventDefault();
+      const btn = document.getElementById('btn-walk-forward');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Validating OOS...';
+      }
+
+      const wfoBox = document.getElementById('bt-wfo-box');
+      const badgeEl = document.getElementById('bt-wfo-badge');
+      const summaryEl = document.getElementById('bt-wfo-summary');
+      const tbody = document.getElementById('bt-wfo-tbody');
+
+      if (wfoBox) wfoBox.classList.remove('hidden');
+      if (badgeEl) {
+        badgeEl.innerText = 'VALIDATING';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-sky-500/20 text-sky-300 border border-sky-500/30';
+      }
+      if (summaryEl) {
+        summaryEl.innerHTML = '<span class="text-sky-300 font-semibold"><i class="fa-solid fa-spinner fa-spin mr-1"></i> Running chronological Walk-Forward Validation across sequential train/test folds...</span>';
+      }
+      if (tbody) {
+        tbody.innerHTML = '<tr><td colspan="9" class="py-2.5 px-2 text-center text-slate-500 italic"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Splitting historical candles into sequential train and unseen out-of-sample test folds...</td></tr>';
+      }
+
+      try {
+        const payload = getBacktestPayloadBase();
+        const askedDays = parseInt((document.getElementById('bt-days') || {}).value, 10) || 90;
+        const tf = (document.getElementById('bt-timeframe') || {}).value || '1h';
+        const tfLimit = (typeof BT_LOOKBACK_LIMITS !== 'undefined' && BT_LOOKBACK_LIMITS[tf])
+          ? BT_LOOKBACK_LIMITS[tf].max_days : 730;
+        const days = Math.min(askedDays, tfLimit);
+
+        payload.timeframe = tf;
+        payload.days = days;
+        payload.n_splits = 3;
+
+        const res = await fetch('/api/backtest/walk-forward', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error((data && (data.detail || data.error)) || `HTTP ${res.status}`);
+        }
+
+        const results = data.results || {};
+        const folds = results.folds || [];
+        const isVal = results.is_out_of_sample_validated;
+        const wfe = Number(results.walk_forward_efficiency_pct || 0).toFixed(1);
+        const avgIS = Number(results.avg_in_sample_return_pct || 0).toFixed(2);
+        const avgOOS = Number(results.avg_out_of_sample_return_pct || 0).toFixed(2);
+
+        if (badgeEl) {
+          if (isVal) {
+            badgeEl.innerText = 'OUT-OF-SAMPLE VALIDATED';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+          } else {
+            badgeEl.innerText = 'IN-SAMPLE ONLY (UNVERIFIED)';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40';
+          }
+        }
+
+        if (summaryEl) {
+          const valText = isVal
+            ? `<span class="text-emerald-400 font-semibold">\u2714 Robust Parameters:</span> Strategy maintains positive expectancy on unseen market segments (WFE: <b>${wfe}%</b>, Avg In-Sample: ${avgIS}%, Avg OOS: <b>${avgOOS}%</b>).`
+            : `<span class="text-amber-400 font-semibold">\u26a0 Curve-Fitting Warning:</span> Performance drops significantly on unseen data (WFE: <b>${wfe}%</b>, Avg In-Sample: ${avgIS}%, Avg OOS: <b>${avgOOS}%</b>). Parameters may be over-fitted to past noise.`;
+          summaryEl.innerHTML = valText;
+        }
+
+        if (tbody) {
+          tbody.innerHTML = '';
+          folds.forEach(f => {
+            const tr = document.createElement('tr');
+            const isProf = f.out_of_sample_profitable;
+            tr.className = isProf ? 'bg-emerald-950/20 hover:bg-emerald-950/30' : 'bg-rose-950/15 hover:bg-rose-950/25';
+
+            const isRetStr = (f.in_sample_return_pct >= 0 ? '+' : '') + Number(f.in_sample_return_pct).toFixed(2) + '%';
+            const isRetCol = f.in_sample_return_pct >= 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold';
+
+            const oosRetStr = (f.out_of_sample_return_pct >= 0 ? '+' : '') + Number(f.out_of_sample_return_pct).toFixed(2) + '%';
+            const oosRetCol = f.out_of_sample_return_pct >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+
+            const oosBHStr = (f.out_of_sample_bh_return_pct >= 0 ? '+' : '') + Number(f.out_of_sample_bh_return_pct).toFixed(2) + '%';
+            const oosBHCol = f.out_of_sample_bh_return_pct >= 0 ? 'text-sky-400' : 'text-slate-400';
+
+            const trainRange = (f.train_date_range || []).join(' \u2192 ') || `${f.train_bars} bars`;
+            const testRange = (f.test_date_range || []).join(' \u2192 ') || `${f.test_bars} bars`;
+
+            const verdictBadge = isProf
+              ? `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold font-sans">OOS PROFIT</span>`
+              : `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold font-sans">OOS LOSS</span>`;
+
+            tr.innerHTML = `
+              <td class="py-1.5 px-1.5 font-bold text-slate-300">Fold ${f.fold}</td>
+              <td class="py-1.5 px-1.5 text-slate-400 text-[10px]" title="Train: ${trainRange}">${trainRange}</td>
+              <td class="py-1.5 px-1.5 ${isRetCol}">${isRetStr}</td>
+              <td class="py-1.5 px-1.5 text-slate-300">${f.in_sample_trades}</td>
+              <td class="py-1.5 px-1.5 text-slate-400 text-[10px]" title="Test (OOS): ${testRange}">${testRange}</td>
+              <td class="py-1.5 px-1.5 ${oosRetCol}">${oosRetStr}</td>
+              <td class="py-1.5 px-1.5 ${oosBHCol}">${oosBHStr}</td>
+              <td class="py-1.5 px-1.5 text-slate-300">${f.out_of_sample_trades}</td>
+              <td class="py-1.5 px-1.5">${verdictBadge}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+        if (typeof refreshLogs === 'function') await refreshLogs();
+      } catch (err) {
+        console.error('Walk-forward error:', err);
+        const failure = describeBacktestError(err);
+        showNotice(failure.title, failure.body, { kind: 'error', detail: failure.detail });
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-arrows-split-up-and-left"></i> Walk-Forward (OOS)';
+        }
+      }
+    }
+
+    async function refreshExecutionTracker(manual) {
+      if (manual) beginRefresh('btn-refresh-tracker', 'Refreshing...');
+      try {
+        const res = await fetch('/api/execution/tracker?limit=25&_ts=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const pos = data.active_position;
+        const orders = data.orders || [];
+
+        const badgeEl = document.getElementById('pos-status-badge');
+        const idEl = document.getElementById('pos-id-display');
+        const symEl = document.getElementById('pos-symbol-side');
+        const entryEl = document.getElementById('pos-entry-price');
+        const currEl = document.getElementById('pos-current-price');
+        const sizeEl = document.getElementById('pos-size-amount');
+        const stopEl = document.getElementById('pos-stop-level');
+        const pnlEl = document.getElementById('pos-unrealized-pnl');
+        const durEl = document.getElementById('pos-duration-opened');
+
+        if (pos) {
+          if (badgeEl) {
+            badgeEl.innerText = `OPEN (${pos.side || 'LONG'})`;
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse';
+          }
+          if (idEl) idEl.innerText = `Pos ID: ${pos.id || '--'}`;
+          if (symEl) symEl.innerHTML = `<span class="text-white">${pos.symbol}</span> <span class="text-emerald-400">(${pos.side})</span>`;
+          if (entryEl) entryEl.innerText = '$' + Number(pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          if (currEl) currEl.innerText = '$' + Number(pos.current_price || pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          if (sizeEl) sizeEl.innerText = `${Number(pos.size || 0).toFixed(4)} (~$${Number(pos.notional || (pos.size * pos.entry_price) || 0).toFixed(2)})`;
+          
+          if (stopEl) {
+            const stopVal = pos.trailing_stop || pos.stop_loss;
+            stopEl.innerText = stopVal ? ('$' + Number(stopVal).toFixed(2)) : '--';
+          }
+
+          if (pnlEl) {
+            const pnl = Number(pos.unrealized_pnl || 0);
+            const pnlPct = Number(pos.unrealized_pnl_pct || 0);
+            const sign = pnl >= 0 ? '+' : '';
+            pnlEl.innerText = `${sign}$${pnl.toFixed(2)} (${sign}${pnlPct.toFixed(2)}%)`;
+            pnlEl.className = pnl >= 0 ? 'font-bold text-emerald-400 mt-0.5' : 'font-bold text-rose-400 mt-0.5';
+          }
+
+          if (durEl) {
+            durEl.innerText = pos.opened_at ? new Date(pos.opened_at).toLocaleTimeString() : '--';
+          }
+        } else {
+          if (badgeEl) {
+            badgeEl.innerText = 'FLAT';
+            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400';
+          }
+          if (idEl) idEl.innerText = 'No Active Position';
+          if (symEl) symEl.innerText = 'Flat';
+          if (entryEl) entryEl.innerText = '$0.00';
+          if (currEl) currEl.innerText = '$0.00';
+          if (sizeEl) sizeEl.innerText = '0.00';
+          if (stopEl) stopEl.innerText = '--';
+          if (pnlEl) {
+            pnlEl.innerText = '$0.00 (0.0%)';
+            pnlEl.className = 'font-bold text-slate-400 mt-0.5';
+          }
+          if (durEl) durEl.innerText = '--';
+        }
+
+        // Render Orders Table
+        const tbody = document.getElementById('tracker-orders-tbody');
+        const countLabel = document.getElementById('orders-count-label');
+        if (countLabel) countLabel.innerText = `${orders.length} order(s) recorded`;
+
+        if (tbody) {
+          if (!orders || orders.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="8" class="py-3 px-3 text-center text-slate-500 italic font-sans">No orders recorded yet. As orders are placed, filled, or rejected by risk controls, they will appear here in real time.</td></tr>`;
+          } else {
+            tbody.innerHTML = '';
+            orders.forEach(o => {
+              const tr = document.createElement('tr');
+              const status = (o.status || '').toUpperCase();
+              let statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400">${escapeHtml(status)}</span>`;
+              if (status === 'FILLED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-bold">FILLED</span>`;
+              } else if (status === 'REJECTED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-rose-500/20 text-rose-300 font-bold">REJECTED</span>`;
+              } else if (status === 'CANCELLED') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-amber-500/20 text-amber-300 font-semibold">CANCELLED</span>`;
+              } else if (status === 'SUBMITTED' || status === 'PENDING') {
+                statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-blue-500/20 text-blue-300 font-semibold">PENDING</span>`;
+              }
+
+              const sideCol = (o.side || '').toUpperCase() === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+              const timeStr = o.timestamp ? new Date(o.timestamp).toLocaleString() : '--';
+              const reasonStr = o.rejection_reason || o.notes || '--';
+              const reasonClass = o.rejection_reason ? 'text-rose-300 font-sans' : 'text-slate-500 font-sans';
+
+              tr.innerHTML = `
+                <td class="py-1.5 px-2.5 text-slate-400 text-[10px]">${escapeHtml(timeStr)}</td>
+                <td class="py-1.5 px-2 font-semibold text-slate-200">${escapeHtml(o.symbol || '--')}</td>
+                <td class="py-1.5 px-2 ${sideCol}">${escapeHtml(o.side || '--')}</td>
+                <td class="py-1.5 px-2 text-slate-300">${escapeHtml(o.order_type || 'MARKET')}</td>
+                <td class="py-1.5 px-2 text-slate-300">${o.price ? ('$' + Number(o.price).toFixed(2)) : 'Market'}</td>
+                <td class="py-1.5 px-2 text-slate-300">${Number(o.amount || 0).toFixed(4)}</td>
+                <td class="py-1.5 px-2">${statusBadge}</td>
+                <td class="py-1.5 px-2.5 ${reasonClass} truncate max-w-[200px]" title="${escapeHtml(reasonStr)}">${escapeHtml(reasonStr)}</td>
+              `;
+              tbody.appendChild(tr);
+            });
+          }
+        }
+        setRefreshStamp('tracker-last-refresh', 'Updated ' + new Date().toLocaleTimeString(), true);
+      } catch (err) {
+        console.error('Error refreshing execution tracker:', err);
+      } finally {
+        if (manual) endRefresh('btn-refresh-tracker', 'fa-rotate', 'Refresh');
+      }
+    }
+
+    async function testLiveAlert() {
+      const btn = document.getElementById('btn-test-alert');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing Alert...';
+      }
+      try {
+        const res = await fetch('/api/alerts/test', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          showNotice('Live Risk Alert Dispatched', `Test alert dispatched successfully. Channels notified: ${JSON.stringify(data.dispatched_channels)}`, { kind: 'success' });
+          if (typeof refreshLogs === 'function') await refreshLogs();
+        } else {
+          showNotice('Alert Dispatch Failed', (data && data.detail) || 'Failed to dispatch alert test.', { kind: 'error' });
+        }
+      } catch (err) {
+        showNotice('Alert Test Error', err.message || 'Network error', { kind: 'error' });
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fa-solid fa-bell"></i> Test Live Alert';
+        }
+      }
+    }
+
+    async function loadFeeInfo() {
+      const exchEl = document.getElementById('bt-exchange');
+      const pillEl = document.getElementById('bt-fee-tier-pill');
+      if (!exchEl || !pillEl) return;
+      const exch = exchEl.value || 'binance';
+      try {
+        const res = await fetch(`/api/exchange/fee-info?exchange=${encodeURIComponent(exch)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const feeInfo = data.fee_info || data;
+        const takerPct = (Number(feeInfo.taker || 0.001) * 100).toFixed(2);
+        const sourceLabel = (feeInfo.source === 'api_account_tier' || feeInfo.source === 'account_verified') ? 'API Tier' : 'Default';
+        pillEl.innerText = `Taker: ${takerPct}% (${sourceLabel})`;
+        pillEl.title = `Fee source: ${feeInfo.source}. Maker: ${(Number(feeInfo.maker || 0.001)*100).toFixed(2)}%, Taker: ${takerPct}%.`;
+      } catch (e) {
+        console.warn('Could not load fee info:', e);
+      }
+    }
+
     let logsInFlight = false;
+    let currentLogFilter = 'all';
+    let rawLogsCache = [];
+
+    function setLogFilter(filter) {
+      currentLogFilter = filter;
+      ['all', 'sweep', 'live'].forEach(f => {
+        const el = document.getElementById(`btn-log-filter-${f}`);
+        if (el) {
+          if (f === filter) {
+            el.className = 'px-2 py-0.5 rounded font-medium bg-purple-600 text-white shadow-sm';
+          } else {
+            el.className = 'px-2 py-0.5 rounded font-medium text-slate-400 hover:text-white transition';
+          }
+        }
+      });
+      renderLogs();
+    }
+
+    function renderLogs() {
+      const container = document.getElementById('log-container');
+      if (!container) return;
+      container.innerHTML = '';
+
+      let filtered = rawLogsCache;
+      if (currentLogFilter === 'sweep') {
+        filtered = rawLogsCache.filter(l => l.includes('[Sweep '));
+      } else if (currentLogFilter === 'live') {
+        filtered = rawLogsCache.filter(l => !l.includes('[Sweep '));
+      }
+
+      if (filtered && filtered.length) {
+        filtered.forEach(l => {
+          const div = document.createElement('div');
+          div.className = 'py-0.5 leading-relaxed';
+          if (l.includes('[CRITICAL]')) {
+            div.className += ' text-rose-400 font-bold';
+          } else if (l.includes('[WARNING]')) {
+            div.className += ' text-amber-400';
+          } else if (l.includes('[Sweep ')) {
+            div.className += ' text-purple-300 font-medium bg-purple-950/20 px-1.5 py-0.5 rounded border-l-2 border-purple-500/50';
+          } else if (l.includes('BUY') || l.includes('Closed position')) {
+            div.className += ' text-emerald-400';
+          } else {
+            div.className += ' text-slate-300';
+          }
+          div.innerText = l;
+          container.appendChild(div);
+        });
+        container.scrollTop = container.scrollHeight;
+      } else {
+        const msg = currentLogFilter === 'sweep'
+          ? 'No sweep logs recorded yet. Run a multi-window or timeframe sweep above.'
+          : (currentLogFilter === 'live'
+              ? 'No live engine logs recorded yet.'
+              : 'No logs recorded yet. Start the bot or run a backtest to generate activity.');
+        container.innerHTML = `<div class="text-slate-500 italic py-2">${escapeHtml(msg)}</div>`;
+      }
+    }
 
     async function refreshLogs(manual) {
       if (logsInFlight) return;
       logsInFlight = true;
       if (manual) beginRefresh('btn-refresh-logs', 'Refreshing...');
       try {
-        const res = await fetch('/api/logs?lines=40&_ts=' + Date.now(), { cache: 'no-store' });
+        const res = await fetch('/api/logs?lines=100&_ts=' + Date.now(), { cache: 'no-store' });
         if (!res.ok) {
           setRefreshStamp('logs-updated', `Could not refresh logs (HTTP ${res.status}).`, false);
           return;
         }
         const data = await res.json();
-        const container = document.getElementById('log-container');
-        if (!container) return;
-        container.innerHTML = '';
-        if (data.logs && data.logs.length) {
-          data.logs.forEach(l => {
-            const div = document.createElement('div');
-            if (l.includes('[CRITICAL]')) div.className = 'text-rose-400 font-bold';
-            else if (l.includes('[WARNING]')) div.className = 'text-amber-400';
-            else if (l.includes('BUY') || l.includes('Closed position')) div.className = 'text-emerald-400';
-            else div.className = 'text-slate-300';
-            div.innerText = l;
-            container.appendChild(div);
-          });
-          container.scrollTop = container.scrollHeight;
-        } else {
-          container.innerHTML = '<div class="text-slate-500">No logs recorded yet.</div>';
-        }
+        rawLogsCache = data.logs || [];
+        renderLogs();
         setRefreshStamp('logs-updated', 'Updated ' + new Date().toLocaleTimeString(), true);
       } catch (e) {
         setRefreshStamp('logs-updated', 'Could not refresh logs: ' + (e && e.message ? e.message : e), false);
@@ -5756,6 +6886,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     fetchStatus();
     refreshAnalysis();
     refreshLogs();
+    refreshExecutionTracker();
+    loadFeeInfo();
     checkEmailStatusBadge();
 
     const urlParams = new URLSearchParams(window.location.search);
@@ -5768,12 +6900,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     setInterval(fetchStatus, 3000);
     setInterval(refreshAnalysis, 15000);
     setInterval(refreshLogs, 5000);
+    setInterval(refreshExecutionTracker, 4000);
     applyTimeframeLimits();
 
     const btnSweepWindows = document.getElementById('btn-sweep-windows');
     if (btnSweepWindows) btnSweepWindows.addEventListener('click', executeCompareWindows);
     const btnSweepTf = document.getElementById('btn-sweep-timeframes');
     if (btnSweepTf) btnSweepTf.addEventListener('click', executeCompareTimeframes);
+    const btnWalkForward = document.getElementById('btn-walk-forward');
+    if (btnWalkForward) btnWalkForward.addEventListener('click', executeWalkForward);
   </script>
 </body>
 </html>
