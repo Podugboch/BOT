@@ -304,6 +304,15 @@ class RiskManager:
         self.state.daily_start_equity = self.state.equity
         self.state.trading_halted_today = False
 
+    def reset_kill_switch(self, reset_peak: bool = True) -> None:
+        """Deactivate the kill switch latch and establish current equity as new baseline."""
+        self.state.kill_switch_triggered = False
+        if reset_peak and self.state.equity > 0:
+            self.state.peak_equity = self.state.equity
+        self.state.daily_start_equity = self.state.equity
+        self.state.trading_halted_today = False
+        log.info("Risk manager kill switch reset. Baseline equity established at $%.2f.", self.state.equity)
+
     def can_trade(self, now=None) -> tuple[bool, str]:
         s, c = self.state, self.cfg
         now = _as_utc(now)

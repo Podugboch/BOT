@@ -182,6 +182,20 @@ class BotRunner:
         self.stop()
         return True
 
+    def deactivate_kill(self):
+        logger.info("Deactivating emergency kill switch...")
+        if os.path.exists(self.cfg.kill_switch_file):
+            try:
+                os.remove(self.cfg.kill_switch_file)
+                logger.info("Removed kill switch file '%s'.", self.cfg.kill_switch_file)
+            except Exception as e:
+                logger.warning("Could not remove kill switch file: %s", e)
+        if self.bot:
+            self.bot.deactivate_kill_switch()
+        self.last_error = None
+        logger.info("Emergency kill switch deactivated. Bot is now IDLE.")
+        return True
+
     def get_or_create_bot(self) -> TradingBot:
         if self.bot is None:
             self.bot = TradingBot(self.cfg)
@@ -1226,6 +1240,12 @@ def stop_bot():
 def kill_bot():
     runner.trigger_kill()
     return {"success": True, "message": "Kill switch file created; bot halted immediately"}
+
+
+@app.post("/api/bot/reset_kill")
+def reset_kill_endpoint():
+    runner.deactivate_kill()
+    return {"success": True, "message": "Emergency kill switch deactivated. Bot is now IDLE."}
 
 
 @app.post("/api/bot/reset_day")
@@ -2352,6 +2372,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <i class="fa-solid fa-skull-crossbones"></i>
           </button>
 
+          <!-- Deactivate Kill Switch Button (visible when kill switch is active) -->
+          <button id="btn-reset-kill" onclick="deactivateKillSwitch()" class="hidden px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg shadow-lg border border-rose-400 flex items-center gap-1.5 animate-pulse text-xs" title="Deactivate Emergency Kill Switch">
+            <i class="fa-solid fa-lock-open"></i>
+            <span>Reset Kill Switch</span>
+          </button>
+
           <!-- Auth User Menu Button -->
           <div id="auth-buttons" class="flex items-center gap-2">
             <button onclick="openAuthModal('login')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition">
@@ -2480,6 +2506,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span>Emergency Kill Switch</span>
           </button>
         </div>
+
+        <!-- Deactivate Kill Switch Mobile (visible when active) -->
+        <div id="btn-reset-kill-mob-container" class="pt-1">
+          <button type="button" id="btn-reset-kill-mob" onclick="deactivateKillSwitch(); toggleMobileMenu();" class="hidden w-full py-2.5 bg-rose-600 active:bg-rose-700 text-white border border-rose-400 font-bold rounded-xl shadow-lg transition flex items-center justify-center gap-2 text-xs animate-pulse">
+            <i class="fa-solid fa-lock-open"></i>
+            <span>Deactivate Kill Switch (Return to IDLE)</span>
+          </button>
+        </div>
       </div>
     </div>
   </header>
@@ -2513,6 +2547,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <!-- Main Container -->
   <main class="max-w-7xl mx-auto px-3 sm:px-4 py-4 sm:py-5 space-y-4 sm:space-y-5 pb-safe-main md:pb-6">
+
+    <!-- Emergency Kill Switch Active Alert Banner -->
+    <div id="kill-switch-active-banner" class="hidden bg-rose-950/90 border-2 border-rose-500/80 rounded-xl p-3 sm:p-4 text-rose-200 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xl">
+      <div class="flex items-center gap-2.5">
+        <i class="fa-solid fa-triangle-exclamation text-rose-400 text-lg sm:text-xl shrink-0 animate-bounce"></i>
+        <div>
+          <div class="font-bold text-rose-300 text-xs sm:text-sm">EMERGENCY KILL SWITCH ACTIVATED — TRADING HALTED</div>
+          <div class="text-[11px] text-rose-200/80 mt-0.5">All automated execution and manual orders are disabled to protect capital. Disarm below to return to safe IDLE mode.</div>
+        </div>
+      </div>
+      <button type="button" onclick="deactivateKillSwitch()" class="w-full sm:w-auto px-4 py-2 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow-lg transition flex items-center justify-center gap-1.5 shrink-0 whitespace-nowrap">
+        <i class="fa-solid fa-lock-open"></i> Deactivate Kill Switch (Return to IDLE)
+      </button>
+    </div>
 
     <!-- KPI Cards Grid (Dashboard Landing Page) -->
     <div id="section-kpi" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
@@ -3326,6 +3374,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
   </main>
+
+  <!-- Persistent Sticky Manual Trading Dock (Stays fixed on screen when manual trade mode is active) -->
+  <div id="manual-sticky-dock" class="hidden fixed bottom-14 md:bottom-5 left-3 right-3 sm:left-auto sm:right-6 z-50 bg-slate-900/95 backdrop-blur-md border-2 border-amber-500/80 rounded-2xl p-2 sm:p-2.5 shadow-2xl flex items-center gap-2 sm:gap-3 transition-all duration-300 sm:max-w-md">
+    <div class="flex items-center gap-1.5 shrink-0 px-2 py-1 bg-amber-500/20 border border-amber-500/40 rounded-lg hidden xs:flex sm:flex">
+      <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+      <span class="text-[10px] sm:text-xs font-bold text-amber-300">MANUAL</span>
+    </div>
+    <div class="flex items-center gap-2 flex-1">
+      <button type="button" id="btn-sticky-buy" onclick="triggerManualTrade('buy')" class="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
+        <i class="fa-solid fa-arrow-trend-up"></i> BUY Market
+      </button>
+      <button type="button" id="btn-sticky-sell" onclick="triggerManualTrade('sell')" class="flex-1 py-2 px-3 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-1.5 whitespace-nowrap min-h-[38px]">
+        <i class="fa-solid fa-arrow-trend-down"></i> SELL Market
+      </button>
+    </div>
+  </div>
 
   <!-- Sticky Mobile Bottom Quick-Action Bar -->
   <nav id="mobile-bottom-nav" class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-cardbg/95 backdrop-blur-md border-t border-bordercol py-1.5 px-2 flex items-center justify-around text-center shadow-2xl safe-area-bottom">
@@ -4973,10 +5037,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!confirm(`Confirm manual ${actName} order execution at current market price?`)) return;
 
       const btn = document.getElementById('btn-manual-' + action.toLowerCase());
+      const btnSticky = document.getElementById('btn-sticky-' + action.toLowerCase());
       const oldHtml = btn ? btn.innerHTML : '';
+      const oldStickyHtml = btnSticky ? btnSticky.innerHTML : '';
       if (btn) {
         btn.disabled = true;
         btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
+      }
+      if (btnSticky) {
+        btnSticky.disabled = true;
+        btnSticky.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Placing...';
       }
 
       try {
@@ -5000,6 +5070,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           btn.disabled = false;
           btn.innerHTML = oldHtml;
         }
+        if (btnSticky) {
+          btnSticky.disabled = false;
+          btnSticky.innerHTML = oldStickyHtml;
+        }
       }
     }
 
@@ -5020,6 +5094,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const activeTfTag = document.getElementById('active-tf-tag');
         const activeModeTag = document.getElementById('active-mode-tag');
         const manualPanel = document.getElementById('manual-control-panel');
+        const manualDock = document.getElementById('manual-sticky-dock');
 
         if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
         if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
@@ -5045,6 +5120,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (manualPanel) {
           manualPanel.classList.toggle('hidden', !isManual);
         }
+        if (manualDock) {
+          manualDock.classList.toggle('hidden', !isManual);
+        }
+
+        const isKillActive = Boolean(data.kill_file_exists || data.kill_switch_triggered);
+        const killBanner = document.getElementById('kill-switch-active-banner');
+        const btnResetKill = document.getElementById('btn-reset-kill');
+        const btnResetKillMob = document.getElementById('btn-reset-kill-mob');
+        if (killBanner) killBanner.classList.toggle('hidden', !isKillActive);
+        if (btnResetKill) btnResetKill.classList.toggle('hidden', !isKillActive);
+        if (btnResetKillMob) btnResetKillMob.classList.toggle('hidden', !isKillActive);
 
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
@@ -5085,15 +5171,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (bottomBtnText) { bottomBtnText.innerText = 'Stop'; bottomBtnText.className = 'text-[10px] font-semibold mt-0.5 text-amber-400'; }
           if (bottomBtnIcon) { bottomBtnIcon.className = 'fa-solid fa-stop text-amber-400 text-base'; }
         } else {
-          if (dot) dot.className = 'inline-block w-2 h-2 rounded-full bg-slate-500';
+          if (dot) dot.className = isKillActive ? 'inline-block w-2 h-2 rounded-full bg-rose-500 animate-pulse' : 'inline-block w-2 h-2 rounded-full bg-slate-500';
           if (text) {
-            text.innerText = data.kill_file_exists ? 'HALTED (KILL SWITCH)' : 'IDLE';
-            text.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+            text.innerText = isKillActive ? 'HALTED (KILL SWITCH)' : 'IDLE';
+            text.className = isKillActive ? 'font-semibold text-rose-400' : 'font-semibold text-slate-400';
           }
-          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full ' + (data.kill_file_exists ? 'bg-red-500' : 'bg-slate-500');
+          if (dotMob) dotMob.className = 'inline-block w-2 h-2 rounded-full ' + (isKillActive ? 'bg-rose-500 animate-pulse' : 'bg-slate-500');
           if (textMob) {
-            textMob.innerText = data.kill_file_exists ? 'HALTED' : 'IDLE';
-            textMob.className = data.kill_file_exists ? 'font-semibold text-red-400' : 'font-semibold text-slate-400';
+            textMob.innerText = isKillActive ? 'HALTED' : 'IDLE';
+            textMob.className = isKillActive ? 'font-semibold text-rose-400' : 'font-semibold text-slate-400';
           }
 
           if (btnToggleText) btnToggleText.innerText = 'Start Bot';
@@ -5180,6 +5266,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await refreshLogs();
       } catch (e) {
         alert('Kill switch failed: ' + e);
+      }
+    }
+
+    async function deactivateKillSwitch() {
+      if (!confirm('Deactivate emergency KILL SWITCH and return to IDLE mode? This clears the halt latch and establishes the current equity baseline.')) return;
+      try {
+        const res = await fetch('/api/bot/reset_kill', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert('Could not deactivate kill switch: ' + (data.message || 'Unknown error'));
+        }
+      } catch (e) {
+        alert('Deactivate kill switch failed: ' + e);
       }
     }
 

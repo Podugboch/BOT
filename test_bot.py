@@ -208,6 +208,22 @@ class TestRiskManager:
         assert can_trade is False
         assert "3 consecutive losses" in reason
 
+    def test_reset_kill_switch_clears_latch_and_resets_baseline(self):
+        cfg = RiskConfig(max_drawdown_pct=0.15)
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        risk.record_trade_result(-160.0)
+        assert risk.can_trade()[0] is False
+        assert risk.state.kill_switch_triggered is True
+
+        risk.reset_kill_switch(reset_peak=True)
+        assert risk.state.kill_switch_triggered is False
+        assert risk.state.peak_equity == 840.0
+        assert risk.state.equity == 840.0
+        assert risk.state.trading_halted_today is False
+        can_trade, reason = risk.can_trade()
+        assert can_trade is True
+        assert reason == "OK"
+
 
 # ============================================================================
 # EXCHANGE CLIENT (PAPER MODE) TESTS
@@ -638,6 +654,22 @@ class TestTradingBot:
         assert bot.kill_switch_active() is True
         assert bot.step() is False
 
+    def test_deactivate_kill_switch(self, tmp_path):
+        cfg = BotConfig()
+        kill_file = str(tmp_path / "TEST_KILL_FILE")
+        cfg.kill_switch_file = kill_file
+        bot = TradingBot(cfg)
+
+        with open(kill_file, "w") as f:
+            f.write("HALT")
+        bot.risk.state.kill_switch_triggered = True
+
+        assert bot.kill_switch_active() is True
+        bot.deactivate_kill_switch()
+        assert bot.kill_switch_active() is False
+        assert not os.path.exists(kill_file)
+        assert bot.risk.state.kill_switch_triggered is False
+
 
 # ============================================================================
 # MULTI-STRATEGY & SETTINGS ENDPOINT TESTS
@@ -768,6 +800,35 @@ class TestNewIndicatorsAndMultiStrategy:
             runner.cfg.execution_mode = orig_mode
             runner.cfg.exchange.timeframe = orig_tf
             runner.cfg.exchange.symbol = orig_sym
+
+    def test_api_reset_kill_and_manual_sticky_dock(self, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        assert 'id="manual-sticky-dock"' in DASHBOARD_HTML
+        assert 'id="btn-sticky-buy"' in DASHBOARD_HTML
+        assert 'id="btn-sticky-sell"' in DASHBOARD_HTML
+        assert 'id="kill-switch-active-banner"' in DASHBOARD_HTML
+        assert 'id="btn-reset-kill"' in DASHBOARD_HTML
+        assert 'deactivateKillSwitch()' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        old_kill_file = runner.cfg.kill_switch_file
+        test_kill_file = str(tmp_path / "KILL")
+        runner.cfg.kill_switch_file = test_kill_file
+        try:
+            with open(test_kill_file, "w") as f:
+                f.write("HALT")
+            assert os.path.exists(test_kill_file)
+
+            res = client.post("/api/bot/reset_kill")
+            assert res.status_code == 200
+            assert res.json()["success"] is True
+            assert not os.path.exists(test_kill_file)
+        finally:
+            runner.cfg.kill_switch_file = old_kill_file
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
 
 
 # ============================================================================
