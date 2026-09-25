@@ -1073,3 +1073,28 @@ class TestSecretEncryptionAndVault:
         assert captured["args"][0] == user_id
         assert captured["args"][1] == "mexc"
         assert captured["args"][5] is False
+
+    def test_delete_exchange_key_removes_from_db_and_remote(self, monkeypatch):
+        """Deleting an exchange key removes it from SQLite and invokes remote deletion."""
+        AuthService.register("del_user", "del@market.io", "Pass123456")
+        conn = get_db_connection()
+        user_id = conn.execute("SELECT id FROM users WHERE username = 'del_user'").fetchone()["id"]
+        conn.close()
+
+        deleted_remote = []
+        monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
+        monkeypatch.setattr("auth.remote_save_exchange_key", lambda *args, **kwargs: True)
+        monkeypatch.setattr("auth.remote_save_latest_exchange_key", lambda *args, **kwargs: True)
+        monkeypatch.setattr("auth.remote_delete_exchange_key", lambda uid, ex: deleted_remote.append((uid, ex)) or True)
+
+        AuthService.save_exchange_key(user_id, "binance", "APIKEY", "APISECRET", "", testnet=False)
+        keys_before = AuthService.get_exchange_keys(user_id)
+        assert len(keys_before) == 1
+        assert keys_before[0]["exchange_id"] == "binance"
+
+        res = AuthService.delete_exchange_key(user_id, "binance")
+        assert res["success"] is True
+        assert deleted_remote == [(user_id, "binance")]
+
+        keys_after = AuthService.get_exchange_keys(user_id)
+        assert len(keys_after) == 0

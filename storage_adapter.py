@@ -351,6 +351,90 @@ def remote_get_exchange_keys(user_id: int, masked: bool = False) -> List[Dict[st
     return [_masked(record) for record in records] if masked else records
 
 
+def remote_delete_exchange_key(user_id: int, exchange_id: str) -> bool:
+    if not is_remote_storage_available():
+        return False
+    uid = int(user_id)
+    exchange = _exchange(exchange_id)
+    driver = _driver()
+    if driver == "kv":
+        del_key = _kv_ok("DEL", f"exchange_key:{uid}:{exchange}")
+        rem_set = _kv_ok("SREM", f"user:{uid}:exchanges", exchange)
+        ok, raw = _kv_command("GET", "exchange_key:latest")
+        if ok and raw:
+            try:
+                rec = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(rec, dict) and rec.get("user_id") == uid and str(rec.get("exchange_id", "")).lower() == exchange:
+                    _kv_ok("DEL", "exchange_key:latest")
+            except Exception:
+                pass
+        return del_key or rem_set
+    if driver == "turso":
+        if not _turso_init():
+            return False
+        ok1, _ = _turso_execute("DELETE FROM remote_exchange_keys WHERE user_id=? AND exchange_id=?", (uid, exchange))
+        _turso_execute("DELETE FROM remote_latest_exchange_key WHERE user_id=? AND exchange_id=?", (uid, exchange))
+        return bool(ok1)
+    path = f"exchange_keys/{uid}/{exchange}.json"
+    deleted = _blob_del(path)
+    names = _blob_json(f"exchange_keys/{uid}/list.json")
+    if isinstance(names, list):
+        updated = [n for n in names if str(n).lower() != exchange]
+        _blob_write_index(f"exchange_keys/{uid}/list.json", updated, "exchange")
+    rec = _blob_json("exchange_keys/latest.json")
+    if isinstance(rec, dict) and rec.get("user_id") == uid and str(rec.get("exchange_id", "")).lower() == exchange:
+        _blob_del("exchange_keys/latest.json")
+    return bool(deleted)
+
+
+def remote_save_app_setting(key: str, value: Any) -> bool:
+    if not is_remote_storage_available():
+        return False
+    k = _component(key, "setting_key")
+    driver = _driver()
+    raw = _json(value).encode()
+    if driver == "kv":
+        return _kv_ok("SET", f"app_setting:{k}", raw.decode())
+    if driver == "turso":
+        if not _turso_init():
+            return False
+        _turso_execute(
+            "CREATE TABLE IF NOT EXISTS remote_app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        ok, _ = _turso_execute(
+            "INSERT INTO remote_app_settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (k, raw.decode(), datetime.now(timezone.utc).isoformat())
+        )
+        return bool(ok)
+    return _blob_put(f"app_settings/{k}.json", raw)
+
+
+def remote_get_app_setting(key: str) -> Optional[Any]:
+    if not is_remote_storage_available():
+        return None
+    k = _component(key, "setting_key")
+    driver = _driver()
+    if driver == "kv":
+        ok, raw = _kv_command("GET", f"app_setting:{k}")
+        if ok and raw:
+            try:
+                return json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return raw
+        return None
+    if driver == "turso":
+        if not _turso_init():
+            return None
+        ok, rows = _turso_execute("SELECT value FROM remote_app_settings WHERE key=?", (k,))
+        if ok and rows:
+            try:
+                return json.loads(rows[0][0])
+            except Exception:
+                return rows[0][0]
+        return None
+    return _blob_json(f"app_settings/{k}.json")
+
+
 # ------------------------------- Deletion ---------------------------------
 def remote_delete_account(user_id: int, username: str = "", email: str = "") -> bool:
     if not is_remote_storage_available(): return False

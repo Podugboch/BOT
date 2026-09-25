@@ -287,6 +287,10 @@ class SaveExchangeKeyRequest(BaseModel):
     testnet: Optional[bool] = True
 
 
+class DeleteExchangeKeyRequest(BaseModel):
+    exchange_id: Optional[str] = None
+
+
 class TestExchangeRequest(BaseModel):
     exchange_id: str
     api_key: str
@@ -911,6 +915,56 @@ def save_exchange_credentials(
     }
 
 
+@app.post("/api/exchange/delete")
+@app.delete("/api/exchange/delete")
+@app.delete("/api/exchange/key")
+def delete_exchange_credentials(
+    req: Optional[DeleteExchangeKeyRequest] = None,
+    exchange_id: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    bot_auth_token: Optional[str] = Cookie(None),
+):
+    user = get_current_user(authorization, bot_auth_token)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please log in to manage exchange API keys."
+        )
+
+    target_ex = None
+    if req and req.exchange_id:
+        target_ex = req.exchange_id.strip().lower()
+    elif exchange_id:
+        target_ex = exchange_id.strip().lower()
+
+    if not target_ex:
+        raise HTTPException(status_code=400, detail="Missing exchange_id to delete.")
+
+    try:
+        AuthService.delete_exchange_key(user["id"], target_ex)
+    except Exception as e:
+        logger.exception("Failed deleting exchange credentials for user %s on %s", user.get("id"), target_ex)
+        raise HTTPException(status_code=500, detail=f"Failed to delete exchange credentials: {e}")
+
+    # If the active runner configuration was using this exchange, clear in-memory credentials
+    if runner.cfg.exchange.exchange_id.lower() == target_ex:
+        runner.cfg.exchange.api_key = ""
+        runner.cfg.exchange.api_secret = ""
+        runner.cfg.exchange.api_passphrase = ""
+        if runner.bot and runner.bot.exchange:
+            runner.bot.exchange.cfg.api_key = ""
+            runner.bot.exchange.cfg.api_secret = ""
+            runner.bot.exchange.cfg.api_passphrase = ""
+        for k in ["EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"]:
+            os.environ.pop(k, None)
+
+    return {
+        "success": True,
+        "exchange_id": target_ex,
+        "message": f"API keys for {target_ex.upper()} successfully removed."
+    }
+
+
 # ============================================================================
 # API ENDPOINTS: CODE DOWNLOAD
 # ============================================================================
@@ -1008,10 +1062,28 @@ def get_status(response: Response = None):
         "valid": False,
     }
 
+    env_mode = os.getenv("EXECUTION_MODE")
+    if env_mode in ("auto", "manual"):
+        cfg.execution_mode = env_mode
+        exec_mode = env_mode
+    else:
+        exec_mode = getattr(cfg, "execution_mode", None)
+        if not exec_mode or exec_mode == "auto":
+            try:
+                from storage_adapter import remote_get_app_setting
+                rm = remote_get_app_setting("execution_mode")
+                if rm in ("auto", "manual"):
+                    cfg.execution_mode = rm
+                    os.environ["EXECUTION_MODE"] = rm
+                    exec_mode = rm
+            except Exception:
+                pass
+    exec_mode = exec_mode or getattr(cfg, "execution_mode", "auto") or "auto"
+
     return {
         "running": runner.running,
         "mode": cfg.mode,
-        "execution_mode": getattr(cfg, "execution_mode", "auto"),
+        "execution_mode": exec_mode,
         "strategy": cfg.strategy.strategy_name,
         "strategy_name": strat_meta["name"],
         "strategy_short_name": strat_meta.get("short_name", strat_meta["name"]),
@@ -1146,6 +1218,12 @@ def save_bot_settings(req: BotSettingsRequest):
         runner.stop()
 
     runner.cfg.execution_mode = exec_mode
+    os.environ["EXECUTION_MODE"] = exec_mode
+    try:
+        from storage_adapter import remote_save_app_setting
+        remote_save_app_setting("execution_mode", exec_mode)
+    except Exception as e:
+        logger.debug(f"Remote storage execution_mode save skipped: {e}")
     runner.cfg.strategy.strategy_name = strategy_id
     runner.cfg.exchange.timeframe = timeframe
     runner.cfg.exchange.symbol = symbol
@@ -1236,6 +1314,12 @@ def set_execution_mode_endpoint(req: ExecutionModeRequest):
             env_file.write_text("".join(new_lines))
     except Exception as e:
         logger.warning(f"Failed updating .env with execution_mode: {e}")
+
+    try:
+        from storage_adapter import remote_save_app_setting
+        remote_save_app_setting("execution_mode", mode)
+    except Exception as e:
+        logger.debug(f"Remote storage execution_mode save skipped: {e}")
 
     logger.info("Bot execution mode explicitly updated to: %s", mode.upper())
     return {
@@ -2924,6 +3008,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
 
             <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+              <button type="button" onclick="deleteCurrentExchangeKey()" id="btn-remove-key" class="w-full sm:w-auto px-3.5 py-2.5 sm:py-2 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 hover:text-white border border-rose-800/60 font-semibold rounded-lg transition flex items-center justify-center gap-1.5" title="Remove saved credentials for the selected exchange">
+                <i class="fa-solid fa-trash-can"></i> Remove Keys
+              </button>
               <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
                 <i class="fa-solid fa-plug"></i> Test Connection
               </button>
@@ -4277,6 +4364,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function deleteSavedExchangeKey(exchangeId) {
+      if (!exchangeId) return;
+      const exName = exchangeId.toUpperCase();
+      if (!confirm(`Are you sure you want to remove your saved API credentials for ${exName}?\n\nThis will remove them from secure encrypted storage and reset this exchange to public / paper mode.`)) return;
+
+      const token = localStorage.getItem('bot_auth_token');
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+
+      try {
+        const res = await fetch('/api/exchange/delete', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ exchange_id: exchangeId })
+        });
+        const data = await res.json();
+        const resBox = document.getElementById('key-test-result');
+        if (resBox) resBox.classList.remove('hidden');
+
+        if (res.ok && data.success) {
+          if (resBox) {
+            resBox.className = 'text-xs p-3 rounded-lg border bg-amber-950/60 border-amber-500/40 text-amber-200';
+            resBox.innerHTML = `<strong><i class="fa-solid fa-trash-can"></i> ${data.message}</strong>`;
+          }
+          const sel = document.getElementById('key-exchange-select');
+          if (sel && sel.value.toLowerCase() === exchangeId.toLowerCase()) {
+            const kInput = document.getElementById('key-api-key');
+            const sInput = document.getElementById('key-api-secret');
+            const pInput = document.getElementById('key-api-passphrase');
+            if (kInput) kInput.value = '';
+            if (sInput) sInput.value = '';
+            if (pInput) pInput.value = '';
+          }
+          await checkAuth();
+          await fetchStatus();
+        } else {
+          if (resBox) {
+            resBox.className = 'text-xs p-3 rounded-lg border bg-rose-950/60 border-rose-500/40 text-rose-200';
+            resBox.innerText = data.detail || data.message || 'Remove failed';
+          }
+        }
+      } catch (err) {
+        alert('Failed to remove API key: ' + err);
+      }
+    }
+
+    async function deleteCurrentExchangeKey() {
+      const sel = document.getElementById('key-exchange-select');
+      const exId = sel ? sel.value : '';
+      if (!exId) {
+        alert('Please choose an exchange to remove credentials for.');
+        return;
+      }
+      await deleteSavedExchangeKey(exId);
+    }
+
     // --- Authentication Modals & API ---
     function openAuthModal(mode) {
       document.getElementById('auth-modal').classList.remove('hidden');
@@ -4832,7 +4975,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <span class="text-[10px] px-1.5 py-0.5 rounded ${k.testnet ? 'bg-blue-500/20 text-blue-300' : 'bg-emerald-500/20 text-emerald-300'} shrink-0">${k.testnet ? 'TESTNET' : 'LIVE'}</span>
                     <span class="font-mono text-slate-400 text-[11px] truncate">${k.api_key_masked}</span>
                   </div>
-                  <span class="text-[10px] text-slate-500 shrink-0">Configured</span>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <span class="text-[10px] text-emerald-400 font-medium">Configured</span>
+                    <button type="button" onclick="deleteSavedExchangeKey('${k.exchange_id}')" class="px-2 py-0.5 text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 rounded transition border border-slate-800 hover:border-rose-500/40 flex items-center gap-1 text-[11px]" title="Remove saved API keys for ${k.exchange_id.toUpperCase()}">
+                      <i class="fa-solid fa-trash-can text-xs"></i>
+                      <span>Remove</span>
+                    </button>
+                  </div>
                 `;
                 list.appendChild(div);
               });
@@ -5024,14 +5173,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         // 2. Set execution mode
+        const savedMode = localStorage.getItem('bot_execution_mode') || data.execution_mode;
         const radioManual = document.getElementById('radio-mode-manual');
         const radioAuto = document.getElementById('radio-mode-auto');
-        if (data.execution_mode === 'manual') {
+        if (savedMode === 'manual') {
           if (radioManual) radioManual.checked = true;
+          if (radioAuto) radioAuto.checked = false;
         } else {
           if (radioAuto) radioAuto.checked = true;
+          if (radioManual) radioManual.checked = false;
         }
-        onExecutionModeOptionChange();
+        onExecutionModeOptionChange(false);
 
         // 3. Set timeframe (with 5m included and verified)
         const tfSel = document.getElementById('settings-timeframe');
@@ -5068,8 +5220,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const radioManual = document.getElementById('radio-mode-manual');
       const isManual = radioManual ? radioManual.checked : false;
+      const targetExecMode = isManual ? 'manual' : 'auto';
+      localStorage.setItem('bot_execution_mode', targetExecMode);
+      updateExecutionModeUI(isManual);
       const payload = {
-        execution_mode: isManual ? 'manual' : 'auto',
+        execution_mode: targetExecMode,
         strategy: document.getElementById('settings-strategy').value,
         timeframe: document.getElementById('settings-timeframe').value,
         symbol: document.getElementById('settings-symbol').value.trim().toUpperCase(),
@@ -5121,7 +5276,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function updateExecutionModeUI(isManual) {
+      const btnExecAuto = document.getElementById('btn-exec-auto');
+      const btnExecManual = document.getElementById('btn-exec-manual');
+      if (btnExecAuto && btnExecManual) {
+        if (isManual) {
+          btnExecManual.className = 'px-2.5 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+          btnExecAuto.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
+        } else {
+          btnExecAuto.className = 'px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
+          btnExecManual.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
+        }
+      }
+      const manualPanel = document.getElementById('manual-control-panel');
+      const manualDock = document.getElementById('manual-sticky-dock');
+      if (manualPanel) {
+        manualPanel.classList.toggle('hidden', !isManual);
+      }
+      if (manualDock) {
+        manualDock.classList.toggle('hidden', !isManual);
+      }
+    }
+
     async function quickSetExecutionMode(targetMode) {
+      const isManual = (targetMode === 'manual');
+      localStorage.setItem('bot_execution_mode', targetMode);
+      updateExecutionModeUI(isManual);
+
+      const radioManual = document.getElementById('radio-mode-manual');
+      const radioAuto = document.getElementById('radio-mode-auto');
+      if (radioManual) radioManual.checked = isManual;
+      if (radioAuto) radioAuto.checked = !isManual;
+      if (typeof onExecutionModeOptionChange === 'function') {
+        onExecutionModeOptionChange(false);
+      }
+
       try {
         const res = await fetch('/api/bot/execution_mode', {
           method: 'POST',
@@ -5133,11 +5322,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           await fetchStatus();
           await refreshLogs();
         } else {
-          alert('Failed to switch execution mode: ' + (data.detail || data.message));
+          console.warn('Execution mode switch warning:', data);
         }
       } catch (err) {
-        alert('Error changing execution mode: ' + err);
+        console.warn('Error changing execution mode:', err);
       }
+    }
+
+    function toggleExecutionMode() {
+      const current = localStorage.getItem('bot_execution_mode') || 'auto';
+      const target = (current === 'manual') ? 'auto' : 'manual';
+      quickSetExecutionMode(target);
     }
 
     async function triggerManualTrade(action) {
@@ -5196,13 +5391,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         updateTradingModeUI(isReal, data.mode, data.testnet);
         document.getElementById('val-symbol-tag').innerText = `${data.symbol} ${data.timeframe}`;
 
-        // Update Execution Mode & Strategy UI on Dashboard
-        const isManual = (data.execution_mode === 'manual');
+        // Update Execution Mode & Strategy UI on Dashboard (Client-authoritative via localStorage)
+        const savedExecMode = localStorage.getItem('bot_execution_mode');
+        let effectiveExecMode = data.execution_mode;
+        if (savedExecMode) {
+          effectiveExecMode = savedExecMode;
+          if (data.execution_mode && data.execution_mode !== savedExecMode) {
+            fetch('/api/bot/execution_mode', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ execution_mode: savedExecMode })
+            }).catch(() => {});
+          }
+        } else if (data.execution_mode) {
+          localStorage.setItem('bot_execution_mode', data.execution_mode);
+          effectiveExecMode = data.execution_mode;
+        }
+
+        const isManual = (effectiveExecMode === 'manual');
+        updateExecutionModeUI(isManual);
+
         const activeStratTag = document.getElementById('active-strat-tag');
         const activeTfTag = document.getElementById('active-tf-tag');
         const activeModeTag = document.getElementById('active-mode-tag');
-        const manualPanel = document.getElementById('manual-control-panel');
-        const manualDock = document.getElementById('manual-sticky-dock');
 
         if (activeStratTag) activeStratTag.innerText = `Strategy: ${data.strategy_short_name || data.strategy}`;
         if (activeTfTag) activeTfTag.innerText = `Timeframe: ${data.timeframe}`;
@@ -5218,17 +5429,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         }
 
-        const btnExecAuto = document.getElementById('btn-exec-auto');
-        const btnExecManual = document.getElementById('btn-exec-manual');
-        if (btnExecAuto && btnExecManual) {
-          if (isManual) {
-            btnExecManual.className = 'px-2.5 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
-            btnExecAuto.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
-          } else {
-            btnExecAuto.className = 'px-2.5 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md shadow transition flex items-center gap-1.5';
-            btnExecManual.className = 'px-2.5 py-1.5 text-slate-300 hover:text-white text-xs font-bold rounded-md transition flex items-center gap-1.5';
-          }
-        }
         const tfWarnBanner = document.getElementById('tf-warning-banner');
         if (tfWarnBanner) {
           if (data.timeframe_warning || ['1m', '3m', '5m', '15m'].includes(data.timeframe)) {
@@ -5236,12 +5436,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           } else {
             tfWarnBanner.classList.add('hidden');
           }
-        }
-        if (manualPanel) {
-          manualPanel.classList.toggle('hidden', !isManual);
-        }
-        if (manualDock) {
-          manualDock.classList.toggle('hidden', !isManual);
         }
 
         const isKillActive = Boolean(data.kill_file_exists || data.kill_switch_triggered);
@@ -6880,6 +7074,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     // Startup
+    const initialSavedMode = localStorage.getItem('bot_execution_mode');
+    if (initialSavedMode) {
+      updateExecutionModeUI(initialSavedMode === 'manual');
+    }
     loadExchanges();
     checkAuth();
     loadBotSettings();

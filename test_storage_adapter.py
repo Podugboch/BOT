@@ -86,3 +86,30 @@ def test_blob_concurrent_style_updates_preserve_index(storage, monkeypatch):
     assert storage.remote_save_user(2, "bob", "b@example.com", "h", "s")
     index = storage._blob_json("users/index.json")
     assert set(index["ids"]) == {1, 2}
+
+
+def test_remote_delete_exchange_key(storage, monkeypatch):
+    objects = {}
+    monkeypatch.setattr(storage, "_blob_put", lambda path, data, content_type="application/json": objects.__setitem__(path, data) or True)
+    monkeypatch.setattr(storage, "_blob_get", lambda path: objects.get(path))
+    monkeypatch.setattr(storage, "_blob_del", lambda path: objects.pop(path, None) is not None)
+    monkeypatch.setattr(storage, "_encrypt", lambda value: value)
+
+    assert storage.remote_save_exchange_key(1, "binance", "key", "secret")
+    assert storage.remote_save_latest_exchange_key(1, "binance", "key", "secret", "")
+    assert "exchange_keys/1/binance.json" in objects
+    assert "exchange_keys/latest.json" in objects
+
+    assert storage.remote_delete_exchange_key(1, "binance") is True
+    assert "exchange_keys/1/binance.json" not in objects
+    assert "exchange_keys/latest.json" not in objects
+
+
+def test_remote_app_setting_round_trip(storage, monkeypatch):
+    objects = {}
+    monkeypatch.setattr(storage, "_blob_put", lambda path, data, content_type="application/json": objects.__setitem__(path, data) or True)
+    monkeypatch.setattr(storage, "_blob_get", lambda path: objects.get(path))
+
+    assert storage.remote_save_app_setting("execution_mode", "manual")
+    assert storage.remote_get_app_setting("execution_mode") == "manual"
+
