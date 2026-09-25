@@ -3066,5 +3066,36 @@ globalThis.fetch = async (url, opts) => {
         assert "Sweep timeframe 1h: walked" in web_text
         assert "Sweep timeframe 4h: walked" in web_text
 
+    def test_sweep_tag_logged_and_passed_through_pipeline(self, caplog):
+        """When sweep_tag is provided, both engine and web logs should be tagged with it."""
+        import web_server
+        import backtester
+        from config import BotConfig
+        cfg = BotConfig()
+        df = _wave_ohlcv(n=200)
+
+        with caplog.at_level("INFO", logger="backtest"):
+            res = backtester.run_backtest(df, cfg, sweep_tag="Sweep 365d")
+            assert res["sweep_tag"] == "Sweep 365d"
+            assert res["diagnostics"]["sweep_tag"] == "Sweep 365d"
+
+        bt_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "[Sweep 365d] Strategy loop walked" in bt_text
+        assert "[Sweep 365d] Backtest summary:" in bt_text
+        assert "[Sweep 365d] Backtest stages:" in bt_text
+
+    def test_dashboard_html_contains_log_filters_and_sweep_tagging(self):
+        """Dashboard HTML must include sweep log filters and sweep tagging logic."""
+        import web_server
+        html = web_server.DASHBOARD_HTML
+        assert 'id="btn-log-filter-sweep"' in html
+        assert 'id="btn-log-filter-live"' in html
+        assert 'id="btn-log-filter-all"' in html
+        assert "setLogFilter(" in html
+        assert "renderLogs(" in html
+        assert "sweep_tag: 'Sweep ' + item.label" in html
+        assert "sweep_tag: 'Sweep ' + item.tf" in html
+
+
 
 
