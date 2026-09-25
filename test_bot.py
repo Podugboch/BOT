@@ -805,9 +805,12 @@ class TestNewIndicatorsAndMultiStrategy:
         from fastapi.testclient import TestClient
         from web_server import app, runner, DASHBOARD_HTML
 
-        assert 'id="manual-sticky-dock"' in DASHBOARD_HTML
-        assert 'id="btn-sticky-buy"' in DASHBOARD_HTML
-        assert 'id="btn-sticky-sell"' in DASHBOARD_HTML
+        assert 'id="manual-control-panel"' in DASHBOARD_HTML
+        assert 'id="btn-manual-buy"' in DASHBOARD_HTML
+        assert 'id="btn-manual-sell"' in DASHBOARD_HTML
+        assert 'id="manual-sticky-dock"' not in DASHBOARD_HTML
+        assert 'id="btn-sticky-buy"' not in DASHBOARD_HTML
+        assert 'id="btn-sticky-sell"' not in DASHBOARD_HTML
         assert 'id="kill-switch-active-banner"' in DASHBOARD_HTML
         assert 'id="btn-reset-kill"' in DASHBOARD_HTML
         assert 'deactivateKillSwitch()' in DASHBOARD_HTML
