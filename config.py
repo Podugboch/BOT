@@ -164,6 +164,7 @@ class RiskConfig:
     # cooldown that lifts on its own instead of halting forever.
     max_consecutive_losses: int = 8
     loss_streak_cooldown_hours: float = 24.0   # 0 = block until a winning trade
+    max_spread_pct: float = 0.35               # max allowed market spread (0.35%) before suppressing entry
 
 
 def _get_exchange_credential(env_key: str, db_key: str) -> str:

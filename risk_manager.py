@@ -106,6 +106,25 @@ class RiskManager:
         max_size = (self.state.equity * 0.99) / entry_price
         return max(0.0, min(size, max_size))
 
+    def validate_min_notional(self, entry_price: float, size: float, min_notional: float = 5.0, min_amount: float = 0.00001) -> tuple[bool, str]:
+        """
+        Validate whether the computed position size clears exchange min notional / amount limits.
+        If it falls below, returns (False, explanation of rejection).
+        Orders below minimum notional are REJECTED to prevent exchange API errors without
+        artificially oversizing trades beyond the risk budget.
+        """
+        if size <= 0:
+            return False, "Order rejected: position size is 0.0 (check equity and risk parameters)."
+        if size < min_amount:
+            return False, f"Order rejected: position size {size:.6f} is below exchange minimum amount {min_amount:.6f}."
+        notional = entry_price * size
+        if notional < min_notional:
+            return False, (
+                f"Order rejected: order notional ${notional:.2f} is below exchange minimum ${min_notional:.2f}. "
+                f"Trade skipped to preserve risk limits."
+            )
+        return True, "OK"
+
     # -- stop / target -----------------------------------------------------
     def reward_risk_ratio(self) -> float:
         """Realised target-to-stop multiple under the current config."""
@@ -238,6 +257,19 @@ class RiskManager:
                     "%s (%g hour cooldown). The bot resumes automatically; it is not halted "
                     "permanently, and a winning trade clears it early.",
                     self.state.cooldown_losses, _fmt_until(self.state.cooldown_until), hours)
+        try:
+            now_utc = datetime.now(timezone.utc)
+            if abs((now_utc - _as_utc(now)).total_seconds()) < 600:
+                from alerts import get_alert_dispatcher
+                get_alert_dispatcher().send_alert(
+                    "CIRCUIT_BREAKER",
+                    "Consecutive Loss Cooldown Tripped",
+                    f"Hit {self.state.cooldown_losses} consecutive losses. Pausing new entries for {hours}h.",
+                    level="warning",
+                    details={"consecutive_losses": self.state.cooldown_losses, "cooldown_hours": hours}
+                )
+        except Exception:
+            pass
 
     def _clear_cooldown(self, now: datetime) -> None:
         expired = self.state.cooldown_until
@@ -272,6 +304,15 @@ class RiskManager:
         self.state.daily_start_equity = self.state.equity
         self.state.trading_halted_today = False
 
+    def reset_kill_switch(self, reset_peak: bool = True) -> None:
+        """Deactivate the kill switch latch and establish current equity as new baseline."""
+        self.state.kill_switch_triggered = False
+        if reset_peak and self.state.equity > 0:
+            self.state.peak_equity = self.state.equity
+        self.state.daily_start_equity = self.state.equity
+        self.state.trading_halted_today = False
+        log.info("Risk manager kill switch reset. Baseline equity established at $%.2f.", self.state.equity)
+
     def can_trade(self, now=None) -> tuple[bool, str]:
         s, c = self.state, self.cfg
         now = _as_utc(now)
@@ -281,6 +322,20 @@ class RiskManager:
 
         drawdown = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0
         if drawdown >= c.max_drawdown_pct:
+            if not s.kill_switch_triggered:
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    if abs((now_utc - now).total_seconds()) < 600:
+                        from alerts import get_alert_dispatcher
+                        get_alert_dispatcher().send_alert(
+                            "MAX_DRAWDOWN",
+                            "Max Drawdown Limit Reached",
+                            f"Current drawdown is {drawdown:.1%}, reaching max threshold {c.max_drawdown_pct:.1%}. Trading halted.",
+                            level="critical",
+                            details={"equity": round(s.equity, 2), "peak_equity": round(s.peak_equity, 2), "drawdown_pct": round(drawdown * 100, 2)}
+                        )
+                except Exception:
+                    pass
             s.kill_switch_triggered = True
             return False, f"Kill switch: max drawdown {drawdown:.1%} reached"
 
@@ -292,6 +347,20 @@ class RiskManager:
             if s.daily_start_equity > 0 else 0
         )
         if daily_loss >= c.max_daily_loss_pct:
+            if not s.trading_halted_today:
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    if abs((now_utc - now).total_seconds()) < 600:
+                        from alerts import get_alert_dispatcher
+                        get_alert_dispatcher().send_alert(
+                            "CIRCUIT_BREAKER",
+                            "Daily Loss Circuit Breaker Tripped",
+                            f"Daily loss is {daily_loss:.1%}, exceeding max limit {c.max_daily_loss_pct:.1%}. Trading halted for today.",
+                            level="critical",
+                            details={"equity": round(s.equity, 2), "daily_start_equity": round(s.daily_start_equity, 2), "loss_pct": round(daily_loss * 100, 2)}
+                        )
+                except Exception:
+                    pass
             s.trading_halted_today = True
 
         if s.trading_halted_today:

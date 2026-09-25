@@ -22,6 +22,16 @@ from exchange_client import ExchangeClient
 from risk_manager import RiskManager
 from strategy import DEBOUNCE_REASON, Signal, add_indicators, generate_signal
 
+try:
+    from execution_tracker import get_execution_tracker
+except ImportError:
+    get_execution_tracker = None
+
+try:
+    from alerts import get_alert_dispatcher
+except ImportError:
+    get_alert_dispatcher = None
+
 log = logging.getLogger("bot")
 
 
@@ -74,14 +84,32 @@ class TradingBot:
         )
         self.position = None
         self.last_day = datetime.now(timezone.utc).date()
-        # Timestamp of the bar the bot last went flat on. The entry debounce is
-        # measured in candles, so we keep the bar's own timestamp and convert
-        # the gap back into a bar count — a whipsaw that exits and re-triggers
-        # within the cooldown is then suppressed instead of chained.
         self.last_exit_ts = None
+        self.tracker = get_execution_tracker() if get_execution_tracker else None
+        self.alerts = get_alert_dispatcher() if get_alert_dispatcher else None
 
     def kill_switch_active(self) -> bool:
         return os.path.exists(self.cfg.kill_switch_file) or getattr(self.risk.state, "kill_switch_triggered", False)
+
+    def deactivate_kill_switch(self) -> bool:
+        """Deactivate the kill switch by removing the trigger file and clearing risk manager latch."""
+        if os.path.exists(self.cfg.kill_switch_file):
+            try:
+                os.remove(self.cfg.kill_switch_file)
+                log.info("Kill switch file '%s' removed.", self.cfg.kill_switch_file)
+            except Exception as e:
+                log.warning("Could not remove kill switch file '%s': %s", self.cfg.kill_switch_file, e)
+
+        self.risk.reset_kill_switch(reset_peak=True)
+        if self.alerts:
+            self.alerts.send_alert(
+                "KILL_SWITCH_RESET",
+                "Kill Switch Deactivated",
+                "Emergency kill switch has been cleared. System returned to IDLE / ready state.",
+                level="info"
+            )
+        log.info("Emergency kill switch deactivated. Bot is ready.")
+        return True
 
     @staticmethod
     def _last_bar_ts(df):
@@ -122,6 +150,25 @@ class TradingBot:
             self.last_day = today
             log.info("New UTC trading day — daily loss counter reset.")
 
+    def sync_live_balance(self) -> dict:
+        """Synchronize the bot's risk equity with the live exchange wallet balance.
+        In live mode with authenticated API keys, dynamically updates RiskManager equity.
+        """
+        try:
+            wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            if self.cfg.mode == "live" and wallet.get("is_live"):
+                total_val = float(wallet.get("total_quote", 0.0) or 0.0)
+                if total_val > 0:
+                    old_equity = self.risk.state.equity
+                    self.risk.state.equity = total_val
+                    if abs(old_equity - total_val) > 1.0:
+                        log.info("Live wallet balance sync: equity updated $%.2f -> $%.2f (%s free: %.2f)",
+                                 old_equity, total_val, wallet.get("quote_currency"), wallet.get("free_quote", 0.0))
+            return wallet
+        except Exception as e:
+            log.warning("Could not sync live wallet balance: %s", e)
+            return self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+
     def step(self) -> bool:
         """One decision cycle. Returns False only if an active kill switch is triggered."""
         if self.kill_switch_active():
@@ -132,6 +179,7 @@ class TradingBot:
             return False
 
         self.maybe_reset_day()
+        self.sync_live_balance()
 
         try:
             df = self.exchange.fetch_ohlcv(limit=200)
@@ -230,10 +278,48 @@ class TradingBot:
         else:
             size = self.risk.position_size(price, stop)
 
+        # Normalize size to exchange lot precision
+        size = self.exchange.amount_to_precision(size, self.cfg.exchange.symbol)
+
         if size <= 0:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", 0.0, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason="Calculated position size is 0")
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Manual BUY Rejected ({self.cfg.exchange.symbol})", "Calculated position size is 0", level="warning")
             raise RuntimeError("Calculated position size is 0. Check equity or risk settings.")
 
-        fill = self.exchange.place_order("BUY", size, price)
+        valid_notional, notional_msg = self.risk.validate_min_notional(price, size)
+        if not valid_notional:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=notional_msg)
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Manual BUY Rejected ({self.cfg.exchange.symbol})", notional_msg, level="warning")
+            raise RuntimeError(notional_msg)
+
+        # Available wallet balance verification for manual buy
+        wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+        notional_req = size * price
+        free_quote = wallet.get("free_quote", 0.0)
+        if (self.cfg.mode == "live" or wallet.get("is_live")) and free_quote < notional_req:
+            msg = (f"Insufficient wallet balance: available {free_quote:.2f} {wallet.get('quote_currency', 'USDT')} "
+                   f"< required {notional_req:.2f} for size {size:.6f}")
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=msg)
+            if self.alerts:
+                self.alerts.send_alert("INSUFFICIENT_FUNDS", f"Insufficient Funds ({self.cfg.exchange.symbol})", msg, level="critical")
+            raise RuntimeError(msg)
+
+        try:
+            fill = self.exchange.place_order("BUY", size, price)
+        except Exception as e:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
+            raise
+
         self.position = {
             "entry": fill["price"],
             "size": size,
@@ -243,6 +329,15 @@ class TradingBot:
             "initial_stop": stop,
             "manual": True,
         }
+        if self.tracker:
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
+                                      fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+            self.tracker.record_position_opened(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size,
+                                                fill["price"], stop, target, fill["fee"], self.cfg.mode, initial_stop=stop)
+        if self.alerts:
+            self.alerts.send_alert("EXECUTION", f"Position Opened: MANUAL BUY {self.cfg.exchange.symbol}",
+                                   f"Filled at ${fill['price']:,.2f} | Size: {size:.6f} | Stop: ${stop:,.2f} | Target: ${target:,.2f}",
+                                   level="info")
         log.info("MANUAL BUY EXECUTED: entry=%.2f stop=%.2f target=%.2f size=%.6f (R:R 1:%.2f)",
                  fill["price"], stop, target, size, self.risk.reward_risk_ratio())
         return {
@@ -271,19 +366,36 @@ class TradingBot:
             except Exception:
                 price = self.position["entry"]
 
-        fill = self.exchange.place_order("SELL", self.position["size"], price)
-        pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]
+        sell_size = self.position["size"]
+        if self.cfg.mode == "live":
+            wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            free_base = wallet.get("free_base", 0.0)
+            if 0 < free_base < sell_size:
+                log.info("Adjusting manual sell size from %.6f to available free base %.6f", sell_size, free_base)
+                sell_size = free_base
+        sell_size = self.exchange.amount_to_precision(sell_size, self.cfg.exchange.symbol)
+
+        fill = self.exchange.place_order("SELL", sell_size, price)
+        pnl = ((fill["price"] - self.position["entry"]) * sell_size
                - self.position["fee_paid"] - fill["fee"])
         self.risk.record_trade_result(pnl)
         closed_position = dict(self.position)
         self.position = None
         self._mark_exit(df)
+        if self.tracker:
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
+                                      fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+            self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+        if self.alerts:
+            self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL SELL ({self.cfg.exchange.symbol})",
+                                   f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
+                                   level="info")
         log.info("MANUAL SELL EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
         return {
             "success": True,
             "action": "SELL",
             "price": fill["price"],
-            "size": closed_position["size"],
+            "size": sell_size,
             "pnl": round(pnl, 2),
             "equity": round(self.risk.state.equity, 2),
             "fee": fill["fee"],
@@ -301,7 +413,6 @@ class TradingBot:
 
         if sig != Signal.BUY:
             if stages.get("core_trigger"):
-                # The core indicators fired — say exactly which stage ate the trade.
                 log.info("Core signal triggered: BUY | Rejected by: %s", _pipeline_rejection(stages))
                 log.info("Signal pipeline [%s %s]: core_trigger=%s | fib_filter=%s | sizing=%s",
                          self.cfg.exchange.symbol, self.cfg.exchange.timeframe, stages.get("core_trigger"),
@@ -318,17 +429,96 @@ class TradingBot:
         atr_val = float(df["atr"].iloc[-1]) if "atr" in df and pd.notna(df["atr"].iloc[-1]) else (price * 0.02)
         stop, target = self.risk.stop_and_target(price, atr_val, "BUY")
         size = self.risk.position_size(price, stop)
+
+        # Normalize size to exchange lot precision
+        size = self.exchange.amount_to_precision(size, self.cfg.exchange.symbol)
+
         if size <= 0:
             log.warning("Core signal triggered: BUY | Rejected by: position sizing returned 0 "
                         "(equity $%.2f, risk %.2f%% per trade, stop distance $%.2f)",
                         self.risk.state.equity, self.risk.cfg.risk_per_trade_pct * 100, abs(price - stop))
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", 0.0, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason="Position sizing returned 0")
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Order Sizing Rejected ({self.cfg.exchange.symbol})",
+                                       f"Position sizing returned 0 (Equity: ${self.risk.state.equity:.2f}, Risk: {self.risk.cfg.risk_per_trade_pct:.2%})", level="warning")
             log.info("Signal pipeline [%s %s]: core_trigger=True | fib_filter=%s | sizing=False",
                      self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
                      "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")))
             return
-        fill = self.exchange.place_order("BUY", size, price)
+
+        # Minimum notional validation
+        min_notional = 5.0
+        try:
+            if hasattr(self.exchange, "load_market_limits"):
+                limits = self.exchange.load_market_limits(self.cfg.exchange.symbol)
+                min_notional = limits.get("min_notional", 5.0)
+        except Exception:
+            pass
+
+        valid_notional, notional_msg = self.risk.validate_min_notional(price, size, min_notional=min_notional)
+        if not valid_notional:
+            log.warning("Core signal triggered: BUY | Rejected by: %s", notional_msg)
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=notional_msg)
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Min Notional Rejected ({self.cfg.exchange.symbol})",
+                                       notional_msg, level="warning",
+                                       details={"symbol": self.cfg.exchange.symbol, "size": size, "notional": round(price * size, 2), "min_notional": min_notional})
+            return
+
+        # Order book spread & liquidity guard
+        max_spread = getattr(self.risk.cfg, "max_spread_pct", 0.35)
+        spread_info = self.exchange.fetch_order_book_spread(self.cfg.exchange.symbol)
+        if spread_info.get("valid") and spread_info.get("spread_pct", 0.0) > max_spread:
+            msg = (f"Order book spread too wide: {spread_info['spread_pct']:.3f}% "
+                   f"(limit: {max_spread:.3f}%, Bid: {spread_info['bid']}, Ask: {spread_info['ask']})")
+            log.warning("Core signal triggered: BUY | Rejected by: %s", msg)
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=msg)
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Spread Too Wide ({self.cfg.exchange.symbol})", msg, level="warning",
+                                       details={"symbol": self.cfg.exchange.symbol, "spread_pct": spread_info["spread_pct"], "max_spread_pct": max_spread})
+            return
+
+        # Available quote wallet balance verification
+        wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+        notional_req = size * price
+        free_quote = wallet.get("free_quote", 0.0)
+        if (self.cfg.mode == "live" or wallet.get("is_live")) and free_quote < notional_req:
+            msg = (f"Insufficient wallet balance: available {free_quote:.2f} {wallet.get('quote_currency', 'USDT')} "
+                   f"< required {notional_req:.2f} for size {size:.6f}")
+            log.warning("Core signal triggered: BUY | Rejected by: %s", msg)
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=msg)
+            if self.alerts:
+                self.alerts.send_alert("INSUFFICIENT_FUNDS", f"Insufficient Funds ({self.cfg.exchange.symbol})", msg, level="critical",
+                                       details={"symbol": self.cfg.exchange.symbol, "free_quote": free_quote, "required": notional_req})
+            return
+
+        try:
+            fill = self.exchange.place_order("BUY", size, price)
+        except Exception as e:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
+            raise
+
         self.position = {"entry": fill["price"], "size": size, "stop": stop,
                           "target": target, "fee_paid": fill["fee"], "initial_stop": stop}
+        if self.tracker:
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
+                                      fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+            self.tracker.record_position_opened(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size,
+                                                fill["price"], stop, target, fill["fee"], self.cfg.mode, initial_stop=stop)
+        if self.alerts:
+            self.alerts.send_alert("EXECUTION", f"Position Opened: BUY {self.cfg.exchange.symbol}",
+                                   f"Filled at ${fill['price']:,.2f} | Stop: ${stop:,.2f} | Target: ${target:,.2f} | Size: {size:.6f}",
+                                   level="info")
         log.info("Signal pipeline [%s %s]: core_trigger=True | fib_filter=%s | sizing=True -> order placed",
                  self.cfg.exchange.symbol, self.cfg.exchange.timeframe,
                  "not evaluated" if not stages.get("fib_evaluated") else bool(stages.get("fib_pass")))
@@ -343,9 +533,6 @@ class TradingBot:
         atr_val = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
         bar_high = float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price
 
-        # Ratchet the trailing stop before testing it: a trade that has already
-        # run is protected at a profit rather than handed back to the entry stop.
-        # The bar's high feeds the trail, so it follows the highest high since entry.
         previous_stop = self.position["stop"]
         self.risk.update_trailing_stop(self.position, price, atr_val, "BUY", peak_price=bar_high)
         if self.position["stop"] > previous_stop:
@@ -356,28 +543,44 @@ class TradingBot:
         hit_target = price >= self.position["target"]
         running = self.risk.is_running(self.position, self.position.get("peak", price), atr_val, "BUY")
         sig = generate_signal(df, self.cfg.strategy, position_open=True)
-        # Once the trade is in profit far enough for the trail to be armed, a
-        # reversal signal no longer closes it early — the trail manages the exit,
-        # which is what stops winners being banked for roughly what losers cost.
         signal_exit = sig == Signal.SELL and not running
 
         if not (hit_stop or hit_target or signal_exit):
             pnl_approx = (price - self.position["entry"]) * self.position["size"]
+            if self.tracker:
+                self.tracker.update_open_position(price, self.position["stop"], trailing_stop=self.position.get("stop"), peak_price=self.position.get("peak", price))
             log.info("Holding position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f%s",
                      self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx,
                      " | trailing (signal exit suppressed while the trend runs)" if running and sig == Signal.SELL else "")
             return
 
-        fill = self.exchange.place_order("SELL", self.position["size"], price)
-        pnl = ((fill["price"] - self.position["entry"]) * self.position["size"]
+        sell_size = self.position["size"]
+        if self.cfg.mode == "live":
+            wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            free_base = wallet.get("free_base", 0.0)
+            if 0 < free_base < sell_size:
+                log.info("Adjusting exit sell size from %.6f to available free base %.6f", sell_size, free_base)
+                sell_size = free_base
+        sell_size = self.exchange.amount_to_precision(sell_size, self.cfg.exchange.symbol)
+
+        fill = self.exchange.place_order("SELL", sell_size, price)
+        pnl = ((fill["price"] - self.position["entry"]) * sell_size
                - self.position["fee_paid"] - fill["fee"])
         reason = "stop" if hit_stop else ("target" if hit_target else "signal")
         if hit_stop and self.position.get("trail_armed"):
             reason = "trail"
         self.risk.record_trade_result(pnl)
+        if self.tracker:
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
+                                      fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+            self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, reason)
+        if self.alerts:
+            self.alerts.send_alert("EXECUTION", f"Position Closed: {reason.upper()} ({self.cfg.exchange.symbol})",
+                                   f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Total Equity: ${self.risk.state.equity:,.2f}",
+                                   level="info", details={"symbol": self.cfg.exchange.symbol, "exit": fill["price"], "pnl": round(pnl, 2), "reason": reason, "equity": round(self.risk.state.equity, 2)})
         log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f%s",
                   reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
-                 "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
+                  "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
         self._mark_exit(df)
 

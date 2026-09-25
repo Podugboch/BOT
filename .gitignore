@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 .vercel/
 users.db
+execution.db
+*.db
 KILL
 .env
 .DS_Store

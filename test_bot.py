@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import json
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 import ccxt
@@ -206,6 +207,22 @@ class TestRiskManager:
         can_trade, reason = risk.can_trade()
         assert can_trade is False
         assert "3 consecutive losses" in reason
+
+    def test_reset_kill_switch_clears_latch_and_resets_baseline(self):
+        cfg = RiskConfig(max_drawdown_pct=0.15)
+        risk = RiskManager(cfg, starting_equity=1000.0)
+        risk.record_trade_result(-160.0)
+        assert risk.can_trade()[0] is False
+        assert risk.state.kill_switch_triggered is True
+
+        risk.reset_kill_switch(reset_peak=True)
+        assert risk.state.kill_switch_triggered is False
+        assert risk.state.peak_equity == 840.0
+        assert risk.state.equity == 840.0
+        assert risk.state.trading_halted_today is False
+        can_trade, reason = risk.can_trade()
+        assert can_trade is True
+        assert reason == "OK"
 
 
 # ============================================================================
@@ -637,6 +654,22 @@ class TestTradingBot:
         assert bot.kill_switch_active() is True
         assert bot.step() is False
 
+    def test_deactivate_kill_switch(self, tmp_path):
+        cfg = BotConfig()
+        kill_file = str(tmp_path / "TEST_KILL_FILE")
+        cfg.kill_switch_file = kill_file
+        bot = TradingBot(cfg)
+
+        with open(kill_file, "w") as f:
+            f.write("HALT")
+        bot.risk.state.kill_switch_triggered = True
+
+        assert bot.kill_switch_active() is True
+        bot.deactivate_kill_switch()
+        assert bot.kill_switch_active() is False
+        assert not os.path.exists(kill_file)
+        assert bot.risk.state.kill_switch_triggered is False
+
 
 # ============================================================================
 # MULTI-STRATEGY & SETTINGS ENDPOINT TESTS
@@ -767,6 +800,154 @@ class TestNewIndicatorsAndMultiStrategy:
             runner.cfg.execution_mode = orig_mode
             runner.cfg.exchange.timeframe = orig_tf
             runner.cfg.exchange.symbol = orig_sym
+
+    def test_api_reset_kill_and_manual_sticky_dock(self, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        assert 'id="manual-sticky-dock"' in DASHBOARD_HTML
+        assert 'id="btn-sticky-buy"' in DASHBOARD_HTML
+        assert 'id="btn-sticky-sell"' in DASHBOARD_HTML
+        assert 'id="kill-switch-active-banner"' in DASHBOARD_HTML
+        assert 'id="btn-reset-kill"' in DASHBOARD_HTML
+        assert 'deactivateKillSwitch()' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        old_kill_file = runner.cfg.kill_switch_file
+        test_kill_file = str(tmp_path / "KILL")
+        runner.cfg.kill_switch_file = test_kill_file
+        try:
+            with open(test_kill_file, "w") as f:
+                f.write("HALT")
+            assert os.path.exists(test_kill_file)
+
+            res = client.post("/api/bot/reset_kill")
+            assert res.status_code == 200
+            assert res.json()["success"] is True
+            assert not os.path.exists(test_kill_file)
+        finally:
+            runner.cfg.kill_switch_file = old_kill_file
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
+
+    def test_api_kill_switch_toggle_and_ui(self, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        # Assert all toggle button elements are present on desktop and mobile
+        assert 'id="btn-kill-toggle"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-icon"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-text"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob-icon"' in DASHBOARD_HTML
+        assert 'id="btn-kill-toggle-mob-status"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill-icon"' in DASHBOARD_HTML
+        assert 'id="bottom-btn-kill-text"' in DASHBOARD_HTML
+        assert 'toggleKillSwitch()' in DASHBOARD_HTML
+        assert '/api/bot/kill/toggle' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        old_kill_file = runner.cfg.kill_switch_file
+        test_kill_file = str(tmp_path / "TOGGLE_KILL")
+        runner.cfg.kill_switch_file = test_kill_file
+        try:
+            # Ensure starting state is inactive
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
+            if runner.bot:
+                runner.bot.risk.state.kill_switch_triggered = False
+
+            # 1. Toggle ON with empty body
+            res1 = client.post("/api/bot/kill/toggle")
+            assert res1.status_code == 200
+            data1 = res1.json()
+            assert data1["success"] is True
+            assert data1["kill_switch_active"] is True
+            assert os.path.exists(test_kill_file)
+
+            # 2. Toggle OFF with empty body
+            res2 = client.post("/api/bot/kill/toggle")
+            assert res2.status_code == 200
+            data2 = res2.json()
+            assert data2["success"] is True
+            assert data2["kill_switch_active"] is False
+            assert not os.path.exists(test_kill_file)
+
+            # 3. Explicit active=True
+            res3 = client.post("/api/bot/kill/toggle", json={"active": True})
+            assert res3.status_code == 200
+            data3 = res3.json()
+            assert data3["success"] is True
+            assert data3["kill_switch_active"] is True
+            assert os.path.exists(test_kill_file)
+
+            # 4. Explicit active=False
+            res4 = client.post("/api/bot/kill/toggle", json={"active": False})
+            assert res4.status_code == 200
+            data4 = res4.json()
+            assert data4["success"] is True
+            assert data4["kill_switch_active"] is False
+            assert not os.path.exists(test_kill_file)
+        finally:
+            runner.cfg.kill_switch_file = old_kill_file
+            if os.path.exists(test_kill_file):
+                os.remove(test_kill_file)
+
+    def test_execution_mode_persistence_and_dedicated_endpoint(self, monkeypatch, tmp_path):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner, DASHBOARD_HTML
+
+        assert 'id="btn-exec-auto"' in DASHBOARD_HTML
+        assert 'id="btn-exec-manual"' in DASHBOARD_HTML
+        assert '/api/bot/execution_mode' in DASHBOARD_HTML
+
+        client = TestClient(app)
+        orig_mode = runner.cfg.execution_mode
+        try:
+            # 1. Switch to manual via dedicated endpoint
+            res = client.post("/api/bot/execution_mode", json={"execution_mode": "manual"})
+            assert res.status_code == 200
+            assert res.json()["execution_mode"] == "manual"
+            assert runner.cfg.execution_mode == "manual"
+            assert client.get("/api/status").json()["execution_mode"] == "manual"
+
+            # 2. Start bot - verify runner.start() does NOT reset execution_mode to auto
+            started = runner.start()
+            try:
+                assert runner.cfg.execution_mode == "manual"
+                if runner.bot:
+                    assert runner.bot.cfg.execution_mode == "manual"
+                assert client.get("/api/status").json()["execution_mode"] == "manual"
+            finally:
+                runner.stop()
+
+            assert runner.cfg.execution_mode == "manual"
+
+            # 3. Switching environment mode (paper / live) does NOT reset execution_mode
+            m_res = client.post("/api/bot/mode", json={"trading_mode": "real"})
+            assert m_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            t_res = client.post("/api/bot/mode", json={"trading_mode": "testnet"})
+            assert t_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            # 4. Partial settings update does NOT reset execution_mode
+            p_res = client.post("/api/bot/settings", json={"fast_ema": 14})
+            assert p_res.status_code == 200
+            assert runner.cfg.execution_mode == "manual"
+
+            # 5. Switch back to auto
+            a_res = client.post("/api/bot/execution_mode", json={"execution_mode": "auto"})
+            assert a_res.status_code == 200
+            assert a_res.json()["execution_mode"] == "auto"
+            assert runner.cfg.execution_mode == "auto"
+            assert client.get("/api/status").json()["execution_mode"] == "auto"
+        finally:
+            runner.cfg.execution_mode = orig_mode
+            if runner.bot:
+                runner.bot.cfg.execution_mode = orig_mode
 
 
 # ============================================================================
@@ -3004,4 +3185,548 @@ globalThis.fetch = async (url, opts) => {
         assert encoded["rows"][0]["error"] == "Not enough history for 5m (max ~60d)"
         assert encoded["rows"][1]["error"] == "Not enough history for 15m (max ~90d)"
 
+    def test_breakdown_accounting_sums_to_candles_evaluated_exactly(self):
+        """The miss breakdown + raw signals must sum to candles_evaluated with 0 gap."""
+        from backtester import run_backtest
+        res = run_backtest(TestPipelineDiagnostics._series(), TestPipelineDiagnostics._diag_cfg())
+        diag = res["diagnostics"]
+
+        assert diag["candles_in_position"] > 0
+        assert "in_position" in diag["core_misses"]
+        assert diag["core_misses"]["in_position"] == diag["candles_in_position"]
+        total_accounted = sum(diag["core_misses"].values()) + diag["core_signals_detected"]
+        assert total_accounted == diag["candles_evaluated"]
+        assert total_accounted == res["candles_evaluated"]
+
+    def test_walked_candle_range_and_post_warmup_count_logged(self, caplog):
+        """Activity log must include walked first/last timestamps and post-warmup evaluated count."""
+        from backtester import run_backtest
+        from config import BotConfig
+        cfg = BotConfig()
+        cfg.strategy.use_fib_filter = False
+        hist = _wave_ohlcv(n=200)
+
+        with caplog.at_level("INFO", logger="backtest"):
+            res = run_backtest(hist, cfg)
+
+        text = " ".join(record.getMessage() for record in caplog.records)
+        eval_range = res["eval_date_range"]
+        eval_count = res["candles_evaluated"]
+
+        assert "Strategy loop walked" in text
+        assert f"{eval_count:,} post-warmup candle(s) evaluated for signals" in text
+        assert eval_range[0] in text
+        assert eval_range[1] in text
+
+    def test_sweep_endpoints_log_walked_range_and_evaluated_candles(self, monkeypatch, caplog):
+        """Compare windows and compare timeframes endpoints must log walked range and count per row."""
+        import web_server
+        hist = _wave_ohlcv(n=400)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        with caplog.at_level("INFO", logger="web"):
+            # Compare windows
+            req_win = web_server.CompareWindowsRequest(
+                exchange="binance", symbol="BTC/USDT", timeframe="1h",
+                windows=[30, 60], starting_equity=1000.0,
+            )
+            res_win = web_server.compare_windows_endpoint(req_win)
+            assert res_win["success"] is True
+
+            # Compare timeframes
+            req_tf = web_server.CompareTimeframesRequest(
+                exchange="binance", symbol="BTC/USDT", days=30,
+                timeframes=["1h", "4h"], starting_equity=1000.0,
+            )
+            res_tf = web_server.compare_timeframes_endpoint(req_tf)
+            assert res_tf["success"] is True
+
+        web_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "Sweep window 30d: walked" in web_text
+        assert "Sweep window 60d: walked" in web_text
+        assert "Sweep timeframe 1h: walked" in web_text
+        assert "Sweep timeframe 4h: walked" in web_text
+
+    def test_sweep_tag_logged_and_passed_through_pipeline(self, caplog):
+        """When sweep_tag is provided, both engine and web logs should be tagged with it."""
+        import web_server
+        import backtester
+        from config import BotConfig
+        cfg = BotConfig()
+        df = _wave_ohlcv(n=200)
+
+        with caplog.at_level("INFO", logger="backtest"):
+            res = backtester.run_backtest(df, cfg, sweep_tag="Sweep 365d")
+            assert res["sweep_tag"] == "Sweep 365d"
+            assert res["diagnostics"]["sweep_tag"] == "Sweep 365d"
+
+        bt_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "[Sweep 365d] Strategy loop walked" in bt_text
+        assert "[Sweep 365d] Backtest summary:" in bt_text
+        assert "[Sweep 365d] Backtest stages:" in bt_text
+
+    def test_dashboard_html_contains_log_filters_and_sweep_tagging(self):
+        """Dashboard HTML must include sweep log filters and sweep tagging logic."""
+        import web_server
+        html = web_server.DASHBOARD_HTML
+        assert 'id="btn-log-filter-sweep"' in html
+        assert 'id="btn-log-filter-live"' in html
+        assert 'id="btn-log-filter-all"' in html
+        assert "setLogFilter(" in html
+        assert "renderLogs(" in html
+        assert "sweep_tag: 'Sweep ' + item.label" in html
+        assert "sweep_tag: 'Sweep ' + item.tf" in html
+
+
+class TestProductionReadinessStructuralGaps:
+    """
+    Tests for the 8 structural gaps addressed prior to deploying real capital:
+    #0: Ambiguity resolution & safety checks on negative-expectancy timeframes (15m/5m)
+    #1: Persistent live/paper execution tracking for positions and orders (fills, rejections, cancellations)
+    #2: Walk-Forward Validation (out-of-sample parameter verification)
+    #3: Buy-and-Hold benchmark on every backtest and sweep row
+    #4: Exchange minimum-notional sizing validation
+    #5: Fee-tier transparency and per-exchange accuracy
+    #6: Complete pipeline candle accounting
+    #7: Automated risk alerting dispatcher
+    """
+
+    def test_item0_negative_expectancy_timeframe_guarded_in_live_mode(self):
+        """Live execution on 15m/5m must be blocked without explicit override."""
+        import web_server
+        from fastapi import HTTPException
+
+        # Mock runner in stopped state
+        web_server.runner.running = False
+        web_server.runner.cfg.mode = "live"
+        web_server.runner.cfg.exchange.timeframe = "15m"
+
+        # Attempt to start in live mode on 15m without force flag -> HTTP 400
+        with pytest.raises(HTTPException) as exc_info:
+            web_server.start_bot(force=False)
+        assert exc_info.value.status_code == 400
+        assert "negative expectancy" in exc_info.value.detail.lower()
+
+        # Starting on 15m with force=True is allowed
+        with mock.patch.object(web_server.runner, "start", return_value=True):
+            res_force = web_server.start_bot(force=True)
+            assert res_force["success"] is True
+
+        # In paper mode, starting on 15m is allowed without force
+        web_server.runner.running = False
+        web_server.runner.cfg.mode = "paper"
+        with mock.patch.object(web_server.runner, "start", return_value=True):
+            res_paper = web_server.start_bot(force=False)
+            assert res_paper["success"] is True
+
+        # Status endpoint reports timeframe_warning on 15m
+        status = web_server.get_status()
+        assert status["timeframe_warning"] is not None
+        assert "15m" in status["timeframe_warning"]
+
+        # Reset timeframe to 1h
+        web_server.runner.cfg.exchange.timeframe = "1h"
+        status_1h = web_server.get_status()
+        assert status_1h["timeframe_warning"] is None
+
+    def test_item1_execution_tracker_orders_and_position_lifecycle(self, tmp_path):
+        """ExecutionTracker records persistent order audits and position telemetry."""
+        from execution_tracker import ExecutionTracker
+        import web_server
+
+        db_path = str(tmp_path / "test_tracker.db")
+        tracker = ExecutionTracker(db_path=db_path)
+
+        # 1. Record orders
+        o1_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="BUY", size=0.05, price=65000.0, status="FILLED")
+        o2_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="BUY", size=0.0001, price=65000.0, status="REJECTED", rejection_reason="Below exchange min notional $10.00")
+        o3_id = tracker.record_order(symbol="BTC/USDT", timeframe="1h", side="SELL", size=0.05, price=66000.0, status="CANCELLED")
+
+        orders = tracker.get_orders(limit=10)
+        assert len(orders) == 3
+        statuses = [o["status"] for o in orders]
+        assert "FILLED" in statuses
+        assert "REJECTED" in statuses
+        assert "CANCELLED" in statuses
+
+        # 2. Position telemetry
+        pos_id = tracker.record_position_opened(
+            symbol="BTC/USDT",
+            timeframe="1h",
+            side="BUY",
+            size=0.05,
+            entry_price=65000.0,
+            stop=64000.0,
+            target=68000.0,
+            fee=3.25,
+            mode="paper"
+        )
+        assert tracker.get_open_position() is not None
+
+        tracker.update_open_position(current_price=66500.0, current_stop=64500.0, trailing_stop=64800.0)
+        open_pos = tracker.get_open_position()
+        assert open_pos["unrealized_pnl"] > 0
+
+        # 3. Close position
+        tracker.record_position_closed(exit_price=67000.0, exit_fee=3.35, realized_pnl=93.4, exit_reason="TAKE_PROFIT")
+        assert tracker.get_open_position() is None
+        assert len(tracker.get_closed_positions()) == 1
+
+        # 4. Verify API endpoint
+        with mock.patch("web_server.get_execution_tracker", return_value=tracker):
+            res = web_server.get_execution_tracker_data()
+            assert res["success"] is True
+            assert len(res["orders"]) == 3
+            assert res["active_position"] is None
+
+    def test_item2_walk_forward_validation(self):
+        """Walk-forward validation generates train/test folds and computes WFE."""
+        import backtester
+        from config import BotConfig
+        import web_server
+
+        df = _wave_ohlcv(n=250)
+        cfg = BotConfig()
+
+        wfo = backtester.run_walk_forward_validation(df, cfg, n_splits=3)
+        assert wfo["success"] is True
+        assert len(wfo["folds"]) == 3
+        assert "walk_forward_efficiency_pct" in wfo
+        assert "status" in wfo
+        assert wfo["status"] in ("OUT_OF_SAMPLE_VALIDATED", "IN_SAMPLE_ONLY_UNVERIFIED")
+
+        for f in wfo["folds"]:
+            assert "in_sample_return_pct" in f
+            assert "out_of_sample_return_pct" in f
+            assert "out_of_sample_bh_return_pct" in f
+            assert "in_sample_trades" in f
+            assert "out_of_sample_trades" in f
+
+        # Test endpoint
+        with mock.patch("web_server.fetch_historical", return_value=df):
+            req = web_server.WalkForwardRequest(
+                exchange="binance",
+                symbol="BTC/USDT",
+                timeframe="1h",
+                days=30,
+                starting_equity=1000.0,
+                n_splits=3
+            )
+            res = web_server.walk_forward_endpoint(req)
+            assert res["success"] is True
+            assert "results" in res
+            assert len(res["results"]["folds"]) == 3
+
+    def test_item3_buy_and_hold_benchmark(self):
+        """Every backtest and sweep row must include zero-fee buy & hold benchmark."""
+        import backtester
+        from config import BotConfig
+        import web_server
+
+        df = _wave_ohlcv(n=200)
+        cfg = BotConfig()
+
+        res = backtester.run_backtest(df, cfg)
+        assert "buy_and_hold_return_pct" in res
+        assert "buy_and_hold_final_equity" in res
+        assert isinstance(res["buy_and_hold_return_pct"], (int, float))
+
+        # Sweep row verification
+        with mock.patch("web_server.fetch_historical", return_value=df):
+            req_win = web_server.CompareWindowsRequest(
+                exchange="binance", symbol="BTC/USDT", timeframe="1h",
+                windows=[30, 60], starting_equity=1000.0,
+            )
+            res_win = web_server.compare_windows_endpoint(req_win)
+            for row in res_win["rows"]:
+                assert "buy_and_hold_return_pct" in row
+
+    def test_item4_exchange_minimum_notional_validation(self):
+        """Computed order size must clear exchange minimum notional/amount limits."""
+        from risk_manager import RiskManager
+        from config import RiskConfig
+        import web_server
+
+        rm = RiskManager(RiskConfig(), starting_equity=1000.0)
+        # Case 1: below min cost ($5 < $10)
+        ok1, err1 = rm.validate_min_notional(entry_price=50000.0, size=0.0001, min_notional=10.0, min_amount=0.00001)
+        assert ok1 is False
+        assert "below exchange minimum" in err1
+
+        # Case 2: above min cost ($50 >= $10)
+        ok2, err2 = rm.validate_min_notional(entry_price=50000.0, size=0.001, min_notional=10.0, min_amount=0.00001)
+        assert ok2 is True
+        assert err2 == "OK"
+
+        # Sizing validation endpoint
+        req_sizing = web_server.SizingValidationRequest(
+            equity=1000.0, risk_per_trade_pct=0.01, price=50000.0, stop_price=49000.0, min_notional=10.0
+        )
+        res = web_server.validate_sizing_endpoint(req_sizing)
+        assert res["success"] is True
+        assert "clears_minimum" in res
+        assert "explanation" in res
+
+    def test_item5_fee_tier_accuracy(self):
+        """Fee tiers must accurately reflect exchange schedule or verified API tier."""
+        from exchange_client import get_exchange_fee_info
+        import web_server
+
+        mexc_fees = get_exchange_fee_info("mexc")
+        assert mexc_fees["taker"] == 0.001  # 0.10% taker
+        assert mexc_fees["taker_fee_pct"] == 0.001
+        assert mexc_fees["source"] == "hardcoded_default"
+
+        binance_fees = get_exchange_fee_info("binance")
+        assert binance_fees["taker"] == 0.001
+
+        res = web_server.get_fee_info_endpoint("mexc")
+        assert res["success"] is True
+        assert res["fee_info"]["taker"] == 0.001
+
+    def test_item6_pipeline_candle_accounting(self):
+        """Pipeline accounting must account for open position candles as well as misses."""
+        import backtester
+        from config import BotConfig
+
+        df = _wave_ohlcv(n=250)
+        cfg = BotConfig()
+
+        res = backtester.run_backtest(df, cfg)
+        diag = res.get("diagnostics", {})
+        candles_eval = diag.get("candles_evaluated", 0)
+
+        # Rejection breakdown
+        misses = diag.get("core_misses", {})
+        total_misses = sum(misses.values())
+        raw_signals = diag.get("raw_signals", 0)
+
+        # Sum of non-signal candles + core signals evaluated
+        assert total_misses + raw_signals == candles_eval
+
+    def test_item7_alert_dispatcher(self, caplog):
+        """AlertDispatcher notifies channels and handles unconfigured endpoints gracefully."""
+        from alerts import AlertDispatcher
+        import web_server
+
+        dispatcher = AlertDispatcher()
+
+        with caplog.at_level("CRITICAL", logger="alerts"):
+            ok = dispatcher.send_alert(
+                event_type="CIRCUIT_BREAKER",
+                title="Daily loss limit hit",
+                message="Daily loss limit hit (-5.0%). Trading halted.",
+                level="critical",
+                details={"current_drawdown_pct": 5.2},
+                force=True,
+            )
+            assert ok is True
+
+        log_text = " ".join(record.getMessage() for record in caplog.records)
+        assert "CIRCUIT_BREAKER" in log_text
+
+        # API test endpoint
+        res = web_server.test_alert_endpoint()
+        assert res["success"] is True
+
+
+# ============================================================================
+# CCXT ENHANCEMENTS TESTS
+# ============================================================================
+class TestCCXTEnhancements:
+    def test_amount_and_price_precision(self):
+        """Precision helpers use CCXT formatting or graceful fallbacks."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+        # Fallback when markets are not loaded
+        assert client.amount_to_precision(0.123456789) == 0.123457
+        assert client.price_to_precision(50000.12345) == 50000.12
+
+        # When exchange methods are present and markets loaded
+        client.exchange.markets = {"BTC/USDT": {"precision": {"amount": 3, "price": 1}}}
+        client.exchange.amount_to_precision = mock.MagicMock(return_value="0.123")
+        client.exchange.price_to_precision = mock.MagicMock(return_value="50000.1")
+
+        assert client.amount_to_precision(0.123456, "BTC/USDT") == 0.123
+        assert client.price_to_precision(50000.123, "BTC/USDT") == 50000.1
+        client.exchange.amount_to_precision.assert_called_with("BTC/USDT", 0.123456)
+        client.exchange.price_to_precision.assert_called_with("BTC/USDT", 50000.123)
+
+    def test_fetch_wallet_balance_paper_and_live(self):
+        """Wallet balance reflects paper accounting or live CCXT fetch_balance."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1250.0)
+        client.paper_position = 0.05
+
+        # Paper mode
+        bal_paper = client.fetch_wallet_balance("BTC/USDT")
+        assert bal_paper["mode"] == "paper"
+        assert bal_paper["is_live"] is False
+        assert bal_paper["free_quote"] == 1250.0
+        assert bal_paper["free_base"] == 0.05
+        assert bal_paper["quote_currency"] == "USDT"
+        assert bal_paper["base_currency"] == "BTC"
+
+        # Live mode
+        cfg_live = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT", api_key="test_key", api_secret="test_sec")
+        client_live = ExchangeClient(cfg=cfg_live, mode="live", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+        client_live.exchange.fetch_balance = mock.MagicMock(return_value={
+            "free": {"USDT": 4500.50, "BTC": 0.25},
+            "total": {"USDT": 5000.00, "BTC": 0.25},
+        })
+
+        bal_live = client_live.fetch_wallet_balance("BTC/USDT")
+        assert bal_live["mode"] == "live"
+        assert bal_live["is_live"] is True
+        assert bal_live["free_quote"] == 4500.50
+        assert bal_live["free_base"] == 0.25
+        assert bal_live["total_quote"] == 5000.00
+
+    def test_fetch_order_book_spread(self):
+        """Order book spread extracts top-of-book and computes spread percentage."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+        # Mock order book with 0.1% spread
+        client.exchange.fetch_order_book = mock.MagicMock(return_value={
+            "bids": [[50000.0, 1.5]],
+            "asks": [[50050.0, 2.0]],
+        })
+
+        ob_data = client.fetch_order_book_spread("BTC/USDT")
+        assert ob_data["valid"] is True
+        assert ob_data["bid"] == 50000.0
+        assert ob_data["ask"] == 50050.0
+        assert ob_data["spread"] == 50.0
+        assert ob_data["mid"] == 50025.0
+        assert ob_data["spread_pct"] == pytest.approx(0.0999, rel=1e-2)
+
+        # Failure / empty fallback
+        client.exchange.fetch_order_book = mock.MagicMock(side_effect=Exception("Timeout"))
+        client.current_price = mock.MagicMock(return_value=50000.0)
+        fallback = client.fetch_order_book_spread("BTC/USDT")
+        assert fallback["valid"] is False
+        assert fallback["spread"] == 0.0
+
+    def test_sync_live_balance_updates_equity(self):
+        """sync_live_balance updates RiskManager equity in live mode."""
+        cfg = BotConfig(mode="live")
+        cfg.exchange.api_key = "live_key"
+        cfg.exchange.api_secret = "live_secret"
+
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            bot = TradingBot(cfg)
+            assert bot.risk.state.equity == 1000.0
+
+            with mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                "mode": "live",
+                "is_live": True,
+                "free_quote": 8500.0,
+                "total_quote": 9200.0,
+                "free_base": 0.1,
+                "quote_currency": "USDT",
+                "base_currency": "BTC",
+            }):
+                wallet = bot.sync_live_balance()
+                assert wallet["is_live"] is True
+                assert bot.risk.state.equity == 9200.0
+
+    def test_order_book_spread_guard_blocks_entry(self):
+        """Spread exceeding max_spread_pct suppresses BUY order entry."""
+        from strategy import Signal
+
+        cfg = BotConfig(mode="paper")
+        cfg.risk.max_spread_pct = 0.35
+        bot = TradingBot(cfg)
+
+        df = _wave_ohlcv(n=100)
+        price = 50000.0
+
+        # Mock signal to BUY with wide spread
+        with mock.patch("bot.generate_signal", return_value=Signal.BUY), \
+             mock.patch.object(bot.exchange, "fetch_order_book_spread", return_value={
+                 "valid": True,
+                 "bid": 49700.0,
+                 "ask": 50000.0,
+                 "spread": 300.0,
+                 "spread_pct": 0.60,
+                 "mid": 49850.0,
+             }), \
+             mock.patch.object(bot.exchange, "place_order") as mock_place:
+            bot._maybe_enter(df, price)
+            mock_place.assert_not_called()
+            assert bot.position is None
+
+    def test_insufficient_wallet_balance_blocks_entry(self):
+        """Insufficient free quote currency suppresses/rejects BUY order."""
+        from strategy import Signal
+
+        cfg = BotConfig(mode="live")
+        cfg.exchange.api_key = "live_key"
+
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            bot = TradingBot(cfg)
+
+            df = _wave_ohlcv(n=100)
+            price = 50000.0
+
+            with mock.patch("bot.generate_signal", return_value=Signal.BUY), \
+                 mock.patch.object(bot.exchange, "fetch_order_book_spread", return_value={"valid": True, "spread_pct": 0.05}), \
+                 mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                     "mode": "live",
+                     "is_live": True,
+                     "free_quote": 5.0,
+                     "total_quote": 5.0,
+                     "quote_currency": "USDT",
+                 }), \
+                 mock.patch.object(bot.exchange, "place_order") as mock_place:
+                bot._maybe_enter(df, price)
+                mock_place.assert_not_called()
+                assert bot.position is None
+
+            # manual_buy raises RuntimeError
+            with mock.patch.object(bot.exchange, "fetch_ohlcv", return_value=df), \
+                 mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                     "mode": "live",
+                     "is_live": True,
+                     "free_quote": 5.0,
+                     "total_quote": 5.0,
+                     "quote_currency": "USDT",
+                 }):
+                with pytest.raises(RuntimeError, match="Insufficient wallet balance"):
+                    bot.manual_buy(custom_size=0.01)
+
+    def test_typed_ccxt_exceptions_on_live_order(self):
+        """_place_live_order catches typed CCXT exceptions and sends alerts."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="BTC/USDT", api_key="k", api_secret="s")
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            client = ExchangeClient(cfg=cfg, mode="live", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+            # InsufficientFunds
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.InsufficientFunds("Account has insufficient balance"))
+            with pytest.raises(ccxt.InsufficientFunds):
+                client._place_live_order("BUY", 0.01)
+
+            # InvalidOrder
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.InvalidOrder("Filter failure: LOT_SIZE"))
+            with pytest.raises(ccxt.InvalidOrder):
+                client._place_live_order("BUY", 0.01)
+
+            # RateLimitExceeded
+            client.exchange.create_order = mock.MagicMock(side_effect=ccxt.RateLimitExceeded("Too many requests"))
+            with pytest.raises(ccxt.RateLimitExceeded):
+                client._place_live_order("BUY", 0.01)
+
+    def test_api_exchange_wallet_endpoint(self):
+        """GET /api/exchange/wallet returns wallet balances and spread info."""
+        import web_server
+
+        res = web_server.get_exchange_wallet_endpoint()
+        assert res["success"] is True
+        assert "wallet" in res
+        assert "spread" in res
+        assert "limits" in res
+        assert "max_spread_pct" in res
+        assert res["wallet"]["mode"] in ("paper", "live")
 
