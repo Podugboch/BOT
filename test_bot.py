@@ -3739,9 +3739,8 @@ class TestExchangeKeyRemovalAndExecutionMode:
 
     def test_ui_contains_key_removal_button_and_execution_toggle(self):
         from web_server import DASHBOARD_HTML
-        assert 'id="btn-remove-key"' in DASHBOARD_HTML
+        assert 'id="btn-remove-key"' not in DASHBOARD_HTML
         assert 'deleteSavedExchangeKey' in DASHBOARD_HTML
-        assert 'deleteCurrentExchangeKey' in DASHBOARD_HTML
         assert 'toggleExecutionMode' in DASHBOARD_HTML
         assert 'updateExecutionModeUI' in DASHBOARD_HTML
         assert 'id="btn-exec-auto"' in DASHBOARD_HTML

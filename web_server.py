@@ -3008,9 +3008,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
 
             <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
-              <button type="button" onclick="deleteCurrentExchangeKey()" id="btn-remove-key" class="w-full sm:w-auto px-3.5 py-2.5 sm:py-2 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 hover:text-white border border-rose-800/60 font-semibold rounded-lg transition flex items-center justify-center gap-1.5" title="Remove saved credentials for the selected exchange">
-                <i class="fa-solid fa-trash-can"></i> Remove Keys
-              </button>
               <button type="button" onclick="testExchangeConnection()" id="btn-test-key" class="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-bordercol font-semibold rounded-lg transition flex items-center justify-center gap-1.5">
                 <i class="fa-solid fa-plug"></i> Test Connection
               </button>
