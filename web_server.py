@@ -956,6 +956,22 @@ def get_status(response: Response = None):
     kill_file_exists = os.path.exists(cfg.kill_switch_file)
     strat_meta = next((s for s in STRATEGIES if s["id"] == cfg.strategy.strategy_name), STRATEGIES[0])
 
+    wallet_info = bot.exchange.fetch_wallet_balance(cfg.exchange.symbol) if bot else {
+        "free_quote": cfg.starting_equity,
+        "free_base": 0.0,
+        "total_quote": cfg.starting_equity,
+        "total_base": 0.0,
+        "quote_currency": "USDT",
+        "base_currency": "BTC",
+        "mode": cfg.mode,
+        "is_live": (cfg.mode == "live" and bool(cfg.exchange.api_key)),
+    }
+    spread_info = bot.exchange.fetch_order_book_spread(cfg.exchange.symbol) if bot else {
+        "symbol": cfg.exchange.symbol,
+        "spread_pct": 0.0,
+        "valid": False,
+    }
+
     return {
         "running": runner.running,
         "mode": cfg.mode,
@@ -993,6 +1009,9 @@ def get_status(response: Response = None):
         "kill_switch_triggered": risk_state.kill_switch_triggered if risk_state else False,
         "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
         "paper_position": round(exchange.paper_position, 6) if exchange else 0.0,
+        "wallet_balance": wallet_info,
+        "order_book_spread": spread_info,
+        "max_spread_pct": getattr(cfg.risk, "max_spread_pct", 0.35),
         "active_position": bot.position if bot else None,
         "timeframe_warning": (
             f"Negative expectancy (-10% to -15%) in historical backtests on {cfg.exchange.timeframe}. Do not risk live capital on this grain without strategy recalibration."
@@ -1882,6 +1901,25 @@ def get_fee_info_endpoint(exchange: str = "binance", symbol: str = "BTC/USDT"):
     exch_obj = exch_client.exchange if exch_client else None
     info = get_exchange_fee_info(exchange, exchange_obj=exch_obj, symbol=symbol)
     return sanitize_for_json({"success": True, "fee_info": info})
+
+
+@app.get("/api/exchange/wallet")
+def get_exchange_wallet_endpoint(response: Response = None):
+    _no_store(response)
+    bot = runner.get_or_create_bot()
+    symbol = runner.cfg.exchange.symbol
+    wallet = bot.exchange.fetch_wallet_balance(symbol)
+    spread = bot.exchange.fetch_order_book_spread(symbol)
+    limits = bot.exchange.load_market_limits(symbol)
+    return sanitize_for_json({
+        "success": True,
+        "symbol": symbol,
+        "mode": runner.cfg.mode,
+        "wallet": wallet,
+        "spread": spread,
+        "limits": limits,
+        "max_spread_pct": getattr(runner.cfg.risk, "max_spread_pct", 0.35),
+    })
 
 
 @app.post("/api/risk/validate-sizing")
@@ -5072,8 +5110,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         document.getElementById('val-equity').innerText = '$' + data.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
         document.getElementById('val-peak').innerText = '$' + data.peak_equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('val-cash').innerText = '$' + data.paper_cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('val-pos').innerText = data.paper_position.toFixed(6);
+
+        const cashLbl = document.getElementById('val-cash-label');
+        if (data.mode === 'live' && data.wallet_balance && data.wallet_balance.is_live) {
+          if (cashLbl) cashLbl.innerText = `Live ${data.wallet_balance.quote_currency || 'Quote'}`;
+          document.getElementById('val-cash').innerText = '$' + (data.wallet_balance.free_quote ?? data.paper_cash).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+          document.getElementById('val-pos').innerText = (data.wallet_balance.free_base ?? data.paper_position).toFixed(6);
+        } else {
+          if (cashLbl) cashLbl.innerText = 'Paper Cash';
+          document.getElementById('val-cash').innerText = '$' + data.paper_cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+          document.getElementById('val-pos').innerText = data.paper_position.toFixed(6);
+        }
+
+        const symTag = document.getElementById('val-symbol-tag');
+        if (symTag) {
+          let extra = '';
+          if (data.order_book_spread && data.order_book_spread.valid) {
+            extra = ` · Spr: ${data.order_book_spread.spread_pct.toFixed(2)}%`;
+          }
+          symTag.innerText = `${data.symbol} ${data.timeframe}${extra}`;
+        }
+
         document.getElementById('val-drawdown').innerText = data.drawdown_pct.toFixed(1) + '%';
         document.getElementById('val-daily-loss').innerText = data.daily_loss_pct.toFixed(1) + '%';
         document.getElementById('val-streak').innerText = `${data.consecutive_losses} / ${data.max_consecutive_losses ?? 8}`;
