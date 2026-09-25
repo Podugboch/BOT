@@ -3758,14 +3758,19 @@ class TestExchangeKeyRemovalAndExecutionMode:
 
         init_auth_db()
         reg = AuthService.register("test_key_user", "keyuser@example.com", "Password123!")
-        from auth import get_db_connection
-        conn = get_db_connection()
-        tok = conn.execute("SELECT activation_token FROM users WHERE username = 'test_key_user'").fetchone()["activation_token"]
-        conn.close()
-        AuthService.activate_account(tok)
-        login_res = AuthService.login("test_key_user", "Password123!")
-        token = login_res["token"]
-        user_id = login_res["user"]["id"]
+        if reg.get("token"):
+            token = reg["token"]
+            user_id = reg["user"]["id"]
+        else:
+            from auth import get_db_connection
+            conn = get_db_connection()
+            tok = conn.execute("SELECT activation_token FROM users WHERE username = 'test_key_user'").fetchone()["activation_token"]
+            conn.close()
+            if tok:
+                AuthService.activate_account(tok)
+            login_res = AuthService.login("test_key_user", "Password123!")
+            token = login_res["token"]
+            user_id = login_res["user"]["id"]
 
         AuthService.save_exchange_key(user_id, "binance", "TEST_KEY_123", "TEST_SECRET_456", "", testnet=False)
         keys_before = AuthService.get_exchange_keys(user_id)
