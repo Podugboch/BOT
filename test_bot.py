@@ -3834,5 +3834,57 @@ class TestTraderQueenLogoAndBranding:
         assert 'logout()' in badge_content
 
 
+class TestTradingModePersistenceAndStability:
+    """Verifies that trading mode (Testnet vs Real) remains stable and persists properly."""
+
+    def test_ui_contains_client_authoritative_trading_mode_storage(self):
+        from web_server import DASHBOARD_HTML
+        assert "localStorage.getItem('bot_trading_mode')" in DASHBOARD_HTML
+        assert "localStorage.setItem('bot_trading_mode'" in DASHBOARD_HTML
+        assert "switchTradingMode" in DASHBOARD_HTML
+
+    def test_switch_trading_mode_endpoint_paper_and_real(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+        import storage_adapter
+
+        saved_settings = {}
+        monkeypatch.setattr(storage_adapter, "remote_save_app_setting", lambda k, v: saved_settings.update({k: v}) or True)
+        monkeypatch.setattr(storage_adapter, "remote_get_app_setting", lambda k: saved_settings.get(k))
+
+        client = TestClient(app)
+
+        # 1. Switch to Real Trading (LIVE)
+        res_real = client.post("/api/bot/mode", json={"trading_mode": "real"})
+        assert res_real.status_code == 200
+        assert res_real.json()["is_real"] is True
+        assert res_real.json()["mode"] == "live"
+        assert res_real.json()["testnet"] is False
+        assert runner.cfg.mode == "live"
+        assert runner.cfg.exchange.testnet is False
+        assert saved_settings.get("trading_mode") == "real"
+
+        # Check status reflects real trading
+        status_real = client.get("/api/status").json()
+        assert status_real["mode"] == "live"
+        assert status_real["testnet"] is False
+
+        # 2. Switch back to Testnet Mode
+        res_testnet = client.post("/api/bot/mode", json={"trading_mode": "testnet"})
+        assert res_testnet.status_code == 200
+        assert res_testnet.json()["is_real"] is False
+        assert res_testnet.json()["mode"] == "paper"
+        assert res_testnet.json()["testnet"] is True
+        assert runner.cfg.mode == "paper"
+        assert runner.cfg.exchange.testnet is True
+        assert saved_settings.get("trading_mode") == "testnet"
+
+        # Check status reflects testnet mode
+        status_testnet = client.get("/api/status").json()
+        assert status_testnet["mode"] == "paper"
+        assert status_testnet["testnet"] is True
+
+
+
 
 
