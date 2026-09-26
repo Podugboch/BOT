@@ -3842,6 +3842,8 @@ class TestTradingModePersistenceAndStability:
         assert "localStorage.getItem('bot_trading_mode')" in DASHBOARD_HTML
         assert "localStorage.setItem('bot_trading_mode'" in DASHBOARD_HTML
         assert "switchTradingMode" in DASHBOARD_HTML
+        assert "TESTNET / SIMULATION" not in DASHBOARD_HTML
+        assert "TEST MODE" in DASHBOARD_HTML
 
     def test_switch_trading_mode_endpoint_paper_and_real(self, monkeypatch):
         from fastapi.testclient import TestClient
