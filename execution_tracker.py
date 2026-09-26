@@ -166,18 +166,24 @@ class ExecutionTracker:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, entry_price, size, fees_paid, peak_price FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1")
+                cur.execute("SELECT id, entry_price, size, fees_paid, peak_price, side FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1")
                 row = cur.fetchone()
                 if not row:
                     return
                 pos_id = row["id"]
                 entry = float(row["entry_price"])
                 size = float(row["size"])
+                row_side = str(row["side"] if "side" in row.keys() else "BUY").upper()
                 prev_peak = float(row["peak_price"] or entry)
-                new_peak = max(prev_peak, float(peak_price or current_price))
 
-                unrealized_pnl = (float(current_price) - entry) * size - float(row["fees_paid"])
-                unrealized_pnl_pct = ((float(current_price) - entry) / entry) * 100.0 if entry > 0 else 0.0
+                if row_side == "SELL":
+                    new_peak = min(prev_peak, float(peak_price or current_price))
+                    unrealized_pnl = (entry - float(current_price)) * size - float(row["fees_paid"])
+                    unrealized_pnl_pct = ((entry - float(current_price)) / entry) * 100.0 if entry > 0 else 0.0
+                else:
+                    new_peak = max(prev_peak, float(peak_price or current_price))
+                    unrealized_pnl = (float(current_price) - entry) * size - float(row["fees_paid"])
+                    unrealized_pnl_pct = ((float(current_price) - entry) / entry) * 100.0 if entry > 0 else 0.0
 
                 cur.execute("""
                     UPDATE positions SET
@@ -209,14 +215,18 @@ class ExecutionTracker:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, entry_price, size, fees_paid FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1")
+                cur.execute("SELECT id, entry_price, size, fees_paid, side FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1")
                 row = cur.fetchone()
                 if not row:
                     return
                 pos_id = row["id"]
                 entry = float(row["entry_price"])
+                row_side = str(row["side"] if "side" in row.keys() else "BUY").upper()
                 total_fees = float(row["fees_paid"]) + float(exit_fee)
-                ret_pct = ((float(exit_price) - entry) / entry) * 100.0 if entry > 0 else 0.0
+                if row_side == "SELL":
+                    ret_pct = ((entry - float(exit_price)) / entry) * 100.0 if entry > 0 else 0.0
+                else:
+                    ret_pct = ((float(exit_price) - entry) / entry) * 100.0 if entry > 0 else 0.0
 
                 cur.execute("""
                     UPDATE positions SET

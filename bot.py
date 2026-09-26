@@ -211,21 +211,36 @@ class TradingBot:
                 rsi_val = float(df["rsi"].iloc[-1]) if ("rsi" in df and pd.notna(df["rsi"].iloc[-1])) else 0.0
                 adx_val = float(df["adx"].iloc[-1]) if ("adx" in df and pd.notna(df["adx"].iloc[-1])) else 0.0
                 if self.position is not None:
+                    pos_side = str(self.position.get("side", "BUY")).upper()
                     atr_now = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
-                    bar_high = float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price
-                    self.risk.update_trailing_stop(self.position, price, atr_now, "BUY", peak_price=bar_high)
-                    hit_stop = price <= self.position["stop"]
-                    hit_target = price >= self.position["target"]
-                    pnl_approx = (price - self.position["entry"]) * self.position["size"]
-                    if hit_stop:
-                        log.warning("MANUAL MODE: Stop loss reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
-                    elif hit_target:
-                        log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
-                    elif sig == Signal.SELL:
-                        log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+                    extreme_price = (float(df["low"].iloc[-1]) if ("low" in df and pd.notna(df["low"].iloc[-1])) else price) if pos_side == "SELL" else (float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price)
+                    self.risk.update_trailing_stop(self.position, price, atr_now, pos_side, peak_price=extreme_price)
+                    if pos_side == "SELL":
+                        hit_stop = price >= self.position["stop"]
+                        hit_target = price <= self.position["target"]
+                        pnl_approx = (self.position["entry"] - price) * self.position["size"]
+                        if hit_stop:
+                            log.warning("MANUAL MODE: Short stop loss reached (%.2f >= %.2f). Awaiting manual buy to cover.", price, self.position["stop"])
+                        elif hit_target:
+                            log.info("MANUAL MODE: Short target price reached (%.2f <= %.2f). Awaiting manual buy to cover.", price, self.position["target"])
+                        elif sig == Signal.BUY:
+                            log.info("MANUAL MODE: Buy signal triggered at %.2f. Awaiting manual order to cover short.", price)
+                        else:
+                            log.info("MANUAL MODE: Short position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
+                                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
                     else:
-                        log.info("MANUAL MODE: Position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
-                                 self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
+                        hit_stop = price <= self.position["stop"]
+                        hit_target = price >= self.position["target"]
+                        pnl_approx = (price - self.position["entry"]) * self.position["size"]
+                        if hit_stop:
+                            log.warning("MANUAL MODE: Stop loss reached (%.2f <= %.2f). Awaiting manual sell.", price, self.position["stop"])
+                        elif hit_target:
+                            log.info("MANUAL MODE: Target price reached (%.2f >= %.2f). Awaiting manual sell.", price, self.position["target"])
+                        elif sig == Signal.SELL:
+                            log.info("MANUAL MODE: Sell signal triggered at %.2f. Awaiting manual order.", price)
+                        else:
+                            log.info("MANUAL MODE: Position holding [%s %s] price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f",
+                                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx)
                 else:
                     if sig == Signal.BUY:
                         log.info("MANUAL MODE: Buy signal triggered at %.2f for %s. Awaiting manual order.", price, self.cfg.exchange.symbol)
@@ -253,11 +268,72 @@ class TradingBot:
         return True
 
     def manual_buy(self, custom_size: float = 0.0) -> dict:
-        """Place a manual BUY order."""
+        """Place a manual BUY order (open Long, or cover an open Short)."""
         if self.kill_switch_active():
             raise RuntimeError(f"Kill switch active ({self.cfg.kill_switch_file}). Operation aborted.")
+
         if self.position is not None:
-            raise RuntimeError("Position already open. Please close your current position before opening a new one.")
+            pos_side = str(self.position.get("side", "BUY")).upper()
+            if pos_side == "BUY":
+                raise RuntimeError("A Long position is already open. Click 'Manual SELL' to close your current long position.")
+
+            # Position is open and side == "SELL" -> Close / Cover Short!
+            df = None
+            try:
+                df = self.exchange.fetch_ohlcv(limit=10)
+                price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
+            except Exception:
+                try:
+                    price = self.exchange.current_price()
+                except Exception:
+                    price = self.position["entry"]
+
+            buy_size = self.position["size"]
+            buy_size = self.exchange.amount_to_precision(buy_size, self.cfg.exchange.symbol)
+
+            # Available wallet balance verification for closing short (buying back quote required)
+            wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            notional_req = buy_size * price
+            free_quote = wallet.get("free_quote", 0.0)
+            if (self.cfg.mode == "live" or wallet.get("is_live")) and free_quote < notional_req:
+                msg = (f"Insufficient wallet balance to cover short: available {free_quote:.2f} {wallet.get('quote_currency', 'USDT')} "
+                       f"< required {notional_req:.2f} for size {buy_size:.6f}")
+                if self.tracker:
+                    self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", buy_size, price,
+                                              mode=self.cfg.mode, status="REJECTED", rejection_reason=msg)
+                if self.alerts:
+                    self.alerts.send_alert("INSUFFICIENT_FUNDS", f"Insufficient Funds ({self.cfg.exchange.symbol})", msg, level="critical")
+                raise RuntimeError(msg)
+
+            fill = self.exchange.place_order("BUY", buy_size, price)
+            pnl = ((self.position["entry"] - fill["price"]) * buy_size
+                   - self.position["fee_paid"] - fill["fee"])
+            self.risk.record_trade_result(pnl)
+            closed_position = dict(self.position)
+            self.position = None
+            self._mark_exit(df)
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", buy_size,
+                                          fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+            if self.alerts:
+                self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL BUY (Cover Short) ({self.cfg.exchange.symbol})",
+                                       f"Covered at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
+                                       level="info")
+            log.info("MANUAL BUY (COVER SHORT) EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
+            return {
+                "success": True,
+                "action": "BUY",
+                "type": "CLOSE_SHORT",
+                "price": fill["price"],
+                "size": buy_size,
+                "pnl": round(pnl, 2),
+                "equity": round(self.risk.state.equity, 2),
+                "fee": fill["fee"],
+                "mode": fill.get("mode", self.cfg.mode),
+            }
+
+        # Otherwise, self.position is None -> Open a new Long position
         can_trade, reason = self.risk.can_trade()
         if not can_trade:
             raise RuntimeError(f"Risk check blocked trade: {reason}")
@@ -321,12 +397,14 @@ class TradingBot:
             raise
 
         self.position = {
+            "side": "BUY",
             "entry": fill["price"],
             "size": size,
             "stop": stop,
             "target": target,
             "fee_paid": fill["fee"],
             "initial_stop": stop,
+            "peak": fill["price"],
             "manual": True,
         }
         if self.tracker:
@@ -343,6 +421,7 @@ class TradingBot:
         return {
             "success": True,
             "action": "BUY",
+            "type": "OPEN_LONG",
             "price": fill["price"],
             "size": size,
             "stop": stop,
@@ -351,53 +430,156 @@ class TradingBot:
             "mode": fill.get("mode", self.cfg.mode),
         }
 
-    def manual_sell(self) -> dict:
-        """Place a manual SELL / close position order."""
-        if self.position is None:
-            raise RuntimeError("No active open position to close.")
+    def manual_sell(self, custom_size: float = 0.0) -> dict:
+        """Place a manual SELL order (close Long, or open Short)."""
+        if self.kill_switch_active():
+            raise RuntimeError(f"Kill switch active ({self.cfg.kill_switch_file}). Operation aborted.")
 
-        df = None
-        try:
-            df = self.exchange.fetch_ohlcv(limit=10)
-            price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
-        except Exception:
+        if self.position is not None:
+            pos_side = str(self.position.get("side", "BUY")).upper()
+            if pos_side == "SELL":
+                raise RuntimeError("A Short position is already open. Click 'Manual BUY' to cover / close your short position.")
+
+            # Position is open and side == "BUY" -> Close Long!
+            df = None
             try:
-                price = self.exchange.current_price()
+                df = self.exchange.fetch_ohlcv(limit=10)
+                price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else self.position["entry"]
             except Exception:
-                price = self.position["entry"]
+                try:
+                    price = self.exchange.current_price()
+                except Exception:
+                    price = self.position["entry"]
 
-        sell_size = self.position["size"]
-        if self.cfg.mode == "live":
-            wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
-            free_base = wallet.get("free_base", 0.0)
-            if 0 < free_base < sell_size:
-                log.info("Adjusting manual sell size from %.6f to available free base %.6f", sell_size, free_base)
-                sell_size = free_base
-        sell_size = self.exchange.amount_to_precision(sell_size, self.cfg.exchange.symbol)
+            sell_size = self.position["size"]
+            if self.cfg.mode == "live":
+                wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+                free_base = wallet.get("free_base", 0.0)
+                if 0 < free_base < sell_size:
+                    log.info("Adjusting manual sell size from %.6f to available free base %.6f", sell_size, free_base)
+                    sell_size = free_base
+            sell_size = self.exchange.amount_to_precision(sell_size, self.cfg.exchange.symbol)
 
-        fill = self.exchange.place_order("SELL", sell_size, price)
-        pnl = ((fill["price"] - self.position["entry"]) * sell_size
-               - self.position["fee_paid"] - fill["fee"])
-        self.risk.record_trade_result(pnl)
-        closed_position = dict(self.position)
-        self.position = None
-        self._mark_exit(df)
+            fill = self.exchange.place_order("SELL", sell_size, price)
+            pnl = ((fill["price"] - self.position["entry"]) * sell_size
+                   - self.position["fee_paid"] - fill["fee"])
+            self.risk.record_trade_result(pnl)
+            closed_position = dict(self.position)
+            self.position = None
+            self._mark_exit(df)
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
+                                          fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+            if self.alerts:
+                self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL SELL ({self.cfg.exchange.symbol})",
+                                       f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
+                                       level="info")
+            log.info("MANUAL SELL EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
+            return {
+                "success": True,
+                "action": "SELL",
+                "type": "CLOSE_LONG",
+                "price": fill["price"],
+                "size": sell_size,
+                "pnl": round(pnl, 2),
+                "equity": round(self.risk.state.equity, 2),
+                "fee": fill["fee"],
+                "mode": fill.get("mode", self.cfg.mode),
+            }
+
+        # Otherwise, self.position is None -> Open a new Short position!
+        can_trade, reason = self.risk.can_trade()
+        if not can_trade:
+            raise RuntimeError(f"Risk check blocked trade: {reason}")
+
+        df = self.exchange.fetch_ohlcv(limit=50)
+        if df is None or len(df) < 2:
+            raise RuntimeError("Could not fetch current market price from exchange.")
+        df = add_indicators(df, self.cfg.strategy)
+        price = float(df["close"].iloc[-1])
+        atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns and pd.notna(df["atr"].iloc[-1]) else (price * 0.02)
+
+        stop, target = self.risk.stop_and_target(price, atr_val, "SELL")
+        if custom_size > 0:
+            max_size = (self.risk.state.equity * 0.99) / price
+            if custom_size > max_size:
+                raise RuntimeError(f"Requested size {custom_size:.6f} exceeds maximum allowed by available equity ({max_size:.6f}).")
+            size = custom_size
+        else:
+            size = self.risk.position_size(price, stop)
+
+        # Normalize size to exchange lot precision
+        size = self.exchange.amount_to_precision(size, self.cfg.exchange.symbol)
+
+        if size <= 0:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", 0.0, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason="Calculated position size is 0")
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Manual SELL Rejected ({self.cfg.exchange.symbol})", "Calculated position size is 0", level="warning")
+            raise RuntimeError("Calculated position size is 0. Check equity or risk settings.")
+
+        valid_notional, notional_msg = self.risk.validate_min_notional(price, size)
+        if not valid_notional:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=notional_msg)
+            if self.alerts:
+                self.alerts.send_alert("ORDER_REJECTED", f"Manual SELL Rejected ({self.cfg.exchange.symbol})", notional_msg, level="warning")
+            raise RuntimeError(notional_msg)
+
+        # Spot live vs test mode short check
+        wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+        free_base = wallet.get("free_base", 0.0)
+        if (self.cfg.mode == "live" or wallet.get("is_live")) and free_base < size:
+            msg = (f"Cannot open live spot Short: Available {wallet.get('base_currency', 'BTC')} balance is {free_base:.6f} "
+                   f"(required {size:.6f}). Spot exchanges require holding the asset to sell, or use Test Mode for simulated shorting.")
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=msg)
+            if self.alerts:
+                self.alerts.send_alert("INSUFFICIENT_FUNDS", f"Live Short Unavailable ({self.cfg.exchange.symbol})", msg, level="critical")
+            raise RuntimeError(msg)
+
+        try:
+            fill = self.exchange.place_order("SELL", size, price)
+        except Exception as e:
+            if self.tracker:
+                self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, price,
+                                          mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
+            raise
+
+        self.position = {
+            "side": "SELL",
+            "entry": fill["price"],
+            "size": size,
+            "stop": stop,
+            "target": target,
+            "fee_paid": fill["fee"],
+            "initial_stop": stop,
+            "trough": fill["price"],
+            "manual": True,
+        }
         if self.tracker:
-            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
-                                      fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
-            self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, fill["price"],
+                                      fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
+            self.tracker.record_position_opened(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size,
+                                                fill["price"], stop, target, fill["fee"], self.cfg.mode, initial_stop=stop)
         if self.alerts:
-            self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL SELL ({self.cfg.exchange.symbol})",
-                                   f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
+            self.alerts.send_alert("EXECUTION", f"Position Opened: MANUAL SELL (Short) {self.cfg.exchange.symbol}",
+                                   f"Filled at ${fill['price']:,.2f} | Size: {size:.6f} | Stop: ${stop:,.2f} | Target: ${target:,.2f}",
                                    level="info")
-        log.info("MANUAL SELL EXECUTED: pnl=%+.2f equity=%.2f", pnl, self.risk.state.equity)
+        log.info("MANUAL SELL (SHORT) EXECUTED: entry=%.2f stop=%.2f target=%.2f size=%.6f (R:R 1:%.2f)",
+                 fill["price"], stop, target, size, self.risk.reward_risk_ratio())
         return {
             "success": True,
             "action": "SELL",
+            "type": "OPEN_SHORT",
             "price": fill["price"],
-            "size": sell_size,
-            "pnl": round(pnl, 2),
-            "equity": round(self.risk.state.equity, 2),
+            "size": size,
+            "stop": stop,
+            "target": target,
             "fee": fill["fee"],
             "mode": fill.get("mode", self.cfg.mode),
         }
@@ -508,8 +690,8 @@ class TradingBot:
                                           mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
             raise
 
-        self.position = {"entry": fill["price"], "size": size, "stop": stop,
-                          "target": target, "fee_paid": fill["fee"], "initial_stop": stop}
+        self.position = {"side": "BUY", "entry": fill["price"], "size": size, "stop": stop,
+                          "target": target, "fee_paid": fill["fee"], "initial_stop": stop, "peak": fill["price"]}
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -531,55 +713,72 @@ class TradingBot:
 
     def _maybe_exit(self, df, price):
         atr_val = float(df["atr"].iloc[-1]) if ("atr" in df and pd.notna(df["atr"].iloc[-1])) else (price * 0.02)
-        bar_high = float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price
+        pos_side = str(self.position.get("side", "BUY")).upper()
+        extreme_price = (float(df["low"].iloc[-1]) if ("low" in df and pd.notna(df["low"].iloc[-1])) else price) if pos_side == "SELL" else (float(df["high"].iloc[-1]) if ("high" in df and pd.notna(df["high"].iloc[-1])) else price)
 
         previous_stop = self.position["stop"]
-        self.risk.update_trailing_stop(self.position, price, atr_val, "BUY", peak_price=bar_high)
-        if self.position["stop"] > previous_stop:
-            log.info("TRAILING STOP raised to %.2f (peak %.2f, entry %.2f) — letting the winner run",
-                     self.position["stop"], self.position.get("peak", price), self.position["entry"])
-
-        hit_stop = price <= self.position["stop"]
-        hit_target = price >= self.position["target"]
-        running = self.risk.is_running(self.position, self.position.get("peak", price), atr_val, "BUY")
-        sig = generate_signal(df, self.cfg.strategy, position_open=True)
-        signal_exit = sig == Signal.SELL and not running
+        self.risk.update_trailing_stop(self.position, price, atr_val, pos_side, peak_price=extreme_price)
+        if pos_side == "SELL":
+            if self.position["stop"] < previous_stop:
+                log.info("TRAILING STOP lowered to %.2f (trough %.2f, entry %.2f) — letting the winner run",
+                         self.position["stop"], self.position.get("trough", price), self.position["entry"])
+            hit_stop = price >= self.position["stop"]
+            hit_target = price <= self.position["target"]
+            running = self.risk.is_running(self.position, self.position.get("trough", price), atr_val, "SELL")
+            sig = generate_signal(df, self.cfg.strategy, position_open=True)
+            signal_exit = sig == Signal.BUY and not running
+        else:
+            if self.position["stop"] > previous_stop:
+                log.info("TRAILING STOP raised to %.2f (peak %.2f, entry %.2f) — letting the winner run",
+                         self.position["stop"], self.position.get("peak", price), self.position["entry"])
+            hit_stop = price <= self.position["stop"]
+            hit_target = price >= self.position["target"]
+            running = self.risk.is_running(self.position, self.position.get("peak", price), atr_val, "BUY")
+            sig = generate_signal(df, self.cfg.strategy, position_open=True)
+            signal_exit = sig == Signal.SELL and not running
 
         if not (hit_stop or hit_target or signal_exit):
-            pnl_approx = (price - self.position["entry"]) * self.position["size"]
+            pnl_approx = (self.position["entry"] - price) * self.position["size"] if pos_side == "SELL" else (price - self.position["entry"]) * self.position["size"]
             if self.tracker:
-                self.tracker.update_open_position(price, self.position["stop"], trailing_stop=self.position.get("stop"), peak_price=self.position.get("peak", price))
-            log.info("Holding position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f%s",
-                     self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx,
-                     " | trailing (signal exit suppressed while the trend runs)" if running and sig == Signal.SELL else "")
+                self.tracker.update_open_position(price, self.position["stop"], trailing_stop=self.position.get("stop"),
+                                                  peak_price=self.position.get("trough" if pos_side == "SELL" else "peak", price))
+            opp_sig = Signal.BUY if pos_side == "SELL" else Signal.SELL
+            log.info("Holding %s position [%s %s]: price=$%.2f | entry=$%.2f | stop=$%.2f | target=$%.2f | unrealized PnL=$%+.2f%s",
+                     pos_side, self.cfg.exchange.symbol, self.cfg.exchange.timeframe, price, self.position["entry"], self.position["stop"], self.position["target"], pnl_approx,
+                     " | trailing (signal exit suppressed while the trend runs)" if running and sig == opp_sig else "")
             return
 
-        sell_size = self.position["size"]
-        if self.cfg.mode == "live":
+        exit_side = "BUY" if pos_side == "SELL" else "SELL"
+        order_size = self.position["size"]
+        if self.cfg.mode == "live" and exit_side == "SELL":
             wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
             free_base = wallet.get("free_base", 0.0)
-            if 0 < free_base < sell_size:
-                log.info("Adjusting exit sell size from %.6f to available free base %.6f", sell_size, free_base)
-                sell_size = free_base
-        sell_size = self.exchange.amount_to_precision(sell_size, self.cfg.exchange.symbol)
+            if 0 < free_base < order_size:
+                log.info("Adjusting exit sell size from %.6f to available free base %.6f", order_size, free_base)
+                order_size = free_base
+        order_size = self.exchange.amount_to_precision(order_size, self.cfg.exchange.symbol)
 
-        fill = self.exchange.place_order("SELL", sell_size, price)
-        pnl = ((fill["price"] - self.position["entry"]) * sell_size
-               - self.position["fee_paid"] - fill["fee"])
+        fill = self.exchange.place_order(exit_side, order_size, price)
+        if pos_side == "SELL":
+            pnl = ((self.position["entry"] - fill["price"]) * order_size
+                   - self.position["fee_paid"] - fill["fee"])
+        else:
+            pnl = ((fill["price"] - self.position["entry"]) * order_size
+                   - self.position["fee_paid"] - fill["fee"])
         reason = "stop" if hit_stop else ("target" if hit_target else "signal")
         if hit_stop and self.position.get("trail_armed"):
             reason = "trail"
         self.risk.record_trade_result(pnl)
         if self.tracker:
-            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
+            self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, exit_side, order_size,
                                       fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
             self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, reason)
         if self.alerts:
             self.alerts.send_alert("EXECUTION", f"Position Closed: {reason.upper()} ({self.cfg.exchange.symbol})",
-                                   f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Total Equity: ${self.risk.state.equity:,.2f}",
-                                   level="info", details={"symbol": self.cfg.exchange.symbol, "exit": fill["price"], "pnl": round(pnl, 2), "reason": reason, "equity": round(self.risk.state.equity, 2)})
-        log.info("CLOSED POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f%s",
-                  reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
+                                   f"Closed {pos_side} at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Total Equity: ${self.risk.state.equity:,.2f}",
+                                   level="info", details={"symbol": self.cfg.exchange.symbol, "side": pos_side, "exit": fill["price"], "pnl": round(pnl, 2), "reason": reason, "equity": round(self.risk.state.equity, 2)})
+        log.info("CLOSED %s POSITION (%s): entry=%.2f exit=%.2f pnl=%+.2f equity=%.2f%s",
+                  pos_side, reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
                   "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
         self._mark_exit(df)

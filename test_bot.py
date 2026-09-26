@@ -597,6 +597,69 @@ class TestTradingBot:
         assert sell_res["success"] is True
         assert bot.position is None
 
+    def test_manual_mode_short_execution(self, sample_ohlcv):
+        cfg = BotConfig()
+        cfg.execution_mode = "manual"
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+
+        # 1. Opening a SHORT position when no position is open
+        short_res = bot.manual_sell(custom_size=0.01)
+        assert short_res["success"] is True
+        assert short_res["action"] == "SELL"
+        assert short_res["type"] == "OPEN_SHORT"
+        assert bot.position is not None
+        assert bot.position["side"] == "SELL"
+        assert bot.position["size"] == 0.01
+        assert bot.position["stop"] > bot.position["entry"]
+        assert bot.position["target"] < bot.position["entry"]
+
+        # Step monitoring during manual short should run without errors
+        assert bot.step() is True
+
+        # Attempting second manual sell when short is already open should be rejected
+        with pytest.raises(RuntimeError, match="A Short position is already open"):
+            bot.manual_sell(custom_size=0.01)
+
+        # 2. Covering/closing the SHORT position with manual buy
+        cover_res = bot.manual_buy()
+        assert cover_res["success"] is True
+        assert cover_res["action"] == "BUY"
+        assert cover_res["type"] == "CLOSE_SHORT"
+        assert bot.position is None
+
+        # 3. Double buy rejection when long is open
+        long_res = bot.manual_buy(custom_size=0.01)
+        assert long_res["success"] is True
+        assert long_res["type"] == "OPEN_LONG"
+        assert bot.position["side"] == "BUY"
+        with pytest.raises(RuntimeError, match="A Long position is already open"):
+            bot.manual_buy(custom_size=0.01)
+
+        # Close long position
+        close_res = bot.manual_sell()
+        assert close_res["success"] is True
+        assert close_res["type"] == "CLOSE_LONG"
+        assert bot.position is None
+
+    def test_manual_short_live_insufficient_base_rejected(self, sample_ohlcv):
+        cfg = BotConfig()
+        cfg.mode = "live"
+        cfg.execution_mode = "manual"
+        bot = TradingBot(cfg)
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.exchange.fetch_wallet_balance = lambda *args, **kwargs: {
+            "mode": "live",
+            "is_live": True,
+            "free_base": 0.0,
+            "free_quote": 1000.0,
+            "base_currency": "BTC",
+            "quote_currency": "USDT",
+        }
+
+        with pytest.raises(RuntimeError, match="Cannot open live spot Short: Available BTC balance is 0.000000"):
+            bot.manual_sell(custom_size=0.01)
+
     def test_transient_enter_error_does_not_halt_bot(self, sample_ohlcv):
         cfg = BotConfig()
         cfg.execution_mode = "auto"
@@ -3885,6 +3948,64 @@ class TestTradingModePersistenceAndStability:
         status_testnet = client.get("/api/status").json()
         assert status_testnet["mode"] == "paper"
         assert status_testnet["testnet"] is True
+
+
+class TestManualTradeWebEndpoint:
+    """Verifies that manual buy/sell endpoints support both opening and closing Long/Short trades."""
+
+    def test_manual_trade_api_short_and_long_lifecycle(self, sample_ohlcv):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+
+        client = TestClient(app)
+        bot = runner.get_or_create_bot()
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.position = None
+
+        # 1. Manual SELL when flat opens SHORT
+        res_short = client.post("/api/bot/trade/manual", json={"action": "sell", "size": 0.01})
+        assert res_short.status_code == 200
+        data_short = res_short.json()
+        assert data_short["success"] is True
+        assert "Manual SELL (Short) order executed" in data_short["message"]
+        assert bot.position is not None
+        assert bot.position["side"] == "SELL"
+
+        # 2. Duplicate sell rejected
+        res_dup_sell = client.post("/api/bot/trade/manual", json={"action": "sell"})
+        assert res_dup_sell.status_code == 400
+        assert "A Short position is already open" in res_dup_sell.json()["detail"]
+
+        # 3. Manual BUY covers SHORT
+        res_cover = client.post("/api/bot/trade/manual", json={"action": "buy"})
+        assert res_cover.status_code == 200
+        data_cover = res_cover.json()
+        assert data_cover["success"] is True
+        assert "Manual BUY order closed short position" in data_cover["message"]
+        assert bot.position is None
+
+        # 4. Manual BUY when flat opens LONG
+        res_long = client.post("/api/bot/trade/manual", json={"action": "buy", "size": 0.01})
+        assert res_long.status_code == 200
+        data_long = res_long.json()
+        assert data_long["success"] is True
+        assert "Manual BUY order executed" in data_long["message"]
+        assert bot.position is not None
+        assert bot.position["side"] == "BUY"
+
+        # 5. Duplicate buy rejected
+        res_dup_buy = client.post("/api/bot/trade/manual", json={"action": "buy"})
+        assert res_dup_buy.status_code == 400
+        assert "A Long position is already open" in res_dup_buy.json()["detail"]
+
+        # 6. Manual SELL closes LONG
+        res_close = client.post("/api/bot/trade/manual", json={"action": "sell"})
+        assert res_close.status_code == 200
+        data_close = res_close.json()
+        assert data_close["success"] is True
+        assert "Manual SELL order executed" in data_close["message"]
+        assert bot.position is None
+
 
 
 

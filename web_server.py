@@ -1376,9 +1376,14 @@ def execute_manual_trade(req: ManualTradeRequest):
     if act == "buy":
         try:
             res = bot.manual_buy(custom_size=req.size or 0.0)
+            trade_type = res.get("type", "OPEN_LONG")
+            if trade_type == "CLOSE_SHORT":
+                msg = f"Manual BUY order closed short position at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
+            else:
+                msg = f"Manual BUY order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})"
             return {
                 "success": True,
-                "message": f"Manual BUY order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})",
+                "message": msg,
                 "trade": res,
             }
         except Exception as e:
@@ -1386,10 +1391,15 @@ def execute_manual_trade(req: ManualTradeRequest):
             raise HTTPException(status_code=400, detail=str(e))
     elif act == "sell":
         try:
-            res = bot.manual_sell()
+            res = bot.manual_sell(custom_size=req.size or 0.0)
+            trade_type = res.get("type", "CLOSE_LONG")
+            if trade_type == "OPEN_SHORT":
+                msg = f"Manual SELL (Short) order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})"
+            else:
+                msg = f"Manual SELL order executed at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
             return {
                 "success": True,
-                "message": f"Manual SELL order executed at ${res['price']:,.2f} (PnL: ${res['pnl']:+,.2f})",
+                "message": msg,
                 "trade": res,
             }
         except Exception as e:
@@ -3153,10 +3163,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
             <button type="button" id="btn-manual-buy" onclick="triggerManualTrade('buy')" class="w-full sm:flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5 min-h-[42px]">
-              <i class="fa-solid fa-arrow-trend-up"></i> Manual BUY (Market)
+              <i class="fa-solid fa-arrow-trend-up"></i> <span id="btn-manual-buy-text">Manual BUY (Market)</span>
             </button>
             <button type="button" id="btn-manual-sell" onclick="triggerManualTrade('sell')" class="w-full sm:flex-1 py-2.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center justify-center gap-1.5 min-h-[42px]">
-              <i class="fa-solid fa-arrow-trend-down"></i> Manual SELL (Market)
+              <i class="fa-solid fa-arrow-trend-down"></i> <span id="btn-manual-sell-text">Manual SELL (Market)</span>
             </button>
           </div>
         </div>
@@ -4102,6 +4112,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let isKillSwitchActive = false;
     let currentUser = null;
     let exchangesList = [];
+    let currentActivePosition = null;
 
     // Per-grain storage limits, injected by the server from the same table the
     // candle fetcher uses. Asking deeper than this returns an empty page, not
@@ -5389,8 +5400,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     async function triggerManualTrade(action) {
+      const act = action.toLowerCase();
       const actName = action.toUpperCase();
-      if (!confirm(`Confirm manual ${actName} order execution at current market price?`)) return;
+      let confirmMsg = `Confirm manual ${actName} order execution at current market price?`;
+      if (currentActivePosition) {
+        const curSide = (currentActivePosition.side || 'BUY').toUpperCase();
+        if (act === 'sell' && curSide === 'BUY') {
+          confirmMsg = `Confirm CLOSE LONG position at current market price?`;
+        } else if (act === 'buy' && curSide === 'SELL') {
+          confirmMsg = `Confirm CLOSE SHORT position at current market price?`;
+        } else if (act === 'buy' && curSide === 'BUY') {
+          confirmMsg = `A Long position is already open. Confirm manual BUY?`;
+        } else if (act === 'sell' && curSide === 'SELL') {
+          confirmMsg = `A Short position is already open. Confirm manual SELL?`;
+        }
+      } else {
+        if (act === 'sell') {
+          confirmMsg = `Confirm OPEN SHORT position at current market price?`;
+        } else {
+          confirmMsg = `Confirm OPEN LONG position at current market price?`;
+        }
+      }
+      if (!confirm(confirmMsg)) return;
 
       const btn = document.getElementById('btn-manual-' + action.toLowerCase());
       const oldHtml = btn ? btn.innerHTML : '';
@@ -5663,13 +5694,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         }
 
+        currentActivePosition = data.active_position;
         const posBanner = document.getElementById('position-banner');
+        const buyTextEl = document.getElementById('btn-manual-buy-text');
+        const sellTextEl = document.getElementById('btn-manual-sell-text');
         if (data.active_position) {
           posBanner.classList.remove('hidden');
-          document.getElementById('pos-details').innerText = 
-            `Entry: $${data.active_position.entry.toFixed(2)} | Stop: $${data.active_position.stop.toFixed(2)} | Target: $${data.active_position.target.toFixed(2)} | Size: ${data.active_position.size.toFixed(6)}`;
+          const posSide = (data.active_position.side || 'BUY').toUpperCase();
+          const sideColor = posSide === 'SELL' ? 'text-rose-400' : 'text-emerald-400';
+          const sideText = posSide === 'SELL' ? 'SHORT' : 'LONG';
+          document.getElementById('pos-details').innerHTML = 
+            `<span class="${sideColor} font-bold mr-1">[${sideText}]</span> Entry: $${data.active_position.entry.toFixed(2)} | Stop: $${data.active_position.stop.toFixed(2)} | Target: $${data.active_position.target.toFixed(2)} | Size: ${data.active_position.size.toFixed(6)}`;
+          if (buyTextEl && sellTextEl) {
+            if (posSide === 'BUY') {
+              buyTextEl.innerText = 'Manual BUY (Long Open)';
+              sellTextEl.innerText = 'Close Long Position (Market)';
+            } else {
+              buyTextEl.innerText = 'Close Short Position (Market)';
+              sellTextEl.innerText = 'Manual SELL (Short Open)';
+            }
+          }
         } else {
           posBanner.classList.add('hidden');
+          if (buyTextEl && sellTextEl) {
+            buyTextEl.innerText = 'Manual BUY (Market)';
+            sellTextEl.innerText = 'Manual SELL (Market)';
+          }
         }
       } catch (e) {
         console.error('Error fetching status:', e);
