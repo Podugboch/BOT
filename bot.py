@@ -88,6 +88,8 @@ class TradingBot:
         self.last_exit_ts = None
         self.tracker = get_execution_tracker() if get_execution_tracker else None
         self.alerts = get_alert_dispatcher() if get_alert_dispatcher else None
+        self._cached_portfolio_state = None
+        self._sync_portfolio()
 
     def kill_switch_active(self) -> bool:
         return os.path.exists(self.cfg.kill_switch_file) or getattr(self.risk.state, "kill_switch_triggered", False)
@@ -111,6 +113,69 @@ class TradingBot:
             )
         log.info("Emergency kill switch deactivated. Bot is ready.")
         return True
+
+    def _persist_portfolio(self):
+        """Persist portfolio equity and paper balances to maintain a single source of truth."""
+        state = {
+            "equity": round(self.risk.state.equity, 2),
+            "peak_equity": round(self.risk.state.peak_equity, 2),
+            "daily_start_equity": round(self.risk.state.daily_start_equity, 2),
+            "paper_cash": round(self.exchange.paper_cash, 2),
+            "paper_position": round(self.exchange.paper_position, 6),
+        }
+        self._cached_portfolio_state = state
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        try:
+            from storage_adapter import remote_save_app_setting
+            remote_save_app_setting("portfolio_state", state)
+        except Exception as e:
+            log.debug("Remote portfolio_state save skipped: %s", e)
+        try:
+            from pathlib import Path
+            import json
+            port_file = Path("/tmp/portfolio_state.json") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path(os.path.dirname(os.path.abspath(__file__))) / "portfolio_state.json"
+            port_file.write_text(json.dumps(state))
+        except Exception as e:
+            log.debug("Local portfolio_state save skipped: %s", e)
+
+    def _sync_portfolio(self):
+        """Hydrate portfolio state from remote or local storage."""
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            if self._cached_portfolio_state:
+                st = self._cached_portfolio_state
+                self.risk.state.equity = float(st.get("equity", self.risk.state.equity))
+                self.risk.state.peak_equity = float(st.get("peak_equity", self.risk.state.peak_equity))
+                self.risk.state.daily_start_equity = float(st.get("daily_start_equity", self.risk.state.daily_start_equity))
+                self.exchange.paper_cash = float(st.get("paper_cash", self.exchange.paper_cash))
+                self.exchange.paper_position = float(st.get("paper_position", self.exchange.paper_position))
+            return
+        state = None
+        try:
+            from storage_adapter import remote_get_app_setting
+            state = remote_get_app_setting("portfolio_state")
+        except Exception:
+            pass
+        if not state:
+            try:
+                from pathlib import Path
+                import json
+                port_file = Path("/tmp/portfolio_state.json") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path(os.path.dirname(os.path.abspath(__file__))) / "portfolio_state.json"
+                if port_file.exists():
+                    state = json.loads(port_file.read_text())
+            except Exception:
+                pass
+        if state and isinstance(state, dict):
+            if "equity" in state:
+                self.risk.state.equity = float(state["equity"])
+            if "peak_equity" in state:
+                self.risk.state.peak_equity = float(state["peak_equity"])
+            if "daily_start_equity" in state:
+                self.risk.state.daily_start_equity = float(state["daily_start_equity"])
+            if "paper_cash" in state:
+                self.exchange.paper_cash = float(state["paper_cash"])
+            if "paper_position" in state:
+                self.exchange.paper_position = float(state["paper_position"])
 
     def _persist_position(self):
         """Persist open or closed position remotely and locally to eliminate UI flickering."""
@@ -158,6 +223,82 @@ class TradingBot:
         except Exception as e:
             log.debug("Local active_position fetch skipped: %s", e)
         return None
+
+    def get_unified_active_position(self) -> Optional[dict]:
+        """Return the authoritative live active position with real-time mark-to-market metrics."""
+        self._sync_position()
+        if self.position is None:
+            if self.tracker:
+                open_row = self.tracker.get_open_position()
+                if open_row:
+                    try:
+                        self.tracker.record_position_closed(
+                            float(open_row.get("current_price") or open_row.get("entry_price", 0.0)),
+                            0.0, 0.0, "reconciled_flat"
+                        )
+                    except Exception:
+                        pass
+            return None
+
+        # Position is open. Compute live price and live unrealized PnL
+        try:
+            curr_price = float(self.exchange.current_price() or self.position.get("entry", 0.0))
+        except Exception:
+            curr_price = float(self.position.get("entry", 0.0))
+
+        entry = float(self.position.get("entry") or self.position.get("entry_price", curr_price))
+        size = float(self.position.get("size") or self.position.get("amount", 0.0))
+        fees = float(self.position.get("fee_paid") or self.position.get("fees_paid", 0.0))
+        side = str(self.position.get("side", "BUY")).upper()
+
+        if side == "SELL":
+            unrealized_pnl = (entry - curr_price) * size - fees
+            unrealized_pnl_pct = ((entry - curr_price) / entry * 100.0) if entry > 0 else 0.0
+        else:
+            unrealized_pnl = (curr_price - entry) * size - fees
+            unrealized_pnl_pct = ((curr_price - entry) / entry * 100.0) if entry > 0 else 0.0
+
+        stop = float(self.position.get("stop") or self.position.get("current_stop", 0.0))
+        target = float(self.position.get("target", 0.0))
+        opened_at = self.position.get("opened_at") or datetime.now(timezone.utc).isoformat()
+
+        if self.tracker:
+            try:
+                self.tracker.update_open_position(
+                    curr_price,
+                    stop,
+                    trailing_stop=stop,
+                    peak_price=self.position.get("peak") or self.position.get("trough") or curr_price
+                )
+            except Exception:
+                pass
+
+        unified = {
+            "id": self.position.get("id") or self.position.get("position_id") or f"pos_{int(datetime.now(timezone.utc).timestamp()*1000)}",
+            "position_id": self.position.get("position_id") or self.position.get("id"),
+            "symbol": self.position.get("symbol") or self.cfg.exchange.symbol,
+            "side": side,
+            "size": size,
+            "amount": size,
+            "entry": entry,
+            "entry_price": entry,
+            "current_price": curr_price,
+            "stop": stop,
+            "current_stop": stop,
+            "trailing_stop": stop,
+            "stop_loss": stop,
+            "target": target,
+            "fee_paid": fees,
+            "fees_paid": fees,
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+            "notional": round(curr_price * size, 2),
+            "opened_at": opened_at,
+            "status": "OPEN",
+            "mode": self.cfg.mode,
+            "manual": bool(self.position.get("manual", False)),
+        }
+        return unified
 
     @staticmethod
     def _last_bar_ts(df):
@@ -360,14 +501,23 @@ class TradingBot:
             pnl = ((self.position["entry"] - fill["price"]) * buy_size
                    - self.position["fee_paid"] - fill["fee"])
             self.risk.record_trade_result(pnl)
+            if self.cfg.mode != "live":
+                self.exchange.paper_position = 0.0
+                self.exchange.paper_cash = round(self.risk.state.equity, 2)
+            pos_entry = self.position["entry"]
+            pos_opened_at = self.position.get("opened_at")
+            pos_side = str(self.position.get("side", "SELL")).upper()
             closed_position = dict(self.position)
             self.position = None
             self._persist_position()
+            self._persist_portfolio()
             self._mark_exit(df)
             if self.tracker:
                 self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", buy_size,
                                           fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
-                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual",
+                                                    symbol=self.cfg.exchange.symbol, side=pos_side, size=buy_size,
+                                                    entry_price=pos_entry, opened_at=pos_opened_at)
             if self.alerts:
                 self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL BUY (Cover Short) ({self.cfg.exchange.symbol})",
                                        f"Covered at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
@@ -381,6 +531,8 @@ class TradingBot:
                 "size": buy_size,
                 "pnl": round(pnl, 2),
                 "equity": round(self.risk.state.equity, 2),
+                "paper_cash": round(self.exchange.paper_cash, 2),
+                "paper_position": round(self.exchange.paper_position, 6),
                 "fee": fill["fee"],
                 "mode": fill.get("mode", self.cfg.mode),
             }
@@ -448,18 +600,32 @@ class TradingBot:
                                           mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
             raise
 
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos_id = f"pos_{int(datetime.now(timezone.utc).timestamp()*1000)}"
         self.position = {
+            "id": pos_id,
+            "position_id": pos_id,
+            "symbol": self.cfg.exchange.symbol,
             "side": "BUY",
             "entry": fill["price"],
+            "entry_price": fill["price"],
             "size": size,
+            "amount": size,
             "stop": stop,
+            "current_stop": stop,
+            "stop_loss": stop,
+            "trailing_stop": stop,
             "target": target,
             "fee_paid": fill["fee"],
+            "fees_paid": fill["fee"],
             "initial_stop": stop,
             "peak": fill["price"],
             "manual": True,
+            "opened_at": now_iso,
+            "status": "OPEN",
         }
         self._persist_position()
+        self._persist_portfolio()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -480,6 +646,9 @@ class TradingBot:
             "stop": stop,
             "target": target,
             "fee": fill["fee"],
+            "equity": round(self.risk.state.equity, 2),
+            "paper_cash": round(self.exchange.paper_cash, 2),
+            "paper_position": round(self.exchange.paper_position, 6),
             "mode": fill.get("mode", self.cfg.mode),
         }
 
@@ -519,14 +688,23 @@ class TradingBot:
             pnl = ((fill["price"] - self.position["entry"]) * sell_size
                    - self.position["fee_paid"] - fill["fee"])
             self.risk.record_trade_result(pnl)
+            if self.cfg.mode != "live":
+                self.exchange.paper_position = 0.0
+                self.exchange.paper_cash = round(self.risk.state.equity, 2)
+            pos_entry = self.position["entry"]
+            pos_opened_at = self.position.get("opened_at")
+            pos_side = str(self.position.get("side", "BUY")).upper()
             closed_position = dict(self.position)
             self.position = None
             self._persist_position()
+            self._persist_portfolio()
             self._mark_exit(df)
             if self.tracker:
                 self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
                                           fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
-                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual")
+                self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, "manual",
+                                                    symbol=self.cfg.exchange.symbol, side=pos_side, size=sell_size,
+                                                    entry_price=pos_entry, opened_at=pos_opened_at)
             if self.alerts:
                 self.alerts.send_alert("EXECUTION", f"Position Closed: MANUAL SELL ({self.cfg.exchange.symbol})",
                                        f"Closed at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Equity: ${self.risk.state.equity:,.2f}",
@@ -540,6 +718,8 @@ class TradingBot:
                 "size": sell_size,
                 "pnl": round(pnl, 2),
                 "equity": round(self.risk.state.equity, 2),
+                "paper_cash": round(self.exchange.paper_cash, 2),
+                "paper_position": round(self.exchange.paper_position, 6),
                 "fee": fill["fee"],
                 "mode": fill.get("mode", self.cfg.mode),
             }
@@ -606,18 +786,32 @@ class TradingBot:
                                           mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
             raise
 
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos_id = f"pos_{int(datetime.now(timezone.utc).timestamp()*1000)}"
         self.position = {
+            "id": pos_id,
+            "position_id": pos_id,
+            "symbol": self.cfg.exchange.symbol,
             "side": "SELL",
             "entry": fill["price"],
+            "entry_price": fill["price"],
             "size": size,
+            "amount": size,
             "stop": stop,
+            "current_stop": stop,
+            "stop_loss": stop,
+            "trailing_stop": stop,
             "target": target,
             "fee_paid": fill["fee"],
+            "fees_paid": fill["fee"],
             "initial_stop": stop,
             "trough": fill["price"],
             "manual": True,
+            "opened_at": now_iso,
+            "status": "OPEN",
         }
         self._persist_position()
+        self._persist_portfolio()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -638,6 +832,9 @@ class TradingBot:
             "stop": stop,
             "target": target,
             "fee": fill["fee"],
+            "equity": round(self.risk.state.equity, 2),
+            "paper_cash": round(self.exchange.paper_cash, 2),
+            "paper_position": round(self.exchange.paper_position, 6),
             "mode": fill.get("mode", self.cfg.mode),
         }
 
@@ -747,9 +944,32 @@ class TradingBot:
                                           mode=self.cfg.mode, status="REJECTED", rejection_reason=str(e))
             raise
 
-        self.position = {"side": "BUY", "entry": fill["price"], "size": size, "stop": stop,
-                          "target": target, "fee_paid": fill["fee"], "initial_stop": stop, "peak": fill["price"]}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos_id = f"pos_{int(datetime.now(timezone.utc).timestamp()*1000)}"
+        self.position = {
+            "id": pos_id,
+            "position_id": pos_id,
+            "symbol": self.cfg.exchange.symbol,
+            "side": "BUY",
+            "entry": fill["price"],
+            "entry_price": fill["price"],
+            "size": size,
+            "amount": size,
+            "stop": stop,
+            "current_stop": stop,
+            "stop_loss": stop,
+            "trailing_stop": stop,
+            "target": target,
+            "fee_paid": fill["fee"],
+            "fees_paid": fill["fee"],
+            "initial_stop": stop,
+            "peak": fill["price"],
+            "manual": False,
+            "opened_at": now_iso,
+            "status": "OPEN",
+        }
         self._persist_position()
+        self._persist_portfolio()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -827,10 +1047,17 @@ class TradingBot:
         if hit_stop and self.position.get("trail_armed"):
             reason = "trail"
         self.risk.record_trade_result(pnl)
+        if self.cfg.mode != "live":
+            self.exchange.paper_position = 0.0
+            self.exchange.paper_cash = round(self.risk.state.equity, 2)
+        pos_entry = self.position["entry"]
+        pos_opened_at = self.position.get("opened_at")
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, exit_side, order_size,
                                       fill["price"], fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
-            self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, reason)
+            self.tracker.record_position_closed(fill["price"], fill["fee"], pnl, reason,
+                                                symbol=self.cfg.exchange.symbol, side=pos_side, size=order_size,
+                                                entry_price=pos_entry, opened_at=pos_opened_at)
         if self.alerts:
             self.alerts.send_alert("EXECUTION", f"Position Closed: {reason.upper()} ({self.cfg.exchange.symbol})",
                                    f"Closed {pos_side} at ${fill['price']:,.2f} with PnL ${pnl:+,.2f} | Total Equity: ${self.risk.state.equity:,.2f}",
@@ -840,6 +1067,7 @@ class TradingBot:
                   "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
         self._persist_position()
+        self._persist_portfolio()
         self._mark_exit(df)
 
     def run(self):

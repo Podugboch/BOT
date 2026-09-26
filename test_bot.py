@@ -4086,6 +4086,133 @@ class TestPositionBannerAndCloseTrade:
         assert "No active position open to close" in res.json()["detail"]
 
 
+class TestFiveSurfacesUnifiedSynchronization:
+    """
+    Assert that all five surfaces:
+      1. Plain-text activity log (/api/logs & memory buffer)
+      2. Top-level active position banner (/api/status active_position)
+      3. Portfolio equity and paper cash KPI tiles (/api/status equity, paper_cash, paper_position)
+      4. Active Position Telemetry card (/api/execution/tracker active_position)
+      5. Order Execution History table (/api/execution/tracker orders, closed_trades, stats)
+    read from one unified source of truth and stay in lockstep agreement across the complete
+    lifecycle of opening and closing a paper trade.
+    """
+
+    def test_five_surfaces_synchronized_on_trade_lifecycle(self, sample_ohlcv):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+
+        client = TestClient(app)
+        bot = runner.get_or_create_bot()
+        test_price = float(sample_ohlcv["close"].iloc[-1])
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.exchange.current_price = lambda *args, **kwargs: test_price
+        bot.position = None
+        bot.exchange.paper_position = 0.0
+        bot.exchange.paper_cash = 1000.0
+        bot.risk.state.equity = 1000.0
+        bot._persist_portfolio()
+
+        # Phase 0: Assert initial flat state across all surfaces
+        status_0 = client.get("/api/status").json()
+        tracker_0 = client.get("/api/execution/tracker").json()
+
+        # Surface 2 (Banner) & Surface 4 (Telemetry) agree on Flat
+        assert status_0["active_position"] is None
+        assert tracker_0["active_position"] is None
+
+        # Surface 3 (KPI Tiles)
+        assert status_0["paper_position"] == 0.0
+        assert status_0["paper_cash"] == 1000.0
+        assert status_0["equity"] == 1000.0
+
+        # Phase 1: Open a Paper BUY trade (0.01 BTC)
+        res_open = client.post("/api/bot/trade/manual", json={"action": "buy", "size": 0.01})
+        assert res_open.status_code == 200
+        data_open = res_open.json()
+        assert data_open["success"] is True
+
+        # Fetch all 5 surfaces immediately
+        log_res = client.get("/api/logs?lines=20").json()
+        status_1 = client.get("/api/status").json()
+        tracker_1 = client.get("/api/execution/tracker").json()
+
+        # Surface 1: Plain-text Activity Log
+        logs_text = " ".join(log_res.get("logs", []))
+        assert "Manual BUY order executed" in logs_text or "MANUAL BUY EXECUTED" in logs_text or "BUY" in logs_text
+
+        # Surface 2: Top-level position banner
+        banner_pos = status_1["active_position"]
+        assert banner_pos is not None
+        assert banner_pos["side"] == "BUY"
+        assert banner_pos["size"] == 0.01
+        assert banner_pos["entry_price"] > 0
+        assert banner_pos["entry"] == banner_pos["entry_price"]
+
+        # Surface 3: Portfolio equity & paper cash KPI tiles
+        assert status_1["paper_position"] == 0.01
+        assert status_1["paper_cash"] < 1000.0  # Cash decremented by order notional + fee
+        assert status_1["equity"] == 1000.0
+
+        # Surface 4: Active Position Telemetry
+        telemetry_pos = tracker_1["active_position"]
+        assert telemetry_pos is not None
+        assert telemetry_pos["side"] == banner_pos["side"]
+        assert telemetry_pos["entry_price"] == banner_pos["entry_price"]
+        assert telemetry_pos["size"] == banner_pos["size"]
+        assert telemetry_pos["unrealized_pnl"] == banner_pos["unrealized_pnl"]
+
+        # Surface 5: Order Execution History table
+        orders_1 = tracker_1["orders"]
+        assert len(orders_1) >= 1
+        latest_order = orders_1[0]
+        assert latest_order["side"] == "BUY"
+        assert latest_order["status"] == "FILLED"
+        assert (latest_order.get("size") == 0.01 or latest_order.get("amount") == 0.01)
+
+        # Phase 2: Close the active trade via /api/bot/trade/close
+        res_close = client.post("/api/bot/trade/close")
+        assert res_close.status_code == 200
+        data_close = res_close.json()
+        assert data_close["success"] is True
+
+        # Fetch all 5 surfaces immediately after close
+        log_res_2 = client.get("/api/logs?lines=20").json()
+        status_2 = client.get("/api/status").json()
+        tracker_2 = client.get("/api/execution/tracker").json()
+
+        # Surface 1: Plain-text Activity Log
+        logs_text_2 = " ".join(log_res_2.get("logs", []))
+        assert ("closed LONG position" in logs_text_2) or ("Position Closed" in logs_text_2) or ("Manual order closed" in logs_text_2)
+
+        # Surface 2: Top-level position banner
+        assert status_2["active_position"] is None
+
+        # Surface 3: Portfolio equity & paper cash KPI tiles
+        assert status_2["paper_position"] == 0.0
+        assert status_2["paper_cash"] == status_2["equity"]
+        assert status_2["equity"] > 0
+
+        # Surface 4: Active Position Telemetry
+        assert tracker_2["active_position"] is None
+
+        # Surface 5: Order Execution History table
+        orders_2 = tracker_2["orders"]
+        assert len(orders_2) >= 2
+        order_sides = [o["side"] for o in orders_2[:2]]
+        assert "BUY" in order_sides
+        assert "SELL" in order_sides
+        assert all(o["status"] == "FILLED" for o in orders_2[:2])
+
+        # Closed trades history
+        closed_trades = tracker_2["closed_trades"]
+        assert len(closed_trades) >= 1
+        latest_closed = closed_trades[0]
+        assert latest_closed["status"] == "CLOSED"
+        assert "realized_pnl" in latest_closed or "pnl" in latest_closed
+
+
+
 
 
 
