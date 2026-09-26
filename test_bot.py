@@ -3797,3 +3797,31 @@ class TestExchangeKeyRemovalAndExecutionMode:
         assert runner.cfg.exchange.api_secret == ""
 
 
+class TestTraderQueenLogoAndBranding:
+    """Verifies that Trader Queen logo and favicon are served correctly and embedded in HTML."""
+
+    def test_logo_and_favicon_endpoints(self):
+        from fastapi.testclient import TestClient
+        from web_server import app, LOGO_PATH
+
+        assert LOGO_PATH.exists(), f"Logo file does not exist at {LOGO_PATH}"
+        client = TestClient(app)
+
+        res_logo = client.get("/logo.png")
+        assert res_logo.status_code == 200
+        assert res_logo.headers["content-type"].startswith("image/png")
+        assert len(res_logo.content) > 0
+
+        res_fav = client.get("/favicon.ico")
+        assert res_fav.status_code == 200
+        assert res_fav.headers["content-type"].startswith("image/png")
+        assert res_fav.content == res_logo.content
+
+    def test_dashboard_contains_logo_and_branding(self):
+        from web_server import DASHBOARD_HTML
+        assert '<img src="/logo.png" alt="Trader Queen Logo"' in DASHBOARD_HTML
+        assert '<link rel="icon" type="image/png" href="/logo.png">' in DASHBOARD_HTML
+        assert 'Trader Queen' in DASHBOARD_HTML
+
+
+

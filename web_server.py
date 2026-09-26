@@ -30,6 +30,7 @@ import numpy as np
 import ccxt
 
 CURRENT_DIR = Path(__file__).resolve().parent
+LOGO_PATH = CURRENT_DIR / "static" / "logo.png"
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
@@ -72,6 +73,16 @@ if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
         os.environ.pop(k, None)
 
 app = FastAPI(title="Trader Queen Dashboard & Auth", version="2.0.0")
+
+
+@app.get("/logo.png")
+@app.get("/favicon.ico")
+@app.get("/static/logo.png")
+def get_logo():
+    if LOGO_PATH.exists():
+        return FileResponse(LOGO_PATH, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Logo not found")
+
 
 # Supported popular exchanges with metadata
 EXCHANGES_META = [
@@ -2217,6 +2228,8 @@ def activate_page(token: str = Query(...)):
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>{title_escaped}</title>
+      <link rel="icon" type="image/png" href="/logo.png">
+      <link rel="apple-touch-icon" href="/logo.png">
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
@@ -2278,6 +2291,8 @@ def magic_login_page(token: str = Query(...)):
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>{title_escaped}</title>
+      <link rel="icon" type="image/png" href="/logo.png">
+      <link rel="apple-touch-icon" href="/logo.png">
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/react/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
@@ -2308,6 +2323,8 @@ def reset_password_page(token: str = Query(...)):
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>Reset Your Password</title>
+      <link rel="icon" type="image/png" href="/logo.png">
+      <link rel="apple-touch-icon" href="/logo.png">
       <script src="https://cdn.tailwindcss.com"></script>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
@@ -2406,6 +2423,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Trader Queen - Dashboard & Exchange Keys</title>
+  <link rel="icon" type="image/png" href="/logo.png">
+  <link rel="apple-touch-icon" href="/logo.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <script>
@@ -2531,8 +2550,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="flex items-center justify-between gap-2">
         <!-- Brand & Title -->
         <div class="flex items-center space-x-2.5 sm:space-x-3 min-w-0">
-          <div class="h-8 w-8 sm:h-9 sm:w-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold shrink-0">
-            <i class="fa-solid fa-crown text-sm sm:text-base text-amber-400"></i>
+          <div class="h-8 w-8 sm:h-9 sm:w-9 rounded-lg overflow-hidden border border-amber-500/40 shadow-md shrink-0 flex items-center justify-center bg-slate-900">
+            <img src="/logo.png" alt="Trader Queen Logo" class="h-full w-full object-cover">
           </div>
           <div class="min-w-0">
             <h1 class="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5 sm:gap-2 truncate">
@@ -3600,6 +3619,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- Modal Title -->
       <div class="text-center">
+        <div class="w-12 h-12 mx-auto mb-2 rounded-xl overflow-hidden border border-amber-500/40 shadow-lg bg-slate-900 flex items-center justify-center">
+          <img src="/logo.png" alt="Trader Queen Logo" class="h-full w-full object-cover">
+        </div>
         <h3 id="modal-title" class="text-xl font-bold text-white">Account Login</h3>
         <p id="modal-subtitle" class="text-xs text-slate-400 mt-1">Sign in to manage exchange keys and view trades.</p>
       </div>
