@@ -1056,6 +1056,33 @@ def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
     return response
 
 
+def _safe_remote_pos(bot=None) -> Optional[dict]:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    try:
+        from storage_adapter import remote_get_app_setting
+        rem = remote_get_app_setting("active_position")
+        if rem and isinstance(rem, dict) and rem.get("entry"):
+            if bot and bot.position is None:
+                bot.position = rem
+            return rem
+    except Exception:
+        pass
+    try:
+        from pathlib import Path
+        import json
+        pos_file = Path("/tmp/active_position.json") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path(CURRENT_DIR / "active_position.json")
+        if pos_file.exists():
+            rem = json.loads(pos_file.read_text())
+            if rem and isinstance(rem, dict) and rem.get("entry"):
+                if bot and bot.position is None:
+                    bot.position = rem
+                return rem
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/api/status")
 def get_status(response: Response = None):
     _no_store(response)
@@ -1159,7 +1186,7 @@ def get_status(response: Response = None):
         "wallet_balance": wallet_info,
         "order_book_spread": spread_info,
         "max_spread_pct": getattr(cfg.risk, "max_spread_pct", 0.35),
-        "active_position": bot.position if bot else None,
+        "active_position": bot.position if (bot and bot.position) else _safe_remote_pos(bot),
         "timeframe_warning": (
             f"Negative expectancy (-10% to -15%) in historical backtests on {cfg.exchange.timeframe}. Do not risk live capital on this grain without strategy recalibration."
             if cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] else None
@@ -1385,6 +1412,7 @@ def execute_manual_trade(req: ManualTradeRequest):
                 "success": True,
                 "message": msg,
                 "trade": res,
+                "active_position": bot.position,
             }
         except Exception as e:
             logger.exception("Manual BUY order failed")
@@ -1401,12 +1429,47 @@ def execute_manual_trade(req: ManualTradeRequest):
                 "success": True,
                 "message": msg,
                 "trade": res,
+                "active_position": bot.position,
             }
         except Exception as e:
             logger.exception("Manual SELL order failed")
             raise HTTPException(status_code=400, detail=str(e))
+    elif act in ("close", "close_position", "cover", "exit"):
+        try:
+            if not bot.position:
+                _safe_remote_pos(bot)
+            if not bot.position:
+                raise HTTPException(status_code=400, detail="No active position open to close.")
+            pos_side = str(bot.position.get("side", "BUY")).upper()
+            if pos_side == "SELL":
+                res = bot.manual_buy()
+                msg = f"Manual order closed SHORT position at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
+            else:
+                res = bot.manual_sell()
+                msg = f"Manual order closed LONG position at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
+            try:
+                from storage_adapter import remote_save_app_setting
+                remote_save_app_setting("active_position", None)
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "message": msg,
+                "trade": res,
+                "active_position": bot.position,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Manual close position failed")
+            raise HTTPException(status_code=400, detail=str(e))
     else:
-        raise HTTPException(status_code=400, detail=f"Invalid manual trade action '{req.action}'. Use 'buy' or 'sell'.")
+        raise HTTPException(status_code=400, detail=f"Invalid manual trade action '{req.action}'. Use 'buy', 'sell', or 'close'.")
+
+
+@app.post("/api/bot/trade/close")
+def close_manual_trade():
+    return execute_manual_trade(ManualTradeRequest(action="close"))
 
 
 @app.post("/api/bot/start")
@@ -2863,13 +2926,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Active Position Banner -->
     <div id="position-banner" class="hidden bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-3 sm:p-3.5 flex flex-wrap items-center justify-between gap-2">
       <div class="flex items-center gap-2.5 sm:gap-3 min-w-0">
-        <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></div>
+        <div id="pos-banner-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></div>
         <div class="min-w-0">
           <span class="font-bold text-emerald-400 text-xs">ACTIVE POSITION:</span>
           <span class="text-xs text-slate-300 ml-1.5 break-all" id="pos-details"></span>
         </div>
       </div>
-      <span class="text-[10px] text-emerald-300 font-semibold px-2 py-0.5 bg-emerald-900/60 rounded shrink-0">IN MARKET</span>
+      <div class="flex items-center gap-2 shrink-0">
+        <button type="button" id="btn-banner-close-trade" onclick="closeActivePosition()" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center gap-1.5" title="Close this position immediately at market price">
+          <i class="fa-solid fa-circle-xmark"></i>
+          <span id="btn-banner-close-text">Close Position</span>
+        </button>
+        <button type="button" id="btn-banner-manual-trade" onclick="scrollToManualTrading()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 border border-bordercol font-semibold text-xs rounded-lg transition flex items-center gap-1.5" title="Open or manage manual trades">
+          <i class="fa-solid fa-sliders"></i>
+          <span>Manual Orders</span>
+        </button>
+      </div>
     </div>
 
     <!-- ========================================================================= -->
@@ -4113,6 +4185,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let currentUser = null;
     let exchangesList = [];
     let currentActivePosition = null;
+    let activePosNullStreak = 0;
 
     // Per-grain storage limits, injected by the server from the same table the
     // candle fetcher uses. Asking deeper than this returns an empty page, not
@@ -5399,6 +5472,115 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       quickSetExecutionMode(target);
     }
 
+    function renderActivePositionBanner(pos) {
+      const posBanner = document.getElementById('position-banner');
+      const buyTextEl = document.getElementById('btn-manual-buy-text');
+      const sellTextEl = document.getElementById('btn-manual-sell-text');
+      const posDot = document.getElementById('pos-banner-dot');
+      const closeBtnText = document.getElementById('btn-banner-close-text');
+      const posDetails = document.getElementById('pos-details');
+
+      if (!posBanner) return;
+
+      if (!pos || !pos.entry) {
+        posBanner.classList.add('hidden');
+        if (buyTextEl && sellTextEl) {
+          buyTextEl.innerText = 'Manual BUY (Market)';
+          sellTextEl.innerText = 'Manual SELL (Market)';
+        }
+        return;
+      }
+
+      posBanner.classList.remove('hidden');
+      const posSide = (pos.side || 'BUY').toUpperCase();
+      const isShort = (posSide === 'SELL');
+      const sideColor = isShort ? 'text-rose-400' : 'text-emerald-400';
+      const sideText = isShort ? 'SHORT' : 'LONG';
+      const entryVal = Number(pos.entry || 0).toFixed(2);
+      const stopVal = Number(pos.stop || 0).toFixed(2);
+      const targetVal = Number(pos.target || 0).toFixed(2);
+      const sizeVal = Number(pos.size || 0).toFixed(6);
+
+      if (posDot) {
+        posDot.className = isShort 
+          ? 'w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse shrink-0'
+          : 'w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0';
+      }
+
+      if (posDetails) {
+        posDetails.innerHTML = `<span class="${sideColor} font-bold mr-1">[${sideText}]</span> Entry: $${entryVal} | Stop: $${stopVal} | Target: $${targetVal} | Size: ${sizeVal}`;
+      }
+
+      if (closeBtnText) {
+        closeBtnText.innerText = isShort ? 'Close Short' : 'Close Long';
+      }
+
+      if (buyTextEl && sellTextEl) {
+        if (!isShort) {
+          buyTextEl.innerText = 'Manual BUY (Long Open)';
+          sellTextEl.innerText = 'Close Long Position (Market)';
+        } else {
+          buyTextEl.innerText = 'Close Short Position (Market)';
+          sellTextEl.innerText = 'Manual SELL (Short Open)';
+        }
+      }
+    }
+
+    async function closeActivePosition() {
+      let pos = currentActivePosition;
+      if (!pos) {
+        try { pos = JSON.parse(localStorage.getItem('bot_active_position')); } catch(e) {}
+      }
+      const side = ((pos && pos.side) || 'SELL').toUpperCase();
+      const sideName = side === 'SELL' ? 'SHORT' : 'LONG';
+      if (!confirm(`Confirm CLOSE ${sideName} position at current market price?`)) return;
+
+      const btn = document.getElementById('btn-banner-close-trade');
+      const oldHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Closing...';
+      }
+
+      try {
+        const res = await fetch('/api/bot/trade/close', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'close' })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          alert(data.message || `${sideName} position closed successfully.`);
+          currentActivePosition = null;
+          activePosNullStreak = 0;
+          try { localStorage.removeItem('bot_active_position'); } catch(e) {}
+          renderActivePositionBanner(null);
+          await fetchStatus();
+          await refreshLogs();
+        } else {
+          alert(`Failed to close ${sideName} position: ` + (data.detail || data.message || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Error closing position: ' + err);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = oldHtml;
+        }
+      }
+    }
+
+    function scrollToManualTrading() {
+      quickSetExecutionMode('manual');
+      const panel = document.getElementById('manual-control-panel');
+      if (panel) {
+        panel.classList.remove('hidden');
+        panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        panel.classList.add('ring-2', 'ring-amber-400');
+        setTimeout(() => panel.classList.remove('ring-2', 'ring-amber-400'), 2500);
+      }
+    }
+
     async function triggerManualTrade(action) {
       const act = action.toLowerCase();
       const actName = action.toUpperCase();
@@ -5439,6 +5621,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (res.ok && data.success) {
           alert(data.message);
+          if (data.active_position) {
+            currentActivePosition = data.active_position;
+            activePosNullStreak = 0;
+            try { localStorage.setItem('bot_active_position', JSON.stringify(data.active_position)); } catch(e) {}
+            renderActivePositionBanner(data.active_position);
+          } else {
+            currentActivePosition = null;
+            activePosNullStreak = 0;
+            try { localStorage.removeItem('bot_active_position'); } catch(e) {}
+            renderActivePositionBanner(null);
+          }
           await fetchStatus();
           await refreshLogs();
         } else {
@@ -5694,31 +5887,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         }
 
-        currentActivePosition = data.active_position;
-        const posBanner = document.getElementById('position-banner');
-        const buyTextEl = document.getElementById('btn-manual-buy-text');
-        const sellTextEl = document.getElementById('btn-manual-sell-text');
         if (data.active_position) {
-          posBanner.classList.remove('hidden');
-          const posSide = (data.active_position.side || 'BUY').toUpperCase();
-          const sideColor = posSide === 'SELL' ? 'text-rose-400' : 'text-emerald-400';
-          const sideText = posSide === 'SELL' ? 'SHORT' : 'LONG';
-          document.getElementById('pos-details').innerHTML = 
-            `<span class="${sideColor} font-bold mr-1">[${sideText}]</span> Entry: $${data.active_position.entry.toFixed(2)} | Stop: $${data.active_position.stop.toFixed(2)} | Target: $${data.active_position.target.toFixed(2)} | Size: ${data.active_position.size.toFixed(6)}`;
-          if (buyTextEl && sellTextEl) {
-            if (posSide === 'BUY') {
-              buyTextEl.innerText = 'Manual BUY (Long Open)';
-              sellTextEl.innerText = 'Close Long Position (Market)';
-            } else {
-              buyTextEl.innerText = 'Close Short Position (Market)';
-              sellTextEl.innerText = 'Manual SELL (Short Open)';
-            }
-          }
+          activePosNullStreak = 0;
+          currentActivePosition = data.active_position;
+          try { localStorage.setItem('bot_active_position', JSON.stringify(data.active_position)); } catch (e) {}
+          renderActivePositionBanner(data.active_position);
         } else {
-          posBanner.classList.add('hidden');
-          if (buyTextEl && sellTextEl) {
-            buyTextEl.innerText = 'Manual BUY (Market)';
-            sellTextEl.innerText = 'Manual SELL (Market)';
+          const savedPos = localStorage.getItem('bot_active_position');
+          if (savedPos) {
+            activePosNullStreak = (activePosNullStreak || 0) + 1;
+            if (activePosNullStreak >= 2) {
+              currentActivePosition = null;
+              try { localStorage.removeItem('bot_active_position'); } catch (e) {}
+              renderActivePositionBanner(null);
+            }
+          } else {
+            currentActivePosition = null;
+            renderActivePositionBanner(null);
           }
         }
       } catch (e) {
@@ -7203,6 +7388,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const initialSavedMode = localStorage.getItem('bot_execution_mode');
     if (initialSavedMode) {
       updateExecutionModeUI(initialSavedMode === 'manual');
+    }
+    const initialSavedPos = localStorage.getItem('bot_active_position');
+    if (initialSavedPos) {
+      try {
+        const parsedPos = JSON.parse(initialSavedPos);
+        if (parsedPos && parsedPos.entry) {
+          currentActivePosition = parsedPos;
+          renderActivePositionBanner(parsedPos);
+        }
+      } catch (e) {}
     }
     loadExchanges();
     checkAuth();

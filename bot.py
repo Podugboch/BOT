@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Dict, Any
 import pandas as pd
 
 from config import BotConfig, timeframe_minutes
@@ -111,6 +112,53 @@ class TradingBot:
         log.info("Emergency kill switch deactivated. Bot is ready.")
         return True
 
+    def _persist_position(self):
+        """Persist open or closed position remotely and locally to eliminate UI flickering."""
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        try:
+            from storage_adapter import remote_save_app_setting
+            remote_save_app_setting("active_position", self.position)
+        except Exception as e:
+            log.debug("Remote active_position save skipped: %s", e)
+        try:
+            from pathlib import Path
+            import json
+            pos_file = Path("/tmp/active_position.json") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path(os.path.dirname(os.path.abspath(__file__))) / "active_position.json"
+            if self.position is not None:
+                pos_file.write_text(json.dumps(self.position))
+            elif pos_file.exists():
+                pos_file.unlink(missing_ok=True)
+        except Exception as e:
+            log.debug("Local active_position save skipped: %s", e)
+
+    def _sync_position(self) -> Optional[dict]:
+        """Hydrate active position from remote storage or local active position cache."""
+        if self.position is not None:
+            return self.position
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return None
+        try:
+            from storage_adapter import remote_get_app_setting
+            rem = remote_get_app_setting("active_position")
+            if rem and isinstance(rem, dict) and rem.get("entry"):
+                self.position = rem
+                return self.position
+        except Exception as e:
+            log.debug("Remote active_position fetch skipped: %s", e)
+        try:
+            from pathlib import Path
+            import json
+            pos_file = Path("/tmp/active_position.json") if (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")) else Path(os.path.dirname(os.path.abspath(__file__))) / "active_position.json"
+            if pos_file.exists():
+                rem = json.loads(pos_file.read_text())
+                if rem and isinstance(rem, dict) and rem.get("entry"):
+                    self.position = rem
+                    return self.position
+        except Exception as e:
+            log.debug("Local active_position fetch skipped: %s", e)
+        return None
+
     @staticmethod
     def _last_bar_ts(df):
         """Bar timestamp of the newest candle, falling back to wall-clock time."""
@@ -180,6 +228,7 @@ class TradingBot:
 
         self.maybe_reset_day()
         self.sync_live_balance()
+        self._sync_position()
 
         try:
             df = self.exchange.fetch_ohlcv(limit=200)
@@ -272,6 +321,8 @@ class TradingBot:
         if self.kill_switch_active():
             raise RuntimeError(f"Kill switch active ({self.cfg.kill_switch_file}). Operation aborted.")
 
+        self._sync_position()
+
         if self.position is not None:
             pos_side = str(self.position.get("side", "BUY")).upper()
             if pos_side == "BUY":
@@ -311,6 +362,7 @@ class TradingBot:
             self.risk.record_trade_result(pnl)
             closed_position = dict(self.position)
             self.position = None
+            self._persist_position()
             self._mark_exit(df)
             if self.tracker:
                 self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", buy_size,
@@ -407,6 +459,7 @@ class TradingBot:
             "peak": fill["price"],
             "manual": True,
         }
+        self._persist_position()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -434,6 +487,8 @@ class TradingBot:
         """Place a manual SELL order (close Long, or open Short)."""
         if self.kill_switch_active():
             raise RuntimeError(f"Kill switch active ({self.cfg.kill_switch_file}). Operation aborted.")
+
+        self._sync_position()
 
         if self.position is not None:
             pos_side = str(self.position.get("side", "BUY")).upper()
@@ -466,6 +521,7 @@ class TradingBot:
             self.risk.record_trade_result(pnl)
             closed_position = dict(self.position)
             self.position = None
+            self._persist_position()
             self._mark_exit(df)
             if self.tracker:
                 self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", sell_size,
@@ -561,6 +617,7 @@ class TradingBot:
             "trough": fill["price"],
             "manual": True,
         }
+        self._persist_position()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "SELL", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -692,6 +749,7 @@ class TradingBot:
 
         self.position = {"side": "BUY", "entry": fill["price"], "size": size, "stop": stop,
                           "target": target, "fee_paid": fill["fee"], "initial_stop": stop, "peak": fill["price"]}
+        self._persist_position()
         if self.tracker:
             self.tracker.record_order(self.cfg.exchange.symbol, self.cfg.exchange.timeframe, "BUY", size, fill["price"],
                                       fee=fill["fee"], mode=self.cfg.mode, status="FILLED")
@@ -781,6 +839,7 @@ class TradingBot:
                   pos_side, reason, self.position["entry"], fill["price"], pnl, self.risk.state.equity,
                   "" if reason != "trail" else f" (trailing stop {self.position['stop']:.2f})")
         self.position = None
+        self._persist_position()
         self._mark_exit(df)
 
     def run(self):

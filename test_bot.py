@@ -4007,6 +4007,86 @@ class TestManualTradeWebEndpoint:
         assert bot.position is None
 
 
+class TestPositionBannerAndCloseTrade:
+    """Verifies that active trade banner contains close/manual trade buttons and close endpoint works."""
+
+    def test_dashboard_contains_banner_buttons_and_functions(self):
+        from web_server import DASHBOARD_HTML
+        assert 'id="btn-banner-close-trade"' in DASHBOARD_HTML
+        assert 'id="btn-banner-manual-trade"' in DASHBOARD_HTML
+        assert 'closeActivePosition()' in DASHBOARD_HTML
+        assert 'scrollToManualTrading()' in DASHBOARD_HTML
+        assert 'renderActivePositionBanner' in DASHBOARD_HTML
+        assert 'IN MARKET' not in DASHBOARD_HTML
+
+    def test_close_trade_endpoint_closes_short_position(self, sample_ohlcv):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+
+        client = TestClient(app)
+        bot = runner.get_or_create_bot()
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.position = None
+
+        # Open short position
+        res_open = client.post("/api/bot/trade/manual", json={"action": "sell", "size": 0.01})
+        assert res_open.status_code == 200
+        assert bot.position is not None
+        assert bot.position["side"] == "SELL"
+
+        # Verify /api/status returns active_position
+        status_res = client.get("/api/status").json()
+        assert status_res["active_position"] is not None
+        assert status_res["active_position"]["side"] == "SELL"
+
+        # Close position via /api/bot/trade/close
+        res_close = client.post("/api/bot/trade/close")
+        assert res_close.status_code == 200
+        data_close = res_close.json()
+        assert data_close["success"] is True
+        assert "closed SHORT position" in data_close["message"]
+        assert bot.position is None
+
+        # Verify /api/status now has active_position as None
+        status_after = client.get("/api/status").json()
+        assert status_after["active_position"] is None
+
+    def test_close_trade_endpoint_closes_long_position(self, sample_ohlcv):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+
+        client = TestClient(app)
+        bot = runner.get_or_create_bot()
+        bot.exchange.fetch_ohlcv = lambda *args, **kwargs: sample_ohlcv
+        bot.position = None
+
+        # Open long position
+        res_open = client.post("/api/bot/trade/manual", json={"action": "buy", "size": 0.01})
+        assert res_open.status_code == 200
+        assert bot.position is not None
+        assert bot.position["side"] == "BUY"
+
+        # Close position via action='close' on /api/bot/trade/manual
+        res_close = client.post("/api/bot/trade/manual", json={"action": "close"})
+        assert res_close.status_code == 200
+        data_close = res_close.json()
+        assert data_close["success"] is True
+        assert "closed LONG position" in data_close["message"]
+        assert bot.position is None
+
+    def test_close_trade_when_flat_returns_400(self):
+        from fastapi.testclient import TestClient
+        from web_server import app, runner
+
+        client = TestClient(app)
+        bot = runner.get_or_create_bot()
+        bot.position = None
+
+        res = client.post("/api/bot/trade/close")
+        assert res.status_code == 400
+        assert "No active position open to close" in res.json()["detail"]
+
+
 
 
 
