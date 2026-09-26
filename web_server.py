@@ -2595,7 +2595,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div id="user-badge" class="hidden items-center gap-2 bg-slate-900 border border-bordercol px-2.5 py-1 rounded-lg">
             <i class="fa-solid fa-user-circle text-emerald-400"></i>
             <span id="user-name-display" class="font-semibold text-slate-200"></span>
-            <button onclick="confirmDeleteAccount()" class="text-slate-500 hover:text-rose-400 text-xs ml-1" title="Delete My Account"><i class="fa-solid fa-trash-can"></i></button>
             <button onclick="logout()" class="text-slate-400 hover:text-rose-400 ml-1" title="Logout"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
           </div>
         </div>
@@ -2639,7 +2638,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </div>
               <div class="min-w-0">
                 <div class="font-bold text-white text-xs truncate" id="user-name-display-mobile">Account</div>
-                <div class="text-[10px] text-emerald-400">View Profile & Delete Account</div>
+                <div class="text-[10px] text-emerald-400">View Profile & Settings</div>
               </div>
             </div>
             <i class="fa-solid fa-chevron-right text-emerald-400 text-xs"></i>
