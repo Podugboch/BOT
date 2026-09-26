@@ -12,6 +12,7 @@ Two behaviours matter more than the rest here:
   of silently vetoing every later signal forever.
 """
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -95,6 +96,8 @@ class RiskManager:
     # -- sizing ------------------------------------------------------------
     def position_size(self, entry_price: float, stop_price: float) -> float:
         """Risk a fixed % of equity per trade, sized by stop distance (not a fixed $ bet)."""
+        if not math.isfinite(self.state.equity) or not math.isfinite(entry_price) or not math.isfinite(stop_price):
+            return 0.0
         if self.state.equity <= 0 or entry_price <= 0:
             return 0.0
         risk_amount = self.state.equity * self.cfg.risk_per_trade_pct
@@ -137,11 +140,11 @@ class RiskManager:
         stop_distance = float(getattr(self.cfg, "stop_loss_atr_mult", 1.5) or 0.0) * atr_value
         reward_distance = self._reward_atr_mult() * atr_value
         if str(side).upper() == "BUY":
-            stop = entry_price - stop_distance
+            stop = max(0.0, entry_price - stop_distance)
             target = entry_price + reward_distance
         else:
             stop = entry_price + stop_distance
-            target = entry_price - reward_distance
+            target = max(0.00000001, entry_price - reward_distance)
         return stop, target
 
     # -- trailing stop -----------------------------------------------------
@@ -317,8 +320,8 @@ class RiskManager:
         s, c = self.state, self.cfg
         now = _as_utc(now)
 
-        if s.equity <= 0:
-            return False, "Circuit breaker: equity fully depleted (<= 0)"
+        if not math.isfinite(s.equity) or s.equity <= 0:
+            return False, "Circuit breaker: equity fully depleted (<= 0 or invalid)"
 
         drawdown = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0
         if drawdown >= c.max_drawdown_pct:

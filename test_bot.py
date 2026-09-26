@@ -4212,6 +4212,115 @@ class TestFiveSurfacesUnifiedSynchronization:
         assert "realized_pnl" in latest_closed or "pnl" in latest_closed
 
 
+class TestCriticalRemediationAndHardening:
+    """Verifies all critical trading safety, runtime stability, and concurrency fixes."""
+
+    def test_turso_dict_rows_handling(self, monkeypatch):
+        """Verifies remote_get_app_setting correctly extracts values from Turso dictionary rows."""
+        import storage_adapter
+        monkeypatch.setattr(storage_adapter, "is_remote_storage_available", lambda: True)
+        monkeypatch.setattr(storage_adapter, "_driver", lambda: "turso")
+        monkeypatch.setattr(storage_adapter, "_turso_init", lambda: True)
+        monkeypatch.setattr(
+            storage_adapter,
+            "_turso_execute",
+            lambda sql, args=(): (True, [{"value": '{"trading_mode": "live", "equity": 5000.0}'}])
+        )
+
+        val = storage_adapter.remote_get_app_setting("portfolio_state")
+        assert isinstance(val, dict)
+        assert val["trading_mode"] == "live"
+        assert val["equity"] == 5000.0
+
+    def test_sync_live_balance_with_base_asset(self):
+        """Verifies live equity includes base asset value, preventing false drawdown kill-switch."""
+        cfg = BotConfig(mode="live")
+        cfg.exchange.api_key = "test_key"
+        cfg.exchange.api_secret = "test_secret"
+
+        with mock.patch.object(ccxt.Exchange, "load_time_difference"):
+            bot = TradingBot(cfg)
+            bot.risk.state.equity = 1000.0
+            bot.exchange.current_price = mock.MagicMock(return_value=50000.0)
+
+            # Wallet has only $100 cash because $900 was used to buy 0.018 BTC
+            with mock.patch.object(bot.exchange, "fetch_wallet_balance", return_value={
+                "mode": "live",
+                "is_live": True,
+                "free_quote": 100.0,
+                "total_quote": 100.0,
+                "free_base": 0.018,
+                "total_base": 0.018,
+                "quote_currency": "USDT",
+                "base_currency": "BTC",
+            }):
+                wallet = bot.sync_live_balance()
+                assert wallet["is_live"] is True
+                # Total equity must be 100 + (0.018 * 50000) = 100 + 900 = 1000.0
+                assert bot.risk.state.equity == pytest.approx(1000.0)
+
+    def test_subdollar_price_to_precision(self):
+        """Verifies low-priced coins are not rounded down to $0.00."""
+        cfg = ExchangeConfig(exchange_id="binance", symbol="DOGE/USDT")
+        client = ExchangeClient(cfg=cfg, mode="paper", fee_pct=0.001, slippage_pct=0.0005, starting_equity=1000.0)
+
+        # Sub-dollar precision fallbacks
+        assert client.price_to_precision(0.145678) == 0.1457
+        assert client.price_to_precision(0.002345) == 0.002345
+        assert client.price_to_precision(0.00001567) == 0.00001567
+        # Standard >= $1.00 pricing
+        assert client.price_to_precision(50000.1234) == 50000.12
+
+    def test_risk_manager_nan_and_negative_protection(self):
+        """Verifies RiskManager handles NaN and clamps target/stop prices."""
+        cfg = RiskConfig()
+        rm = RiskManager(cfg, 1000.0)
+
+        # 1. NaN equity halts trading
+        rm.state.equity = float("nan")
+        can_trade, reason = rm.can_trade()
+        assert can_trade is False
+        assert "Circuit breaker" in reason
+        assert rm.position_size(50000.0, 49000.0) == 0.0
+
+        # 2. Stop and target clamping for wide ATR sell orders
+        rm.state.equity = 1000.0
+        # Entry $10, ATR $10, 2R target would be $10 - 20 = -$10 without clamp
+        stop, target = rm.stop_and_target(10.0, 10.0, "SELL")
+        assert target > 0
+        assert target == pytest.approx(0.00000001)
+
+    def test_bot_thread_synchronization(self):
+        """Verifies TradingBot has thread synchronization lock and decorators."""
+        cfg = BotConfig(mode="paper")
+        bot = TradingBot(cfg)
+        assert hasattr(bot, "_lock")
+        import threading
+        assert isinstance(bot._lock, type(threading.RLock()))
+
+    def test_reversal_exit_allowed_after_pullback_from_peak(self):
+        """Verifies that when price pulls back below trailing arm, reversal exit is not blocked."""
+        cfg = BotConfig(mode="paper")
+        bot = TradingBot(cfg)
+
+        # Position entered at 50,000, previously peaked at 52,000 (past trailing arm of 1.0 ATR = 500)
+        # Price has now pulled back to 50,100 (below 50,000 + 500)
+        bot.position = {
+            "side": "BUY",
+            "entry": 50000.0,
+            "peak": 52000.0,
+            "stop": 49000.0,
+            "target": 55000.0,
+            "size": 0.01,
+            "fee_paid": 0.5,
+        }
+
+        # Current price 50,100 with ATR 500 -> (50100 - 50000) = 100 < 500 -> is_running must be False!
+        running = bot.risk.is_running(bot.position, 50100.0, 500.0, "BUY")
+        assert running is False
+
+
+
 
 
 

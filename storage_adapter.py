@@ -124,14 +124,24 @@ def _turso_execute(sql: str, args: Sequence[Any] = ()) -> Tuple[bool, List[Dict[
         return False, []
 
 
+_TURSO_INITIALIZED = False
+
+
 def _turso_init() -> bool:
-    return all(_turso_execute(sql)[0] for sql in (
+    global _TURSO_INITIALIZED
+    if _TURSO_INITIALIZED:
+        return True
+    success = all(_turso_execute(sql)[0] for sql in (
         "CREATE TABLE IF NOT EXISTS remote_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, email TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, is_active INTEGER NOT NULL, created_at TEXT NOT NULL)",
         "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_username ON remote_users(username)",
         "CREATE UNIQUE INDEX IF NOT EXISTS remote_users_email ON remote_users(email)",
         "CREATE TABLE IF NOT EXISTS remote_exchange_keys (user_id INTEGER NOT NULL, exchange_id TEXT NOT NULL, api_key TEXT NOT NULL, api_secret TEXT NOT NULL, api_passphrase TEXT NOT NULL, testnet INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(user_id, exchange_id))",
         "CREATE TABLE IF NOT EXISTS remote_latest_exchange_key (id INTEGER PRIMARY KEY CHECK (id = 1), user_id INTEGER NOT NULL, exchange_id TEXT NOT NULL, api_key TEXT NOT NULL, api_secret TEXT NOT NULL, api_passphrase TEXT NOT NULL, testnet INTEGER NOT NULL, created_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS remote_app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
     ))
+    if success:
+        _TURSO_INITIALIZED = True
+    return success
 
 
 # ------------------------------ Blob --------------------------------------
@@ -427,10 +437,13 @@ def remote_get_app_setting(key: str) -> Optional[Any]:
             return None
         ok, rows = _turso_execute("SELECT value FROM remote_app_settings WHERE key=?", (k,))
         if ok and rows:
-            try:
-                return json.loads(rows[0][0])
-            except Exception:
-                return rows[0][0]
+            row0 = rows[0]
+            val = row0.get("value") if isinstance(row0, dict) else (row0[0] if isinstance(row0, (list, tuple)) else row0)
+            if val is not None:
+                try:
+                    return json.loads(val) if isinstance(val, str) else val
+                except Exception:
+                    return val
         return None
     return _blob_json(f"app_settings/{k}.json")
 
