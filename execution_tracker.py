@@ -8,6 +8,7 @@ Operates completely independently from backtesting to catch live/paper execution
 import os
 import sqlite3
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
@@ -78,10 +79,23 @@ class ExecutionTracker:
             except Exception:
                 pass
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_conn(self):
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+        except Exception:
+            pass
+        try:
+            with conn:
+                yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _init_db(self):
         try:
@@ -131,6 +145,8 @@ class ExecutionTracker:
                         mode TEXT NOT NULL
                     )
                 """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
                 conn.commit()
         except Exception as e:
             log.warning("Could not initialize execution database at %s: %s", self.db_path, e)
@@ -189,6 +205,8 @@ class ExecutionTracker:
             "rejection_reason": rejection_reason,
         }
         self._cached_orders.insert(0, ord_dict)
+        if len(self._cached_orders) > 1000:
+            self._cached_orders = self._cached_orders[:1000]
         self._sync_to_storage()
         return last_id
 
@@ -427,6 +445,8 @@ class ExecutionTracker:
                     "exit_reason": exit_reason,
                 }
                 self._cached_closed_positions.insert(0, closed_dict)
+                if len(self._cached_closed_positions) > 1000:
+                    self._cached_closed_positions = self._cached_closed_positions[:1000]
                 self._cached_open_position = None
                 self._sync_to_storage()
         except Exception as e:

@@ -140,9 +140,10 @@ class BotRunner:
         self.last_step_time: Optional[str] = None
         self.last_error: Optional[str] = None
         self.cfg: BotConfig = BotConfig()
+        self._stop_event: threading.Event = threading.Event()
 
     def start(self):
-        if self.running:
+        if self.running and self.thread and self.thread.is_alive():
             return False
         if os.path.exists(self.cfg.kill_switch_file):
             try:
@@ -154,6 +155,14 @@ class BotRunner:
             self.bot = TradingBot(self.cfg)
         else:
             self.bot.cfg = self.cfg
+
+        # Signal any prior thread to stop
+        self._stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+        self._stop_event = threading.Event()
+        stop_evt = self._stop_event
         self.running = True
         self.last_error = None
 
@@ -166,10 +175,10 @@ class BotRunner:
             self.cfg.exchange.timeframe,
         )
 
-        def _run_loop():
+        def _run_loop(evt: threading.Event):
             logger.info("Bot execution loop active. Polling interval: %ds.", self.cfg.poll_interval_sec)
             try:
-                while self.running:
+                while not evt.is_set():
                     step_ok = False
                     try:
                         step_ok = self.bot.step()
@@ -187,10 +196,8 @@ class BotRunner:
                         else:
                             logger.warning("Bot step returned False without active kill switch — retrying on next cycle.")
 
-                    for _ in range(self.cfg.poll_interval_sec):
-                        if not self.running or (self.bot and self.bot.kill_switch_active()):
-                            break
-                        time.sleep(1)
+                    if evt.wait(timeout=self.cfg.poll_interval_sec):
+                        break
                     if self.bot and self.bot.kill_switch_active():
                         logger.warning("Kill switch active — halting bot runner loop.")
                         self.running = False
@@ -200,13 +207,14 @@ class BotRunner:
                 self.last_error = str(e)
                 self.running = False
 
-        self.thread = threading.Thread(target=_run_loop, daemon=True)
+        self.thread = threading.Thread(target=_run_loop, args=(stop_evt,), daemon=True)
         self.thread.start()
         return True
 
     def stop(self):
         was_running = self.running
         self.running = False
+        self._stop_event.set()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
         if was_running:
@@ -553,7 +561,7 @@ def resend_activation_endpoint(req: ResendActivationRequest, request: Request):
 
 @app.post("/api/login")
 @app.post("/api/auth/login")
-async def login(payload: LoginRequest, response: Response):
+def login(payload: LoginRequest, response: Response):
     try:
         username = (payload.username or payload.username_or_email or "").strip()
         result = auth_service.login(username, payload.password, payload.client_token)
@@ -5685,15 +5693,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const isReal = (effectiveTradingMode === 'real');
-        const serverIsReal = (data.mode === 'live' && !data.testnet);
-        if (serverIsReal !== isReal) {
-          // Keep backend synchronized with the user's explicit selection
-          fetch('/api/bot/mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ trading_mode: effectiveTradingMode })
-          }).catch(() => {});
-        }
         updateTradingModeUI(isReal, isReal ? 'live' : 'paper', !isReal);
         document.getElementById('val-symbol-tag').innerText = `${data.symbol} ${data.timeframe}`;
 
@@ -5702,13 +5701,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let effectiveExecMode = data.execution_mode;
         if (savedExecMode) {
           effectiveExecMode = savedExecMode;
-          if (data.execution_mode && data.execution_mode !== savedExecMode) {
-            fetch('/api/bot/execution_mode', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ execution_mode: savedExecMode })
-            }).catch(() => {});
-          }
         } else if (data.execution_mode) {
           localStorage.setItem('bot_execution_mode', data.execution_mode);
           effectiveExecMode = data.execution_mode;

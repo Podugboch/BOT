@@ -171,8 +171,8 @@ def fetch_page(exchange, symbol: str, timeframe: str, since_ms: int, limit: int)
         try:
             batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
             return list(batch) if batch else []
-        except ccxt.NetworkError as err:
-            # NetworkError covers RequestTimeout, DDoSProtection, RateLimitExceeded
+        except (ccxt.NetworkError, ccxt.RateLimitExceeded) as err:
+            # NetworkError and RateLimitExceeded covers RequestTimeout, DDoSProtection, RateLimitExceeded
             # and ExchangeNotAvailable — all of which are worth retrying.
             if attempt > MAX_CHUNK_RETRIES:
                 raise
@@ -372,6 +372,13 @@ class ExchangeClient:
             except Exception as e:
                 log.warning(f"Could not load time difference for {cfg.exchange_id}: {e}")
 
+        # Pre-load markets for precision and order lot formatting
+        if self.mode == "live" and cfg.api_key:
+            try:
+                self.exchange.load_markets()
+            except Exception as e:
+                log.debug("Could not pre-load markets during exchange init for %s: %s", cfg.exchange_id, e)
+
         # paper trading book-keeping
         self.paper_cash = starting_equity
         self.paper_position = 0.0
@@ -444,6 +451,8 @@ class ExchangeClient:
                 return float(formatted)
         except Exception as e:
             log.debug("amount_to_precision fallback for %s: %s", sym, e)
+        if 0 < size < 0.000001:
+            return float(round(size, 8))
         return float(round(size, 6))
 
     def price_to_precision(self, price: float, symbol: str = None) -> float:
@@ -457,6 +466,13 @@ class ExchangeClient:
                 return float(formatted)
         except Exception as e:
             log.debug("price_to_precision fallback for %s: %s", sym, e)
+        if 0 < price < 1.0:
+            if price < 0.0001:
+                return float(round(price, 8))
+            elif price < 0.01:
+                return float(round(price, 6))
+            else:
+                return float(round(price, 4))
         return float(round(price, 2))
 
     def fetch_wallet_balance(self, symbol: str = None) -> dict:

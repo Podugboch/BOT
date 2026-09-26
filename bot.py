@@ -9,14 +9,28 @@ Run:
 Stop immediately at any time:
     touch KILL
 """
+import functools
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 import pandas as pd
+
+
+def synchronized(method):
+    """Decorator to ensure thread-safe execution of TradingBot operations."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                return method(self, *args, **kwargs)
+        return method(self, *args, **kwargs)
+    return wrapper
 
 from config import BotConfig, timeframe_minutes
 from exchange_client import ExchangeClient
@@ -88,6 +102,7 @@ class TradingBot:
         self.last_exit_ts = None
         self.tracker = get_execution_tracker() if get_execution_tracker else None
         self.alerts = get_alert_dispatcher() if get_alert_dispatcher else None
+        self._lock = threading.RLock()
         self._cached_portfolio_state = None
         self._sync_portfolio()
 
@@ -346,7 +361,16 @@ class TradingBot:
         try:
             wallet = self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
             if self.cfg.mode == "live" and wallet.get("is_live"):
-                total_val = float(wallet.get("total_quote", 0.0) or 0.0)
+                total_quote = float(wallet.get("total_quote", 0.0) or 0.0)
+                total_base = float(wallet.get("total_base", 0.0) or 0.0)
+                base_val = 0.0
+                if total_base > 0:
+                    try:
+                        curr_price = float(self.exchange.current_price() or 0.0)
+                        base_val = total_base * curr_price
+                    except Exception as pe:
+                        log.debug("Could not fetch current price for live base valuation: %s", pe)
+                total_val = total_quote + base_val
                 if total_val > 0:
                     old_equity = self.risk.state.equity
                     self.risk.state.equity = total_val
@@ -356,8 +380,12 @@ class TradingBot:
             return wallet
         except Exception as e:
             log.warning("Could not sync live wallet balance: %s", e)
-            return self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            try:
+                return self.exchange.fetch_wallet_balance(self.cfg.exchange.symbol)
+            except Exception:
+                return {}
 
+    @synchronized
     def step(self) -> bool:
         """One decision cycle. Returns False only if an active kill switch is triggered."""
         if self.kill_switch_active():
@@ -457,6 +485,7 @@ class TradingBot:
 
         return True
 
+    @synchronized
     def manual_buy(self, custom_size: float = 0.0) -> dict:
         """Place a manual BUY order (open Long, or cover an open Short)."""
         if self.kill_switch_active():
@@ -652,6 +681,7 @@ class TradingBot:
             "mode": fill.get("mode", self.cfg.mode),
         }
 
+    @synchronized
     def manual_sell(self, custom_size: float = 0.0) -> dict:
         """Place a manual SELL order (close Long, or open Short)."""
         if self.kill_switch_active():
@@ -1002,7 +1032,7 @@ class TradingBot:
                          self.position["stop"], self.position.get("trough", price), self.position["entry"])
             hit_stop = price >= self.position["stop"]
             hit_target = price <= self.position["target"]
-            running = self.risk.is_running(self.position, self.position.get("trough", price), atr_val, "SELL")
+            running = self.risk.is_running(self.position, price, atr_val, "SELL")
             sig = generate_signal(df, self.cfg.strategy, position_open=True)
             signal_exit = sig == Signal.BUY and not running
         else:
@@ -1011,7 +1041,7 @@ class TradingBot:
                          self.position["stop"], self.position.get("peak", price), self.position["entry"])
             hit_stop = price <= self.position["stop"]
             hit_target = price >= self.position["target"]
-            running = self.risk.is_running(self.position, self.position.get("peak", price), atr_val, "BUY")
+            running = self.risk.is_running(self.position, price, atr_val, "BUY")
             sig = generate_signal(df, self.cfg.strategy, position_open=True)
             signal_exit = sig == Signal.SELL and not running
 
