@@ -2998,14 +2998,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div>
               <div class="text-xs font-bold text-white flex items-center gap-2">
-                Active Environment: <span id="env-mode-title" class="text-blue-400 font-bold">TESTNET / SIMULATION</span>
+                Active Environment: <span id="env-mode-title" class="text-blue-400 font-bold">TEST MODE</span>
               </div>
               <p id="env-mode-desc" class="text-[11px] text-slate-400">Safe simulated execution. Zero real funds at risk.</p>
             </div>
           </div>
           <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 w-full sm:w-auto">
-            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5" title="Switch to Testnet / Paper Trading">
-              <i class="fa-solid fa-flask"></i> Testnet Mode
+            <button type="button" onclick="switchTradingMode('testnet')" id="env-btn-testnet" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5" title="Switch to Test Mode / Paper Trading">
+              <i class="fa-solid fa-flask"></i> Test Mode
             </button>
             <button type="button" onclick="switchTradingMode('real')" id="env-btn-real" class="flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5" title="Switch to Real Trading (LIVE)">
               <i class="fa-solid fa-bolt text-rose-400"></i> Real Trading (LIVE)
@@ -5129,13 +5129,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (cashLabel) cashLabel.innerText = 'Exchange Balance';
       } else {
         if (badgeMode) {
-          badgeMode.innerText = 'TESTNET';
+          badgeMode.innerText = 'TEST MODE';
           badgeMode.className = 'text-[10px] px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30';
         }
         if (envBtnTestnet) envBtnTestnet.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
         if (envBtnReal) envBtnReal.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
         if (envTitle) {
-          envTitle.innerText = 'TESTNET / SIMULATION';
+          envTitle.innerText = 'TEST MODE';
           envTitle.className = 'text-blue-400 font-bold';
         }
         if (envDesc) envDesc.innerText = 'Safe simulated execution. Zero real funds at risk.';
