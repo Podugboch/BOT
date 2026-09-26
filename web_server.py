@@ -2461,7 +2461,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       animation: slideDown 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
     @media (min-width: 768px) {
-      #section-kpi,
+      #section-kpi {
+        display: grid !important;
+        grid-template-columns: repeat(6, minmax(0, 1fr)) !important;
+        gap: 0.75rem !important;
+      }
       #panel-market-analysis,
       #section-api-keys,
       #section-backtester,
@@ -2484,7 +2488,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       #section-account {
         display: none;
       }
-      body.mobile-view-dashboard #section-kpi,
       body.mobile-view-dashboard #dashboard-detail-grid,
       body.mobile-view-dashboard #panel-market-analysis,
       body.mobile-view-backtester #dashboard-detail-grid,
@@ -2494,6 +2497,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       body.mobile-view-activity #section-bot-activity,
       body.mobile-view-account #section-account {
         display: block;
+      }
+      body.mobile-view-dashboard #section-kpi {
+        display: grid !important;
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 0.625rem !important;
       }
       body.mobile-view-dashboard #dashboard-detail-grid,
       body.mobile-view-backtester #dashboard-detail-grid {
@@ -2506,6 +2514,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       body:not(.mobile-view-dashboard):not(.mobile-view-backtester) #dashboard-detail-grid {
         display: none !important;
+      }
+    }
+    @media (min-width: 480px) and (max-width: 767px) {
+      body.mobile-view-dashboard #section-kpi {
+        grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
       }
     }
   </style>
@@ -2740,38 +2753,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <!-- KPI Cards Grid (Dashboard Landing Page) -->
     <div id="section-kpi" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Portfolio Equity</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate">Portfolio Equity</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-white truncate" id="val-equity">$1,000.00</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Peak: <span id="val-peak">$1,000.00</span></div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium" id="val-cash-label">Paper Cash</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate" id="val-cash-label">Paper Cash</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-emerald-400 truncate" id="val-cash">$1,000.00</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Position: <span id="val-pos">0.000000</span></div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Max Drawdown</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate">Max Drawdown</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-drawdown">0.0%</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Limit: 15.0% Kill</div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Daily Loss</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate">Daily Loss</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-daily-loss">0.0%</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Limit: 3.0% Circuit</div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Loss Streak</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate">Loss Streak</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-slate-200 truncate" id="val-streak">0 / 8</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate">Cooloff at <span id="val-streak-limit">8</span></div>
       </div>
 
-      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3">
-        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium">Live Signal</div>
+      <div class="bg-cardbg border border-bordercol rounded-xl p-2.5 sm:p-3 min-w-0">
+        <div class="text-slate-400 text-[10px] sm:text-[11px] font-medium truncate">Live Signal</div>
         <div class="text-base sm:text-lg font-bold mt-0.5 text-yellow-400 truncate" id="val-signal">HOLD</div>
         <div class="text-[9px] sm:text-[10px] text-slate-400 mt-0.5 truncate" id="val-symbol-tag">BTC/USDT 15m</div>
       </div>
