@@ -3823,5 +3823,16 @@ class TestTraderQueenLogoAndBranding:
         assert '<link rel="icon" type="image/png" href="/logo.png">' in DASHBOARD_HTML
         assert 'Trader Queen' in DASHBOARD_HTML
 
+    def test_delete_button_removed_from_header_user_badge(self):
+        from web_server import DASHBOARD_HTML
+        import re
+        match = re.search(r'<div id="user-badge"[^>]*>(.*?)</div>', DASHBOARD_HTML, re.DOTALL)
+        assert match, "user-badge not found in DASHBOARD_HTML"
+        badge_content = match.group(1)
+        assert 'fa-trash-can' not in badge_content
+        assert 'confirmDeleteAccount' not in badge_content
+        assert 'logout()' in badge_content
+
+
 
 
