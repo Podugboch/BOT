@@ -2932,16 +2932,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span class="text-xs text-slate-300 ml-1.5 break-all" id="pos-details"></span>
         </div>
       </div>
-      <div class="flex items-center gap-2 shrink-0">
-        <button type="button" id="btn-banner-close-trade" onclick="closeActivePosition()" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center gap-1.5" title="Close this position immediately at market price">
-          <i class="fa-solid fa-circle-xmark"></i>
-          <span id="btn-banner-close-text">Close Position</span>
-        </button>
-        <button type="button" id="btn-banner-manual-trade" onclick="scrollToManualTrading()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 border border-bordercol font-semibold text-xs rounded-lg transition flex items-center gap-1.5" title="Open or manage manual trades">
-          <i class="fa-solid fa-sliders"></i>
-          <span>Manual Orders</span>
-        </button>
-      </div>
+      <button type="button" id="btn-banner-close-trade" onclick="closeActivePosition()" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-bold text-xs rounded-lg shadow transition flex items-center gap-1.5 shrink-0" title="Close this position immediately at market price">
+        <i class="fa-solid fa-circle-xmark"></i>
+        <span id="btn-banner-close-text">Close Position</span>
+      </button>
     </div>
 
     <!-- ========================================================================= -->
@@ -5567,17 +5561,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           btn.disabled = false;
           btn.innerHTML = oldHtml;
         }
-      }
-    }
-
-    function scrollToManualTrading() {
-      quickSetExecutionMode('manual');
-      const panel = document.getElementById('manual-control-panel');
-      if (panel) {
-        panel.classList.remove('hidden');
-        panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        panel.classList.add('ring-2', 'ring-amber-400');
-        setTimeout(() => panel.classList.remove('ring-2', 'ring-amber-400'), 2500);
       }
     }
 

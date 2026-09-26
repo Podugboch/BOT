@@ -4013,9 +4013,8 @@ class TestPositionBannerAndCloseTrade:
     def test_dashboard_contains_banner_buttons_and_functions(self):
         from web_server import DASHBOARD_HTML
         assert 'id="btn-banner-close-trade"' in DASHBOARD_HTML
-        assert 'id="btn-banner-manual-trade"' in DASHBOARD_HTML
+        assert 'id="btn-banner-manual-trade"' not in DASHBOARD_HTML
         assert 'closeActivePosition()' in DASHBOARD_HTML
-        assert 'scrollToManualTrading()' in DASHBOARD_HTML
         assert 'renderActivePositionBanner' in DASHBOARD_HTML
         assert 'IN MARKET' not in DASHBOARD_HTML
 
