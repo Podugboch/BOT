@@ -67,6 +67,16 @@ if latest_key:
     if not os.getenv("TESTNET") and "testnet" in latest_key:
         os.environ["TESTNET"] = "true" if latest_key["testnet"] else "false"
 
+# Check if an explicit trading_mode preference exists in remote settings
+try:
+    from storage_adapter import remote_get_app_setting
+    saved_init_tm = remote_get_app_setting("trading_mode")
+    if saved_init_tm in ("real", "testnet"):
+        os.environ["MODE"] = "live" if saved_init_tm == "real" else "paper"
+        os.environ["TESTNET"] = "false" if saved_init_tm == "real" else "true"
+except Exception:
+    pass
+
 # Ensure sensitive exchange credentials are never present in os.environ at runtime
 if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
     for k in {"EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "EXCHANGE_API_PASSPHRASE"}:
@@ -1091,6 +1101,24 @@ def get_status(response: Response = None):
                 pass
     exec_mode = exec_mode or getattr(cfg, "execution_mode", "auto") or "auto"
 
+    try:
+        from storage_adapter import remote_get_app_setting
+        saved_tm = remote_get_app_setting("trading_mode")
+        if saved_tm in ("real", "testnet"):
+            is_real = (saved_tm == "real")
+            cfg.mode = "live" if is_real else "paper"
+            cfg.exchange.testnet = not is_real
+            os.environ["MODE"] = cfg.mode
+            os.environ["TESTNET"] = "false" if is_real else "true"
+            if runner.bot:
+                runner.bot.cfg.mode = cfg.mode
+                runner.bot.cfg.exchange.testnet = cfg.exchange.testnet
+                if hasattr(runner.bot, "exchange") and runner.bot.exchange:
+                    runner.bot.exchange.mode = cfg.mode
+                    runner.bot.exchange.cfg.testnet = cfg.exchange.testnet
+    except Exception:
+        pass
+
     return {
         "running": runner.running,
         "mode": cfg.mode,
@@ -1449,6 +1477,14 @@ def set_trading_mode_endpoint(req: TradingModeRequest):
     # Update environment variables
     os.environ["MODE"] = new_mode
     os.environ["TESTNET"] = "false" if is_real else "true"
+
+    try:
+        from storage_adapter import remote_save_app_setting
+        remote_save_app_setting("trading_mode", "real" if is_real else "testnet")
+        remote_save_app_setting("mode", new_mode)
+        remote_save_app_setting("testnet", new_testnet)
+    except Exception as e:
+        logger.warning("Failed persisting trading mode remotely: %s", e)
 
     # Persist to .env file if it exists
     try:
@@ -5040,6 +5076,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (!confirmed) return;
       }
 
+      // Explicit user action: persist locally immediately so UI stays stable without flickering
+      try {
+        localStorage.setItem('bot_trading_mode', targetMode);
+      } catch (e) {}
+      updateTradingModeUI(isReal, isReal ? 'live' : 'paper', !isReal);
+
       try {
         const res = await fetch('/api/bot/mode', {
           method: 'POST',
@@ -5073,8 +5115,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           badgeMode.innerText = 'REAL TRADING (LIVE)';
           badgeMode.className = 'text-[10px] px-2 py-0.5 rounded-full font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse';
         }
-        if (envBtnReal) envBtnReal.className = 'px-3 py-1.5 bg-rose-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
-        if (envBtnTestnet) envBtnTestnet.className = 'px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
+        if (envBtnReal) envBtnReal.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-rose-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
+        if (envBtnTestnet) envBtnTestnet.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
         if (envTitle) {
           envTitle.innerText = 'REAL TRADING (LIVE)';
           envTitle.className = 'text-rose-400 font-bold';
@@ -5090,8 +5132,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           badgeMode.innerText = 'TESTNET';
           badgeMode.className = 'text-[10px] px-2 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30';
         }
-        if (envBtnTestnet) envBtnTestnet.className = 'px-3 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
-        if (envBtnReal) envBtnReal.className = 'px-3 py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
+        if (envBtnTestnet) envBtnTestnet.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-blue-600 text-white text-xs font-bold rounded-lg shadow transition flex items-center gap-1.5';
+        if (envBtnReal) envBtnReal.className = 'flex-1 sm:flex-none justify-center px-3 py-2 sm:py-1.5 bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold rounded-lg transition flex items-center gap-1.5';
         if (envTitle) {
           envTitle.innerText = 'TESTNET / SIMULATION';
           envTitle.className = 'text-blue-400 font-bold';
@@ -5387,9 +5429,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const res = await fetch('/api/status?_ts=' + Date.now(), { cache: 'no-store' });
         const data = await res.json();
         botRunning = data.running;
+        // Update Trading Environment UI on Dashboard (Client-authoritative via localStorage)
+        const savedTradingMode = localStorage.getItem('bot_trading_mode');
+        let effectiveTradingMode = savedTradingMode;
+        if (!effectiveTradingMode) {
+          effectiveTradingMode = (data.mode === 'live' && !data.testnet) ? 'real' : 'testnet';
+          try { localStorage.setItem('bot_trading_mode', effectiveTradingMode); } catch (e) {}
+        }
 
-        const isReal = (data.mode === 'live' && !data.testnet);
-        updateTradingModeUI(isReal, data.mode, data.testnet);
+        const isReal = (effectiveTradingMode === 'real');
+        const serverIsReal = (data.mode === 'live' && !data.testnet);
+        if (serverIsReal !== isReal) {
+          // Keep backend synchronized with the user's explicit selection
+          fetch('/api/bot/mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ trading_mode: effectiveTradingMode })
+          }).catch(() => {});
+        }
+        updateTradingModeUI(isReal, isReal ? 'live' : 'paper', !isReal);
         document.getElementById('val-symbol-tag').innerText = `${data.symbol} ${data.timeframe}`;
 
         // Update Execution Mode & Strategy UI on Dashboard (Client-authoritative via localStorage)
@@ -5569,7 +5627,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('val-peak').innerText = '$' + data.peak_equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
 
         const cashLbl = document.getElementById('val-cash-label');
-        if (data.mode === 'live' && data.wallet_balance && data.wallet_balance.is_live) {
+        if (isReal && data.wallet_balance && data.wallet_balance.is_live) {
           if (cashLbl) cashLbl.innerText = `Live ${data.wallet_balance.quote_currency || 'Quote'}`;
           document.getElementById('val-cash').innerText = '$' + (data.wallet_balance.free_quote ?? data.paper_cash).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
           document.getElementById('val-pos').innerText = (data.wallet_balance.free_base ?? data.paper_position).toFixed(6);
@@ -5619,6 +5677,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     async function toggleBot() {
+      if (!botRunning) {
+        const savedTradingMode = localStorage.getItem('bot_trading_mode');
+        if (savedTradingMode) {
+          try {
+            await fetch('/api/bot/mode', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ trading_mode: savedTradingMode })
+            });
+          } catch (e) {}
+        }
+      }
       const endpoint = botRunning ? '/api/bot/stop' : '/api/bot/start';
       try {
         const res = await fetch(endpoint, { method: 'POST' });
@@ -7075,6 +7145,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     // Startup
+    const initialSavedTradingMode = localStorage.getItem('bot_trading_mode');
+    if (initialSavedTradingMode) {
+      const isReal = (initialSavedTradingMode === 'real');
+      updateTradingModeUI(isReal, isReal ? 'live' : 'paper', !isReal);
+    }
     const initialSavedMode = localStorage.getItem('bot_execution_mode');
     if (initialSavedMode) {
       updateExecutionModeUI(initialSavedMode === 'manual');
