@@ -17,6 +17,7 @@ import threading
 import zipfile
 import html
 import re
+import collections
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -58,6 +59,20 @@ AVAILABLE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
 setup_logging()
 logger = logging.getLogger("web")
 init_auth_db()
+
+_memory_log_buffer: collections.deque = collections.deque(maxlen=1000)
+
+class BufferLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            _memory_log_buffer.append(msg)
+        except Exception:
+            pass
+
+_buf_handler = BufferLogHandler()
+_buf_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logging.getLogger().addHandler(_buf_handler)
 
 # Preload non-sensitive exchange metadata into environment if present in vault
 latest_key = AuthService.get_latest_raw_exchange_key()
@@ -1087,9 +1102,11 @@ def _safe_remote_pos(bot=None) -> Optional[dict]:
 def get_status(response: Response = None):
     _no_store(response)
     cfg = runner.cfg
-    bot = runner.bot
-    risk_state = bot.risk.state if bot else None
-    exchange = bot.exchange if bot else None
+    bot = runner.get_or_create_bot()
+    bot._sync_portfolio()
+    active_pos = bot.get_unified_active_position()
+    risk_state = bot.risk.state
+    exchange = bot.exchange
 
     kill_file_exists = os.path.exists(cfg.kill_switch_file)
     strat_meta = next((s for s in STRATEGIES if s["id"] == cfg.strategy.strategy_name), STRATEGIES[0])
@@ -1161,32 +1178,32 @@ def get_status(response: Response = None):
         "last_step_time": runner.last_step_time,
         "last_error": runner.last_error,
         "kill_file_exists": kill_file_exists,
-        "equity": round(risk_state.equity, 2) if risk_state else cfg.starting_equity,
-        "peak_equity": round(risk_state.peak_equity, 2) if risk_state else cfg.starting_equity,
-        "daily_start_equity": round(risk_state.daily_start_equity, 2) if risk_state else cfg.starting_equity,
-        "drawdown_pct": round(((risk_state.peak_equity - risk_state.equity) / risk_state.peak_equity) * 100, 2) if risk_state and risk_state.peak_equity > 0 else 0.0,
-        "daily_loss_pct": round(((risk_state.daily_start_equity - risk_state.equity) / risk_state.daily_start_equity) * 100, 2) if risk_state and risk_state.daily_start_equity > 0 else 0.0,
-        "consecutive_losses": risk_state.consecutive_losses if risk_state else 0,
+        "equity": round(risk_state.equity, 2),
+        "peak_equity": round(risk_state.peak_equity, 2),
+        "daily_start_equity": round(risk_state.daily_start_equity, 2),
+        "drawdown_pct": round(((risk_state.peak_equity - risk_state.equity) / risk_state.peak_equity) * 100, 2) if risk_state.peak_equity > 0 else 0.0,
+        "daily_loss_pct": round(((risk_state.daily_start_equity - risk_state.equity) / risk_state.daily_start_equity) * 100, 2) if risk_state.daily_start_equity > 0 else 0.0,
+        "consecutive_losses": risk_state.consecutive_losses,
         "max_consecutive_losses": cfg.risk.max_consecutive_losses,
         "loss_streak_cooldown_hours": cfg.risk.loss_streak_cooldown_hours,
         # Published so the dashboard can say *when* trading resumes instead of
         # leaving a tripped circuit breaker looking like a dead bot.
         "cooldown_until": (
             risk_state.cooldown_until.isoformat()
-            if (risk_state and getattr(risk_state, "cooldown_until", None)) else None
+            if getattr(risk_state, "cooldown_until", None) else None
         ),
-        "risk_cooldown_note": bot.risk.cooldown_note(peek=True) if bot else "",
+        "risk_cooldown_note": bot.risk.cooldown_note(peek=True),
         "reward_risk_ratio": round(reward_risk_ratio(cfg.risk), 2),
         "trailing_stop_enabled": bool(getattr(cfg.risk, "trailing_stop_enabled", True)),
         "trailing_stop_atr_mult": cfg.risk.trailing_stop_atr_mult,
-        "trading_halted_today": risk_state.trading_halted_today if risk_state else False,
-        "kill_switch_triggered": risk_state.kill_switch_triggered if risk_state else False,
-        "paper_cash": round(exchange.paper_cash, 2) if exchange else cfg.starting_equity,
-        "paper_position": round(exchange.paper_position, 6) if exchange else 0.0,
+        "trading_halted_today": risk_state.trading_halted_today,
+        "kill_switch_triggered": risk_state.kill_switch_triggered,
+        "paper_cash": round(exchange.paper_cash, 2),
+        "paper_position": round(exchange.paper_position, 6),
         "wallet_balance": wallet_info,
         "order_book_spread": spread_info,
         "max_spread_pct": getattr(cfg.risk, "max_spread_pct", 0.35),
-        "active_position": bot.position if (bot and bot.position) else _safe_remote_pos(bot),
+        "active_position": active_pos,
         "timeframe_warning": (
             f"Negative expectancy (-10% to -15%) in historical backtests on {cfg.exchange.timeframe}. Do not risk live capital on this grain without strategy recalibration."
             if cfg.exchange.timeframe in ["1m", "3m", "5m", "15m"] else None
@@ -1408,11 +1425,15 @@ def execute_manual_trade(req: ManualTradeRequest):
                 msg = f"Manual BUY order closed short position at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
             else:
                 msg = f"Manual BUY order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})"
+            logger.info(msg)
             return {
                 "success": True,
                 "message": msg,
                 "trade": res,
-                "active_position": bot.position,
+                "active_position": bot.get_unified_active_position(),
+                "equity": round(bot.risk.state.equity, 2),
+                "paper_cash": round(bot.exchange.paper_cash, 2),
+                "paper_position": round(bot.exchange.paper_position, 6),
             }
         except Exception as e:
             logger.exception("Manual BUY order failed")
@@ -1425,17 +1446,23 @@ def execute_manual_trade(req: ManualTradeRequest):
                 msg = f"Manual SELL (Short) order executed at ${res['price']:,.2f} (Size: {res['size']:.6f})"
             else:
                 msg = f"Manual SELL order executed at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
+            logger.info(msg)
             return {
                 "success": True,
                 "message": msg,
                 "trade": res,
-                "active_position": bot.position,
+                "active_position": bot.get_unified_active_position(),
+                "equity": round(bot.risk.state.equity, 2),
+                "paper_cash": round(bot.exchange.paper_cash, 2),
+                "paper_position": round(bot.exchange.paper_position, 6),
             }
         except Exception as e:
             logger.exception("Manual SELL order failed")
             raise HTTPException(status_code=400, detail=str(e))
     elif act in ("close", "close_position", "cover", "exit"):
         try:
+            if not bot.position:
+                bot._sync_position()
             if not bot.position:
                 _safe_remote_pos(bot)
             if not bot.position:
@@ -1447,6 +1474,7 @@ def execute_manual_trade(req: ManualTradeRequest):
             else:
                 res = bot.manual_sell()
                 msg = f"Manual order closed LONG position at ${res['price']:,.2f} (PnL: ${res.get('pnl', 0.0):+,.2f})"
+            logger.info(msg)
             try:
                 from storage_adapter import remote_save_app_setting
                 remote_save_app_setting("active_position", None)
@@ -1456,7 +1484,10 @@ def execute_manual_trade(req: ManualTradeRequest):
                 "success": True,
                 "message": msg,
                 "trade": res,
-                "active_position": bot.position,
+                "active_position": bot.get_unified_active_position(),
+                "equity": round(bot.risk.state.equity, 2),
+                "paper_cash": round(bot.exchange.paper_cash, 2),
+                "paper_position": round(bot.exchange.paper_position, 6),
             }
         except HTTPException:
             raise
@@ -2127,20 +2158,26 @@ def get_logs(response: Response = None, lines: int = 50):
     _no_store(response)
     lines = max(1, min(int(lines), 1000))
     log_file = _resolve_log_file()
-    if not log_file.exists() or log_file.stat().st_size == 0:
+    lines_from_file = []
+    if log_file.exists() and log_file.stat().st_size > 0:
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                lines_from_file = [line.strip() for line in f.readlines() if line.strip()]
+        except Exception:
+            lines_from_file = []
+
+    combined = list(lines_from_file)
+    if _memory_log_buffer:
+        file_set = set(lines_from_file[-200:]) if lines_from_file else set()
+        for mem_line in _memory_log_buffer:
+            if mem_line.strip() and mem_line.strip() not in file_set:
+                combined.append(mem_line.strip())
+
+    if not combined:
         if runner.running:
             return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}
         return {"logs": ["No logs recorded yet. Start the bot to generate activity."]}
-    try:
-        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = [line.strip() for line in f.readlines() if line.strip()]
-            if not all_lines:
-                if runner.running:
-                    return {"logs": [f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] [INFO] bot: Engine is running. Waiting for cycle step..."]}
-                return {"logs": ["No logs recorded yet. Start the bot to generate activity."]}
-            return {"logs": all_lines[-lines:]}
-    except Exception as e:
-        return {"logs": [f"Error reading log file: {e}"]}
+    return {"logs": combined[-lines:]}
 
 
 class SizingValidationRequest(BaseModel):
@@ -2172,15 +2209,20 @@ class WalkForwardRequest(BaseModel):
 @app.get("/api/execution/tracker")
 def get_execution_tracker_data(response: Response = None):
     _no_store(response)
+    bot = runner.get_or_create_bot()
     tracker = get_execution_tracker()
+    active_pos = bot.get_unified_active_position()
+    orders = tracker.get_orders(limit=50)
+    closed = tracker.get_closed_positions(limit=50)
+    stats = tracker.get_summary_stats()
     return sanitize_for_json({
         "success": True,
-        "active_position": tracker.get_open_position(),
-        "open_position": tracker.get_open_position(),
-        "orders": tracker.get_orders(limit=50),
-        "recent_orders": tracker.get_orders(limit=50),
-        "closed_trades": tracker.get_closed_positions(limit=50),
-        "stats": tracker.get_summary_stats(),
+        "active_position": active_pos,
+        "open_position": active_pos,
+        "orders": orders,
+        "recent_orders": orders,
+        "closed_trades": closed,
+        "stats": stats,
     })
 
 
@@ -5476,7 +5518,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (!posBanner) return;
 
-      if (!pos || !pos.entry) {
+      if (!pos || !(pos.entry || pos.entry_price)) {
         posBanner.classList.add('hidden');
         if (buyTextEl && sellTextEl) {
           buyTextEl.innerText = 'Manual BUY (Market)';
@@ -5487,13 +5529,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       posBanner.classList.remove('hidden');
       const posSide = (pos.side || 'BUY').toUpperCase();
-      const isShort = (posSide === 'SELL');
+      const isShort = (posSide === 'SELL' || posSide === 'SHORT');
       const sideColor = isShort ? 'text-rose-400' : 'text-emerald-400';
       const sideText = isShort ? 'SHORT' : 'LONG';
-      const entryVal = Number(pos.entry || 0).toFixed(2);
-      const stopVal = Number(pos.stop || 0).toFixed(2);
+      const entryVal = Number(pos.entry || pos.entry_price || 0).toFixed(2);
+      const stopVal = Number(pos.stop || pos.current_stop || pos.trailing_stop || pos.stop_loss || 0).toFixed(2);
       const targetVal = Number(pos.target || 0).toFixed(2);
-      const sizeVal = Number(pos.size || 0).toFixed(6);
+      const sizeVal = Number(pos.size !== undefined ? pos.size : (pos.amount || 0)).toFixed(6);
 
       if (posDot) {
         posDot.className = isShort 
@@ -5549,8 +5591,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           activePosNullStreak = 0;
           try { localStorage.removeItem('bot_active_position'); } catch(e) {}
           renderActivePositionBanner(null);
-          await fetchStatus();
-          await refreshLogs();
+          await Promise.all([fetchStatus(), refreshExecutionTracker(), refreshLogs()]);
         } else {
           alert(`Failed to close ${sideName} position: ` + (data.detail || data.message || 'Unknown error'));
         }
@@ -5615,8 +5656,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             try { localStorage.removeItem('bot_active_position'); } catch(e) {}
             renderActivePositionBanner(null);
           }
-          await fetchStatus();
-          await refreshLogs();
+          await Promise.all([fetchStatus(), refreshExecutionTracker(), refreshLogs()]);
         } else {
           alert(`Manual ${actName} failed: ` + (data.detail || data.message));
         }
@@ -5876,18 +5916,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           try { localStorage.setItem('bot_active_position', JSON.stringify(data.active_position)); } catch (e) {}
           renderActivePositionBanner(data.active_position);
         } else {
-          const savedPos = localStorage.getItem('bot_active_position');
-          if (savedPos) {
-            activePosNullStreak = (activePosNullStreak || 0) + 1;
-            if (activePosNullStreak >= 2) {
-              currentActivePosition = null;
-              try { localStorage.removeItem('bot_active_position'); } catch (e) {}
-              renderActivePositionBanner(null);
-            }
-          } else {
-            currentActivePosition = null;
-            renderActivePositionBanner(null);
-          }
+          currentActivePosition = null;
+          activePosNullStreak = 0;
+          try { localStorage.removeItem('bot_active_position'); } catch (e) {}
+          renderActivePositionBanner(null);
         }
       } catch (e) {
         console.error('Error fetching status:', e);
@@ -6885,18 +6917,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const durEl = document.getElementById('pos-duration-opened');
 
         if (pos) {
+          const isShort = (pos.side || '').toUpperCase() === 'SHORT' || (pos.side || '').toUpperCase() === 'SELL';
+          const sideText = isShort ? 'SHORT' : 'LONG';
+          const sideColor = isShort ? 'text-rose-400' : 'text-emerald-400';
+          const badgeBg = isShort ? 'bg-rose-500/20 text-rose-400 border-rose-500/40' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40';
+
           if (badgeEl) {
-            badgeEl.innerText = `OPEN (${pos.side || 'LONG'})`;
-            badgeEl.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse';
+            badgeEl.innerText = `OPEN (${sideText})`;
+            badgeEl.className = `px-2 py-0.5 rounded text-[10px] font-semibold border animate-pulse ${badgeBg}`;
           }
           if (idEl) idEl.innerText = `Pos ID: ${pos.id || '--'}`;
-          if (symEl) symEl.innerHTML = `<span class="text-white">${pos.symbol}</span> <span class="text-emerald-400">(${pos.side})</span>`;
-          if (entryEl) entryEl.innerText = '$' + Number(pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-          if (currEl) currEl.innerText = '$' + Number(pos.current_price || pos.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-          if (sizeEl) sizeEl.innerText = `${Number(pos.size || 0).toFixed(4)} (~$${Number(pos.notional || (pos.size * pos.entry_price) || 0).toFixed(2)})`;
+          if (symEl) symEl.innerHTML = `<span class="text-white">${escapeHtml(pos.symbol || '--')}</span> <span class="${sideColor}">(${sideText})</span>`;
+          const entryVal = pos.entry_price !== undefined ? pos.entry_price : (pos.entry || 0);
+          if (entryEl) entryEl.innerText = '$' + Number(entryVal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          const currVal = pos.current_price !== undefined ? pos.current_price : entryVal;
+          if (currEl) currEl.innerText = '$' + Number(currVal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+          const posSize = pos.size !== undefined ? Number(pos.size) : Number(pos.amount || 0);
+          const notionalVal = pos.notional !== undefined ? Number(pos.notional) : (posSize * Number(currVal));
+          if (sizeEl) sizeEl.innerText = `${posSize.toFixed(4)} (~$${notionalVal.toFixed(2)})`;
           
           if (stopEl) {
-            const stopVal = pos.trailing_stop || pos.stop_loss;
+            const stopVal = pos.trailing_stop || pos.current_stop || pos.stop_loss || pos.stop;
             stopEl.innerText = stopVal ? ('$' + Number(stopVal).toFixed(2)) : '--';
           }
 
@@ -6953,10 +6994,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 statusBadge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-blue-500/20 text-blue-300 font-semibold">PENDING</span>`;
               }
 
-              const sideCol = (o.side || '').toUpperCase() === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
-              const timeStr = o.timestamp ? new Date(o.timestamp).toLocaleString() : '--';
+              const side = (o.side || '').toUpperCase();
+              const sideCol = (side === 'BUY' || side === 'LONG') ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+              const rawTime = o.created_at || o.timestamp;
+              const timeStr = rawTime ? new Date(rawTime).toLocaleString() : '--';
               const reasonStr = o.rejection_reason || o.notes || '--';
               const reasonClass = o.rejection_reason ? 'text-rose-300 font-sans' : 'text-slate-500 font-sans';
+              const sizeVal = o.size !== undefined ? Number(o.size) : Number(o.amount || 0);
 
               tr.innerHTML = `
                 <td class="py-1.5 px-2.5 text-slate-400 text-[10px]">${escapeHtml(timeStr)}</td>
@@ -6964,7 +7008,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <td class="py-1.5 px-2 ${sideCol}">${escapeHtml(o.side || '--')}</td>
                 <td class="py-1.5 px-2 text-slate-300">${escapeHtml(o.order_type || 'MARKET')}</td>
                 <td class="py-1.5 px-2 text-slate-300">${o.price ? ('$' + Number(o.price).toFixed(2)) : 'Market'}</td>
-                <td class="py-1.5 px-2 text-slate-300">${Number(o.amount || 0).toFixed(4)}</td>
+                <td class="py-1.5 px-2 text-slate-300">${sizeVal.toFixed(4)}</td>
                 <td class="py-1.5 px-2">${statusBadge}</td>
                 <td class="py-1.5 px-2.5 ${reasonClass} truncate max-w-[200px]" title="${escapeHtml(reasonStr)}">${escapeHtml(reasonStr)}</td>
               `;
