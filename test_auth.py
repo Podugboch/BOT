@@ -1148,7 +1148,7 @@ class TestServerlessSeedingAndAutoActivation:
         conn.row_factory = sqlite3.Row
         j = conn.execute("SELECT * FROM users WHERE username = 'Jaytricks'").fetchone()
         assert j is not None
-        assert j["email"] == "jaytricks@example.com"
+        assert j["email"] in ("odu.pisc@gmail.com", "jaytricks@example.com")
         assert j["is_active"] == 1
         conn.close()
 
@@ -1207,3 +1207,62 @@ class TestServerlessSeedingAndAutoActivation:
         assert u is not None
         assert u["is_active"] == 1
         conn.close()
+
+    def test_login_with_email_rehydrates_and_authenticates(self, tmp_path, monkeypatch):
+        db = tmp_path / "email_seed_login.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Database is completely empty
+        conn = sqlite3.connect(str(db))
+        assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+        conn.close()
+
+        # Attempting login with odu.pisc@gmail.com rehydrates Jaytricks and authenticates
+        res = AuthService.login("odu.pisc@gmail.com", "Password123456!")
+        assert res["success"] is True
+        assert res["user"]["username"] == "Jaytricks"
+        assert res["user"]["email"] == "odu.pisc@gmail.com"
+        assert "token" in res
+
+        # Verify record in DB
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        u = conn.execute("SELECT * FROM users WHERE email = 'odu.pisc@gmail.com'").fetchone()
+        assert u is not None
+        assert u["username"] == "Jaytricks"
+        assert u["is_active"] == 1
+        conn.close()
+
+    def test_magic_login_and_password_reset_for_seed_user_on_empty_db(self, tmp_path, monkeypatch):
+        db = tmp_path / "seed_magic_and_reset.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Magic link on cold container finds seed user and generates token
+        magic_res = AuthService.send_magic_login_link("odu.pisc@gmail.com")
+        assert magic_res["success"] is True
+        assert "dev_magic_link" in magic_res or magic_res.get("email_sent") is True
+
+        # Password reset on cold container finds seed user and generates reset link
+        reset_res = AuthService.request_password_reset("odu.pisc@gmail.com")
+        assert reset_res["success"] is True
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        u = conn.execute("SELECT * FROM users WHERE email = 'odu.pisc@gmail.com'").fetchone()
+        assert u is not None
+        assert u["reset_token"] is not None
+        conn.close()
+
+    def test_default_seed_users_fallback_without_json(self, tmp_path, monkeypatch):
+        import auth
+        db = tmp_path / "no_json_seed.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        # Point to empty seed list helper directly or fake path
+        monkeypatch.setattr("auth.get_all_seed_users", lambda: [dict(u) for u in auth.DEFAULT_SEED_USERS])
+        init_auth_db()
+
+        # Login with Jaytricks works using DEFAULT_SEED_USERS fallback
+        res = AuthService.login("Jaytricks", "Password123456!")
+        assert res["success"] is True
+        assert res["user"]["username"] == "Jaytricks"

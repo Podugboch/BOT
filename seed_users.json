@@ -1,5 +1,31 @@
 [
   {
+    "id": 2,
+    "username": "Jaytricks",
+    "email": "odu.pisc@gmail.com",
+    "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+    "salt": "33e131a3d850264160c70eb222f1f8ca",
+    "is_active": 1,
+    "activation_token": null,
+    "activation_expires_at": "2026-09-22T08:00:58.305526+00:00",
+    "reset_token": null,
+    "reset_expires_at": null,
+    "created_at": "2026-09-18T10:00:00.000000+00:00"
+  },
+  {
+    "id": 3,
+    "username": "Podugboch",
+    "email": "podugboch@traderqueen.name.ng",
+    "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+    "salt": "33e131a3d850264160c70eb222f1f8ca",
+    "is_active": 1,
+    "activation_token": null,
+    "activation_expires_at": "2026-09-22T08:00:58.305526+00:00",
+    "reset_token": null,
+    "reset_expires_at": null,
+    "created_at": "2026-09-18T10:00:00.000000+00:00"
+  },
+  {
     "id": 5,
     "username": "test_login_user",
     "email": "testlogin@trader.io",
@@ -14,7 +40,7 @@
   },
   {
     "id": 6,
-    "username": "Jaytricks",
+    "username": "jaytricks_alias",
     "email": "jaytricks@example.com",
     "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
     "salt": "33e131a3d850264160c70eb222f1f8ca",
