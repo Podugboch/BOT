@@ -572,7 +572,7 @@ def login(payload: LoginRequest, response: Response):
         if not result.get("success"):
             return JSONResponse(
                 status_code=400,
-                content={"success": False, "message": result.get("message", "Invalid credentials")}
+                content=result
             )
         if result.get("token"):
             response.set_cookie(

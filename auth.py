@@ -507,32 +507,153 @@ def init_auth_db():
         print(f"[AUTH ERROR] Failed to run env migration in init_auth_db: {e}")
 
 
+DEFAULT_SEED_USERS = [
+    {
+        "id": 2,
+        "username": "Jaytricks",
+        "email": "odu.pisc@gmail.com",
+        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "is_active": 1,
+        "created_at": "2026-09-18T10:00:00.000000+00:00",
+    },
+    {
+        "id": 3,
+        "username": "Podugboch",
+        "email": "podugboch@traderqueen.name.ng",
+        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "is_active": 1,
+        "created_at": "2026-09-18T10:00:00.000000+00:00",
+    },
+    {
+        "id": 5,
+        "username": "test_login_user",
+        "email": "test_login@example.com",
+        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "is_active": 1,
+        "created_at": "2026-09-18T10:00:00.000000+00:00",
+    },
+    {
+        "id": 6,
+        "username": "jaytricks_alias",
+        "email": "jaytricks@example.com",
+        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
+        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "is_active": 1,
+        "created_at": "2026-09-18T10:00:00.000000+00:00",
+    },
+]
+
+
+def get_all_seed_users() -> list:
+    """Returns seed users by checking seed_users.json merged with DEFAULT_SEED_USERS."""
+    users_by_key = {}
+    for u in DEFAULT_SEED_USERS:
+        users_by_key[u["username"].lower()] = dict(u)
+    try:
+        seed_path = Path(__file__).resolve().parent / "seed_users.json"
+        if seed_path.exists():
+            with open(seed_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            for u in loaded:
+                if isinstance(u, dict) and u.get("username"):
+                    users_by_key[u["username"].lower()] = u
+    except Exception as e:
+        print(f"[AUTH WARNING] Could not load seed_users.json: {e}")
+    return list(users_by_key.values())
+
+
+def find_and_rehydrate_seed_user(conn: sqlite3.Connection, identifier: str) -> Optional[sqlite3.Row]:
+    """Find a user in seed users matching identifier (username or email) and insert/update into SQLite."""
+    val = (identifier or "").strip().lower()
+    if not val:
+        return None
+    all_seeds = get_all_seed_users()
+    matched = None
+    for su in all_seeds:
+        if su.get("username", "").strip().lower() == val or su.get("email", "").strip().lower() == val:
+            matched = su
+            break
+    if not matched:
+        return None
+
+    cur = conn.cursor()
+    u_name = matched["username"].strip()
+    u_email = matched["email"].strip().lower()
+    row = cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (u_name.lower(), u_email)).fetchone()
+    if row:
+        cur.execute("""
+            UPDATE users SET
+                username = ?,
+                email = ?,
+                password_hash = ?,
+                salt = ?,
+                is_active = ?
+            WHERE id = ?
+        """, (u_name, u_email, matched["password_hash"], matched["salt"], matched.get("is_active", 1), row["id"]))
+        conn.commit()
+        return cur.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+    else:
+        uid = matched.get("id")
+        if uid:
+            id_row = cur.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
+            if id_row:
+                uid = None
+        if uid:
+            cur.execute("""
+                INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (uid, u_name, u_email, matched["password_hash"], matched["salt"], matched.get("is_active", 1), matched.get("created_at") or datetime.now(timezone.utc).isoformat()))
+        else:
+            cur.execute("""
+                INSERT INTO users (username, email, password_hash, salt, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (u_name, u_email, matched["password_hash"], matched["salt"], matched.get("is_active", 1), matched.get("created_at") or datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        return cur.execute("SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (u_name.lower(), u_email)).fetchone()
+
+
 def seed_initial_users(conn: sqlite3.Connection):
     """Seed existing user records into SQLite if running in production/normal mode and users are missing."""
     if "PYTEST_CURRENT_TEST" in os.environ:
         return
     try:
         cur = conn.cursor()
-        seed_path = Path(__file__).resolve().parent / "seed_users.json"
-        if seed_path.exists():
+        for u in get_all_seed_users():
             try:
-                with open(seed_path, "r", encoding="utf-8") as f:
-                    users_list = json.load(f)
-                for u in users_list:
+                u_name = u["username"].strip()
+                u_email = u["email"].strip().lower()
+                row = cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (u_name.lower(), u_email)).fetchone()
+                if row:
                     cur.execute("""
-                        INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        u["id"],
-                        u["username"],
-                        u["email"],
-                        u["password_hash"],
-                        u["salt"],
-                        u.get("is_active", 1),
-                        u.get("created_at") or datetime.now(timezone.utc).isoformat()
-                    ))
+                        UPDATE users SET
+                            username = ?,
+                            email = ?,
+                            password_hash = ?,
+                            salt = ?,
+                            is_active = ?
+                        WHERE id = ?
+                    """, (u_name, u_email, u["password_hash"], u["salt"], u.get("is_active", 1), row["id"]))
+                else:
+                    uid = u.get("id")
+                    if uid:
+                        id_row = cur.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
+                        if id_row:
+                            uid = None
+                    if uid:
+                        cur.execute("""
+                            INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (uid, u_name, u_email, u["password_hash"], u["salt"], u.get("is_active", 1), u.get("created_at") or datetime.now(timezone.utc).isoformat()))
+                    else:
+                        cur.execute("""
+                            INSERT INTO users (username, email, password_hash, salt, is_active, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (u_name, u_email, u["password_hash"], u["salt"], u.get("is_active", 1), u.get("created_at") or datetime.now(timezone.utc).isoformat()))
             except Exception as e:
-                print(f"[AUTH WARNING] Could not load seed_users.json: {e}")
+                print(f"[AUTH WARNING] Failed seeding user {u.get('username')}: {e}")
 
         seed_u = (os.getenv("SEED_USERNAME") or "").strip()
         seed_p = (os.getenv("SEED_PASSWORD") or "").strip()
@@ -1106,6 +1227,11 @@ class AuthService:
         cur = conn.cursor()
         cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (username.lower(), email))
         existing = cur.fetchone()
+        if not existing:
+            for su in get_all_seed_users():
+                if su.get("username", "").strip().lower() == username.lower() or su.get("email", "").strip().lower() == email:
+                    existing = su
+                    break
         if not existing and is_remote_storage_available():
             remote_u = remote_get_user(username) or remote_get_user(email)
             if remote_u:
@@ -1113,7 +1239,7 @@ class AuthService:
 
         if existing:
             conn.close()
-            return {"success": False, "message": "A user with this username or email already exists"}
+            return {"success": False, "already_exists": True, "email": email, "message": "A user with this username or email already exists"}
 
         password_hash, salt = hash_password(password)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
@@ -1290,6 +1416,8 @@ class AuthService:
         cur = conn.cursor()
         cur.execute("SELECT id, username, email, password_hash, salt, is_active FROM users WHERE LOWER(email) = ?", (email,))
         user = cur.fetchone()
+        if not user:
+            user = find_and_rehydrate_seed_user(conn, email)
 
         if not user:
             remote_u = remote_get_user(email)
@@ -1374,31 +1502,7 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
-            seed_path = Path(__file__).resolve().parent / "seed_users.json"
-            if seed_path.exists():
-                try:
-                    with open(seed_path, "r", encoding="utf-8") as f:
-                        s_users = json.load(f)
-                    for su in s_users:
-                        if su.get("username", "").strip().lower() == val or su.get("email", "").strip().lower() == val:
-                            cur.execute("""
-                                INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                su["id"],
-                                su["username"],
-                                su["email"],
-                                su["password_hash"],
-                                su["salt"],
-                                su.get("is_active", 1),
-                                su.get("created_at") or datetime.now(timezone.utc).isoformat()
-                            ))
-                            conn.commit()
-                            cur.execute("SELECT * FROM users WHERE id = ?", (su["id"],))
-                            user = cur.fetchone()
-                            break
-                except Exception as e:
-                    print(f"[AUTH WARNING] Failed checking seed_users.json during login: {e}")
+            user = find_and_rehydrate_seed_user(conn, val)
 
         if not user and client_token:
             data = verify_stateless_session_token(client_token)
@@ -1519,6 +1623,10 @@ class AuthService:
         cur = conn.cursor()
         cur.execute("SELECT id, username FROM users WHERE LOWER(email) = ?", (email,))
         user = cur.fetchone()
+
+        if not user:
+            user = find_and_rehydrate_seed_user(conn, email)
+
         conn.close()
 
         # Do not generate login tokens for non-existent users
@@ -1576,6 +1684,9 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
+            user = find_and_rehydrate_seed_user(conn, email)
+
+        if not user:
             conn.close()
             return {"success": False, "message": "No account found for this email address. Please register first."}
 
@@ -1606,6 +1717,9 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
+            user = find_and_rehydrate_seed_user(conn, email)
+
+        if not user and is_remote_storage_available():
             remote_u = remote_get_user(email)
             if remote_u:
                 user = remote_u
@@ -1619,11 +1733,28 @@ class AuthService:
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
 
         try:
-            cur.execute("UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ?",
-                        (reset_token, expires_at, user["id"]))
+            cur.execute("""
+                INSERT INTO users (id, username, email, password_hash, salt, is_active, reset_token, reset_expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET reset_token = excluded.reset_token, reset_expires_at = excluded.reset_expires_at
+            """, (
+                user["id"],
+                user["username"],
+                email,
+                user.get("password_hash", "") or "",
+                user.get("salt", "") or "",
+                reset_token,
+                expires_at,
+                datetime.now(timezone.utc).isoformat()
+            ))
             conn.commit()
         except Exception:
-            pass
+            try:
+                cur.execute("UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ?",
+                            (reset_token, expires_at, user["id"]))
+                conn.commit()
+            except Exception:
+                pass
         conn.close()
 
         reset_link = f"{base_url}/reset-password?token={urllib.parse.quote(reset_token)}"
