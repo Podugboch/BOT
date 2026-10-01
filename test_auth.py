@@ -1098,3 +1098,112 @@ class TestSecretEncryptionAndVault:
 
         keys_after = AuthService.get_exchange_keys(user_id)
         assert len(keys_after) == 0
+
+
+class TestServerlessSeedingAndAutoActivation:
+    """Test suite covering seed user hydration, client-token recovery, and auto-activation."""
+
+    def test_seed_initial_users_loads_seed_json(self, tmp_path, monkeypatch):
+        from auth import init_auth_db, seed_initial_users, get_db_connection
+        db = tmp_path / "seed_test.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # In pytest, seed_initial_users returns early if PYTEST_CURRENT_TEST is present.
+        # Temporarily clear PYTEST_CURRENT_TEST to simulate serverless cold start.
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        conn = get_db_connection()
+        seed_initial_users(conn)
+        conn.close()
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        users = [dict(r) for r in cur.execute("SELECT username, email, is_active FROM users").fetchall()]
+        conn.close()
+
+        usernames = {u["username"] for u in users}
+        assert "Jaytricks" in usernames
+
+    def test_login_rehydrates_seed_user_on_demand(self, tmp_path, monkeypatch):
+        db = tmp_path / "demand_seed.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Database is completely empty
+        conn = sqlite3.connect(str(db))
+        assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+        conn.close()
+
+        # Attempting login with unknown user fails
+        bad_res = AuthService.login("non_existent_random_user", "AnyPass12345")
+        assert bad_res["success"] is False
+
+        # Attempting login with Jaytricks rehydrates Jaytricks from seed_users.json
+        # Password check fails with wrong password
+        wrong_res = AuthService.login("Jaytricks", "WrongPassword123!")
+        assert wrong_res["success"] is False
+
+        # Verify Jaytricks was rehydrated into SQLite
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        j = conn.execute("SELECT * FROM users WHERE username = 'Jaytricks'").fetchone()
+        assert j is not None
+        assert j["email"] == "jaytricks@example.com"
+        assert j["is_active"] == 1
+        conn.close()
+
+    def test_login_auto_activates_when_auto_activate_enabled(self, tmp_path, monkeypatch):
+        db = tmp_path / "auto_act_login.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Register user with auto_activate=False
+        reg = AuthService.register("inactive_guy", "inactive@trader.io", "StrongPass123!", auto_activate=False)
+        assert reg["success"] is True
+        assert reg["is_active"] == 0
+
+        # Login without AUTO_ACTIVATE or VERCEL fails with needs_activation
+        monkeypatch.delenv("AUTO_ACTIVATE", raising=False)
+        monkeypatch.delenv("VERCEL", raising=False)
+        res_fail = AuthService.login("inactive_guy", "StrongPass123!")
+        assert res_fail["success"] is False
+        assert res_fail.get("needs_activation") is True
+
+        # Now enable AUTO_ACTIVATE=true (as set on Vercel deployment)
+        monkeypatch.setenv("AUTO_ACTIVATE", "true")
+        res_succ = AuthService.login("inactive_guy", "StrongPass123!")
+        assert res_succ["success"] is True
+        assert "token" in res_succ
+
+        # Verify user is active in DB
+        conn = get_db_connection()
+        user_row = conn.execute("SELECT is_active FROM users WHERE username = 'inactive_guy'").fetchone()
+        assert user_row["is_active"] == 1
+        conn.close()
+
+    def test_login_rehydrates_from_client_token_on_new_container(self, tmp_path, monkeypatch):
+        from auth import create_stateless_session_token
+        db = tmp_path / "client_token_db.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
+        init_auth_db()
+
+        # Client has a signed session token from previous container
+        tok = create_stateless_session_token(999, "client_saved_user", "client_saved@test.io")
+
+        # Database has no such user
+        conn = sqlite3.connect(str(db))
+        assert conn.execute("SELECT count(*) FROM users WHERE username = 'client_saved_user'").fetchone()[0] == 0
+        conn.close()
+
+        # Login providing client_token rehydrates the account and logs in
+        res = AuthService.login("client_saved_user", "BrandNewPassword123!", client_token=tok)
+        assert res["success"] is True
+        assert res["user"]["username"] == "client_saved_user"
+
+        # Verify account in DB with active status
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        u = conn.execute("SELECT * FROM users WHERE username = 'client_saved_user'").fetchone()
+        assert u is not None
+        assert u["is_active"] == 1
+        conn.close()

@@ -113,3 +113,45 @@ def test_remote_app_setting_round_trip(storage, monkeypatch):
     assert storage.remote_save_app_setting("execution_mode", "manual")
     assert storage.remote_get_app_setting("execution_mode") == "manual"
 
+
+def test_storage_adapter_supports_none_and_disabled_drivers(monkeypatch):
+    import storage_adapter
+    for driver_name in ("none", "off", "disabled", "local", "sqlite"):
+        monkeypatch.setenv("REMOTE_STORAGE_DRIVER", driver_name)
+        reloaded = importlib.reload(storage_adapter)
+        assert reloaded._driver() == "none"
+        assert reloaded.is_remote_storage_available() is False
+
+
+def test_storage_adapter_suspends_blob_on_http_403(storage, monkeypatch):
+    import urllib.error
+    monkeypatch.setattr(storage, "_BLOB_SUSPENDED", False)
+
+    def raise_403(*args, **kwargs):
+        raise urllib.error.HTTPError("http://example", 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr(storage.urllib.request, "urlopen", raise_403)
+    res = storage._blob_get("users/index.json")
+    assert res is None
+    assert storage._BLOB_SUSPENDED is True
+    assert storage.is_remote_storage_available() is False
+
+
+def test_remote_app_setting_ttl_caching(storage, monkeypatch):
+    call_count = {"get": 0}
+    storage._APP_SETTINGS_CACHE.clear()
+
+    def mock_blob_get(path):
+        call_count["get"] += 1
+        return b'"auto"'
+
+    monkeypatch.setattr(storage, "_blob_get", mock_blob_get)
+    val1 = storage.remote_get_app_setting("execution_mode")
+    assert val1 == "auto"
+    assert call_count["get"] == 1
+
+    # Second call within TTL must hit cache without invoking mock_blob_get
+    val2 = storage.remote_get_app_setting("execution_mode")
+    assert val2 == "auto"
+    assert call_count["get"] == 1
+

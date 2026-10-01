@@ -496,6 +496,7 @@ def init_auth_db():
     )
     """)
     conn.commit()
+    seed_initial_users(conn)
     migrate_unencrypted_secrets(conn)
     sync_env_to_system_settings(conn)
     conn.close()
@@ -504,6 +505,50 @@ def init_auth_db():
         migrate_and_sanitize_env_file()
     except Exception as e:
         print(f"[AUTH ERROR] Failed to run env migration in init_auth_db: {e}")
+
+
+def seed_initial_users(conn: sqlite3.Connection):
+    """Seed existing user records into SQLite if running in production/normal mode and users are missing."""
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    try:
+        cur = conn.cursor()
+        seed_path = Path(__file__).resolve().parent / "seed_users.json"
+        if seed_path.exists():
+            try:
+                with open(seed_path, "r", encoding="utf-8") as f:
+                    users_list = json.load(f)
+                for u in users_list:
+                    cur.execute("""
+                        INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        u["id"],
+                        u["username"],
+                        u["email"],
+                        u["password_hash"],
+                        u["salt"],
+                        u.get("is_active", 1),
+                        u.get("created_at") or datetime.now(timezone.utc).isoformat()
+                    ))
+            except Exception as e:
+                print(f"[AUTH WARNING] Could not load seed_users.json: {e}")
+
+        seed_u = (os.getenv("SEED_USERNAME") or "").strip()
+        seed_p = (os.getenv("SEED_PASSWORD") or "").strip()
+        seed_e = (os.getenv("SEED_EMAIL") or (f"{seed_u}@bot.local" if seed_u else "")).strip().lower()
+        if seed_u and seed_p:
+            existing = cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (seed_u.lower(), seed_e)).fetchone()
+            if not existing:
+                p_hash, salt = hash_password(seed_p)
+                cur.execute("""
+                    INSERT INTO users (username, email, password_hash, salt, is_active, created_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                """, (seed_u, seed_e, p_hash, salt, datetime.now(timezone.utc).isoformat()))
+
+        conn.commit()
+    except Exception as e:
+        print(f"[AUTH WARNING] Failed seeding initial users: {e}")
 
 
 def get_system_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -1076,7 +1121,13 @@ class AuthService:
         temp_token = secrets.token_urlsafe(32)
 
         if auto_activate is None:
-            auto_activate = bool(os.getenv("AUTO_ACTIVATE", "").lower() == "true")
+            env_act = os.getenv("AUTO_ACTIVATE", "").strip().lower()
+            if env_act:
+                auto_activate = env_act in ("true", "1", "yes")
+            elif os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+                auto_activate = True
+            else:
+                auto_activate = False
 
         initial_active = 1 if auto_activate else 0
 
@@ -1323,7 +1374,63 @@ class AuthService:
         user = cur.fetchone()
 
         if not user:
-            remote_u = remote_get_user(val)
+            seed_path = Path(__file__).resolve().parent / "seed_users.json"
+            if seed_path.exists():
+                try:
+                    with open(seed_path, "r", encoding="utf-8") as f:
+                        s_users = json.load(f)
+                    for su in s_users:
+                        if su.get("username", "").strip().lower() == val or su.get("email", "").strip().lower() == val:
+                            cur.execute("""
+                                INSERT OR IGNORE INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                su["id"],
+                                su["username"],
+                                su["email"],
+                                su["password_hash"],
+                                su["salt"],
+                                su.get("is_active", 1),
+                                su.get("created_at") or datetime.now(timezone.utc).isoformat()
+                            ))
+                            conn.commit()
+                            cur.execute("SELECT * FROM users WHERE id = ?", (su["id"],))
+                            user = cur.fetchone()
+                            break
+                except Exception as e:
+                    print(f"[AUTH WARNING] Failed checking seed_users.json during login: {e}")
+
+        if not user and client_token:
+            data = verify_stateless_session_token(client_token)
+            if data:
+                token_u = (data.get("u") or "").strip().lower()
+                token_e = (data.get("e") or "").strip().lower()
+                if val in (token_u, token_e):
+                    pwd_hash, salt = hash_password(password)
+                    try:
+                        cur.execute("""
+                            INSERT INTO users (id, username, email, password_hash, salt, is_active, created_at)
+                            VALUES (?, ?, ?, ?, ?, 1, ?)
+                            ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash, salt = excluded.salt, is_active = 1
+                        """, (
+                            data.get("uid"),
+                            data.get("u") or val,
+                            data.get("e") or (val if "@" in val else f"{val}@bot.local"),
+                            pwd_hash,
+                            salt,
+                            datetime.now(timezone.utc).isoformat()
+                        ))
+                        conn.commit()
+                        cur.execute("SELECT * FROM users WHERE id = ?", (data.get("uid"),))
+                        user = cur.fetchone()
+                    except Exception as e:
+                        print(f"[AUTH WARNING] Failed rehydrating user from client token: {e}")
+
+        if not user:
+            try:
+                remote_u = remote_get_user(val)
+            except Exception:
+                remote_u = None
             if remote_u:
                 try:
                     cur.execute("""
@@ -1359,13 +1466,26 @@ class AuthService:
             return {"success": False, "message": "Invalid username/email or password"}
 
         if user["is_active"] == 0:
-            conn.close()
-            return {
-                "success": False,
-                "needs_activation": True,
-                "email": user["email"],
-                "message": "Your account is not activated yet. Please check your email for the activation link."
-            }
+            can_auto_activate = (
+                os.getenv("AUTO_ACTIVATE", "").strip().lower() in ("true", "1", "yes")
+                or bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+            )
+            if can_auto_activate:
+                try:
+                    cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (user["id"],))
+                    conn.commit()
+                    cur.execute("SELECT * FROM users WHERE id = ?", (user["id"],))
+                    user = cur.fetchone()
+                except Exception as e:
+                    print(f"[AUTH WARNING] Failed auto-activating user on login: {e}")
+            else:
+                conn.close()
+                return {
+                    "success": False,
+                    "needs_activation": True,
+                    "email": user["email"],
+                    "message": "Your account is not activated yet. Please check your email for the activation link."
+                }
 
         session_token = create_stateless_session_token(user["id"], user["username"], user["email"])
         created_at = datetime.now(timezone.utc).isoformat()

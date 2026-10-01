@@ -48,8 +48,15 @@ def _component(value: Any, field: str = "identifier") -> str:
     return value
 
 
+_BLOB_SUSPENDED = False
+
+
 def _driver() -> str:
-    configured = {"kv": bool(KV_URL and KV_TOKEN), "turso": bool(TURSO_URL and TURSO_TOKEN), "blob": bool(BLOB_TOKEN and BLOB_STORE_ID)}
+    if _DRIVER in ("none", "off", "disabled", "local", "sqlite", "false", "0", "no"):
+        return "none"
+    if _BLOB_SUSPENDED and _DRIVER == "blob":
+        return "none"
+    configured = {"kv": bool(KV_URL and KV_TOKEN), "turso": bool(TURSO_URL and TURSO_TOKEN), "blob": bool(BLOB_TOKEN and BLOB_STORE_ID and not _BLOB_SUSPENDED)}
     if _DRIVER:
         if _DRIVER not in configured or not configured[_DRIVER]:
             raise RuntimeError(f"REMOTE_STORAGE_DRIVER={_DRIVER!r} is not fully configured")
@@ -156,27 +163,39 @@ def _blob_url(pathname: str) -> str:
 
 
 def _blob_put(pathname: str, data: bytes, content_type: str = "application/json") -> bool:
-    if not BLOB_TOKEN:
+    global _BLOB_SUSPENDED
+    if not BLOB_TOKEN or _BLOB_SUSPENDED:
         return False
     try:
         url = "https://blob.vercel-storage.com/?pathname=" + urllib.parse.quote(pathname, safe="/")
         req = urllib.request.Request(url, data=data, headers={"authorization": f"Bearer {BLOB_TOKEN}", "x-api-version": "12", "x-vercel-blob-access": "private", "x-add-random-suffix": "0", "x-allow-overwrite": "1", "content-type": content_type}, method="PUT")
         with urllib.request.urlopen(req, timeout=6) as response:
             return response.status in (200, 201)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            _BLOB_SUSPENDED = True
+            print(f"[REMOTE STORE WARNING] Blob PUT {pathname} returned HTTP 403 (store blocked/suspended). Disabling blob storage.")
+        else:
+            print(f"[REMOTE STORE WARNING] Blob PUT {pathname} failed: {exc}")
+        return False
     except Exception as exc:
         print(f"[REMOTE STORE WARNING] Blob PUT {pathname} failed: {exc}")
         return False
 
 
 def _blob_get(pathname: str) -> Optional[bytes]:
-    if not BLOB_TOKEN:
+    global _BLOB_SUSPENDED
+    if not BLOB_TOKEN or _BLOB_SUSPENDED:
         return None
     try:
         req = urllib.request.Request(_blob_url(pathname) + "?cache=0", headers={"authorization": f"Bearer {BLOB_TOKEN}"})
         with urllib.request.urlopen(req, timeout=6) as response:
             return response.read() if response.status == 200 else None
     except urllib.error.HTTPError as exc:
-        if exc.code != 404:
+        if exc.code == 403:
+            _BLOB_SUSPENDED = True
+            print(f"[REMOTE STORE WARNING] Blob GET {pathname} returned HTTP 403 (store blocked/suspended). Disabling blob storage.")
+        elif exc.code != 404:
             print(f"[REMOTE STORE WARNING] Blob GET {pathname} returned HTTP {exc.code}")
         return None
     except Exception as exc:
@@ -185,12 +204,20 @@ def _blob_get(pathname: str) -> Optional[bytes]:
 
 
 def _blob_del(pathname: str) -> bool:
-    if not BLOB_TOKEN:
+    global _BLOB_SUSPENDED
+    if not BLOB_TOKEN or _BLOB_SUSPENDED:
         return False
     try:
         req = urllib.request.Request("https://blob.vercel-storage.com/delete", data=_json({"urls": [_blob_url(pathname)]}).encode(), headers={"authorization": f"Bearer {BLOB_TOKEN}", "x-api-version": "12", "content-type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=6) as response:
             return response.status in (200, 204)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            _BLOB_SUSPENDED = True
+            print(f"[REMOTE STORE WARNING] Blob DELETE {pathname} returned HTTP 403 (store blocked/suspended). Disabling blob storage.")
+        else:
+            print(f"[REMOTE STORE WARNING] Blob DELETE {pathname} failed: {exc}")
+        return False
     except Exception as exc:
         print(f"[REMOTE STORE WARNING] Blob DELETE {pathname} failed: {exc}")
         return False
@@ -397,7 +424,12 @@ def remote_delete_exchange_key(user_id: int, exchange_id: str) -> bool:
     return bool(deleted)
 
 
+_APP_SETTINGS_CACHE: Dict[str, Tuple[float, Any]] = {}
+_CACHE_TTL = 15.0
+
+
 def remote_save_app_setting(key: str, value: Any) -> bool:
+    _APP_SETTINGS_CACHE[str(key).strip().lower()] = (datetime.now(timezone.utc).timestamp(), value)
     if not is_remote_storage_available():
         return False
     k = _component(key, "setting_key")
@@ -420,32 +452,42 @@ def remote_save_app_setting(key: str, value: Any) -> bool:
 
 
 def remote_get_app_setting(key: str) -> Optional[Any]:
+    cache_key = str(key).strip().lower()
+    now = datetime.now(timezone.utc).timestamp()
+    if cache_key in _APP_SETTINGS_CACHE:
+        ts, cached_val = _APP_SETTINGS_CACHE[cache_key]
+        if now - ts < _CACHE_TTL:
+            return cached_val
+
     if not is_remote_storage_available():
         return None
     k = _component(key, "setting_key")
     driver = _driver()
+    val = None
     if driver == "kv":
         ok, raw = _kv_command("GET", f"app_setting:{k}")
         if ok and raw:
             try:
-                return json.loads(raw) if isinstance(raw, str) else raw
+                val = json.loads(raw) if isinstance(raw, str) else raw
             except Exception:
-                return raw
-        return None
-    if driver == "turso":
+                val = raw
+    elif driver == "turso":
         if not _turso_init():
             return None
         ok, rows = _turso_execute("SELECT value FROM remote_app_settings WHERE key=?", (k,))
         if ok and rows:
             row0 = rows[0]
-            val = row0.get("value") if isinstance(row0, dict) else (row0[0] if isinstance(row0, (list, tuple)) else row0)
-            if val is not None:
+            raw_v = row0.get("value") if isinstance(row0, dict) else (row0[0] if isinstance(row0, (list, tuple)) else row0)
+            if raw_v is not None:
                 try:
-                    return json.loads(val) if isinstance(val, str) else val
+                    val = json.loads(raw_v) if isinstance(raw_v, str) else raw_v
                 except Exception:
-                    return val
-        return None
-    return _blob_json(f"app_settings/{k}.json")
+                    val = raw_v
+    else:
+        val = _blob_json(f"app_settings/{k}.json")
+
+    _APP_SETTINGS_CACHE[cache_key] = (now, val)
+    return val
 
 
 # ------------------------------- Deletion ---------------------------------
