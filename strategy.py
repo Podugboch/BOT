@@ -71,6 +71,21 @@ def add_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     fib = fib_retracement_levels(df, cfg.fib_lookback)
     bb = bollinger_bands(df["close"], getattr(cfg, "bb_period", 20), getattr(cfg, "bb_std", 2.0))
     m = macd(df["close"], cfg.fast_ema, cfg.slow_ema, getattr(cfg, "macd_signal_period", 9))
+    # Macro Regime Trend Filter (4h / Daily 200 EMA)
+    if "ema_4h_200" not in df.columns:
+        macro_tf = str(getattr(cfg, "macro_timeframe", "4h") or "4h").lower()
+        macro_period = int(getattr(cfg, "macro_ema_period", 200) or 200)
+        multiplier = 4
+        if macro_tf in ("1d", "d", "daily"):
+            multiplier = 24
+        elif macro_tf == "4h":
+            multiplier = 4
+        effective_period = macro_period * multiplier
+        df["ema_4h_200"] = ema(df["close"], effective_period)
+        df["ema_macro"] = df["ema_4h_200"]
+    elif "ema_macro" not in df.columns:
+        df["ema_macro"] = df["ema_4h_200"]
+
     return pd.concat([df, fib, bb, m], axis=1)
 
 
@@ -408,11 +423,78 @@ def _fib_zone_detail(rows: pd.DataFrame, cfg: StrategyConfig) -> Dict[str, Any]:
                       f"${last_price:,.2f} is {side}"}
 
 
+
+def _macro_trend_detail(df: pd.DataFrame, cfg: StrategyConfig, timeframe: Optional[str] = None) -> Dict[str, Any]:
+    """Stage-3 verdict: is the current candle trading above the 4h 200 EMA macro filter."""
+    if not getattr(cfg, "use_macro_filter", True):
+        return {"pass": True, "reason": None, "macro_val": None}
+
+    # Macro baseline check applies when evaluating 1h signals
+    # 1. If explicit timeframe says it's not 1h, bypass.
+    tf_str = str(timeframe or getattr(cfg, "timeframe", "") or "").strip().lower()
+    if tf_str != "" and tf_str not in ("1h", "60m"):
+        return {"pass": True, "reason": None, "macro_val": None}
+
+    # 2. If df has timestamps and the candle spacing is not 1h, bypass.
+    if "ts" in df.columns and len(df) >= 2:
+        try:
+            delta_sec = (df["ts"].iloc[1] - df["ts"].iloc[0]).total_seconds()
+            if delta_sec < 3300 or delta_sec > 3900:
+                # Candle spacing is not 1h (e.g. 15m, 5m, 1m) -> bypass 1h macro gate
+                return {"pass": True, "reason": None, "macro_val": None}
+        except Exception:
+            pass
+
+    col = "ema_4h_200" if "ema_4h_200" in df.columns else ("ema_macro" if "ema_macro" in df.columns else None)
+    if col is None:
+        if len(df) < 52:
+            return {"pass": True, "reason": "no macro EMA available yet (warming up)", "macro_val": None}
+        macro_series = ema(df["close"], 800)
+        macro_val = macro_series.iloc[-1]
+    else:
+        macro_series = df[col]
+        macro_val = macro_series.iloc[-1]
+
+    if pd.isna(macro_val) or (len(df) < 52 and col is None):
+        return {"pass": True, "reason": "no macro EMA available yet (warming up)", "macro_val": None}
+
+    try:
+        price = float(df["close"].iloc[-1])
+        macro_val = float(macro_val)
+    except (TypeError, ValueError):
+        return {"pass": True, "reason": None, "macro_val": None}
+
+    if price < macro_val:
+        return {
+            "pass": False,
+            "reason": "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)",
+            "macro_val": macro_val,
+        }
+
+    if getattr(cfg, "macro_filter_slope", True):
+        slope_bars = int(getattr(cfg, "macro_slope_bars", 12) or 12)
+        if len(df) > slope_bars:
+            prev_macro = macro_series.iloc[-(slope_bars + 1)]
+            if pd.notna(prev_macro) and macro_val < float(prev_macro):
+                return {
+                    "pass": False,
+                    "reason": "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)",
+                    "macro_val": macro_val,
+                }
+
+    return {
+        "pass": True,
+        "reason": f"price ${price:,.2f} above 4h 200 EMA (${macro_val:,.2f})",
+        "macro_val": macro_val,
+    }
+
+
 def _evaluate_signal(
     df: pd.DataFrame,
     cfg: StrategyConfig,
     position_open: bool,
     diagnostics: Optional[Dict[str, Any]] = None,
+    timeframe: Optional[str] = None,
 ) -> Signal:
     """
     Raw per-candle decision — the indicator rules only, no trade bookkeeping.
@@ -453,6 +535,13 @@ def _evaluate_signal(
         if not position_open:
             rsi_ok = bool(curr["rsi"] < cfg.rsi_overbought)
             core_setup = bool(bullish_cross and trending and rsi_ok)
+
+            macro_ok = True
+            macro_detail = None
+            if core_setup and getattr(cfg, "use_macro_filter", True):
+                macro_detail = _macro_trend_detail(df, cfg, timeframe=timeframe)
+                macro_ok = macro_detail["pass"]
+
             _record(diagnostics,
                     core_signal="BUY" if core_setup else None,
                     core_trigger=core_setup,
@@ -460,9 +549,15 @@ def _evaluate_signal(
                                              cross_text),
                     ema_cross_bars_ago=bars_ago,
                     fib_evaluated=False, fib_pass=None, fib_reason=None,
-                    rejected_by=_core_miss(bullish_cross, trending, rsi_ok, "no_ema_cross"))
-            if core_setup:
+                    macro_evaluated=macro_detail is not None,
+                    macro_pass=None if macro_detail is None else macro_detail["pass"],
+                    macro_reason=None if macro_detail is None else macro_detail["reason"],
+                    rejected_by=(_core_miss(bullish_cross, trending, rsi_ok, "no_ema_cross") if not core_setup
+                                 else (None if macro_ok else "macro_gate")))
+            if core_setup and macro_ok:
                 return Signal.BUY
+            if core_setup and not macro_ok and diagnostics is not None:
+                diagnostics["macro_blocked"] = diagnostics.get("macro_blocked", 0) + 1
             return Signal.HOLD
         if bearish_cross or curr["rsi"] > cfg.rsi_overbought + 10:
             return Signal.SELL
@@ -567,6 +662,13 @@ def _evaluate_signal(
                 fib_ok = fib_detail["pass"]
                 # No fib data yet (rolling swing not warmed up) -> do not block.
 
+            # Macro Regime Trend Filter (4h / Daily 200 EMA)
+            macro_ok = True
+            macro_detail = None
+            if core_setup and fib_ok and getattr(cfg, "use_macro_filter", True):
+                macro_detail = _macro_trend_detail(df, cfg, timeframe=timeframe)
+                macro_ok = macro_detail["pass"]
+
             _record(diagnostics,
                     core_signal="BUY" if core_setup else None,
                     core_trigger=core_setup,
@@ -576,13 +678,18 @@ def _evaluate_signal(
                     fib_evaluated=fib_detail is not None,
                     fib_pass=None if fib_detail is None else fib_detail["pass"],
                     fib_reason=None if fib_detail is None else fib_detail["reason"],
+                    macro_evaluated=macro_detail is not None,
+                    macro_pass=None if macro_detail is None else macro_detail["pass"],
+                    macro_reason=None if macro_detail is None else macro_detail["reason"],
                     rejected_by=(_core_miss(bullish_cross, trending, rsi_ok, "no_ema_cross") if not core_setup
-                                 else (None if fib_ok else "fib_zone")))
+                                 else (None if fib_ok and macro_ok else ("fib_zone" if not fib_ok else "macro_gate"))))
 
-            if core_setup and fib_ok:
+            if core_setup and fib_ok and macro_ok:
                 return Signal.BUY
             if core_setup and not fib_ok and diagnostics is not None:
                 diagnostics["fib_blocked"] = diagnostics.get("fib_blocked", 0) + 1
+            if core_setup and fib_ok and not macro_ok and diagnostics is not None:
+                diagnostics["macro_blocked"] = diagnostics.get("macro_blocked", 0) + 1
             return Signal.HOLD
 
         # position open: exit on trend reversal or overheated RSI
@@ -618,7 +725,13 @@ def generate_signal(
     supplies the default when `cfg.min_bars_between_trades` is None; pass None
     for both to skip the check entirely. Exits are never debounced.
     """
-    sig = _evaluate_signal(df, cfg, position_open, diagnostics)
+    try:
+        sig = _evaluate_signal(df, cfg, position_open, diagnostics, timeframe=timeframe)
+    except TypeError as e:
+        if "timeframe" in str(e) or "unexpected keyword argument" in str(e):
+            sig = _evaluate_signal(df, cfg, position_open, diagnostics)
+        else:
+            raise
     if sig != Signal.BUY or position_open:
         return sig
 

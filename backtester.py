@@ -53,6 +53,8 @@ def _rejection_reason(rule: str, stages: dict) -> str:
     """Human sentence for the stage that blocked an otherwise-valid signal."""
     if rule == "fib_zone":
         return stages.get("fib_reason") or "Price outside the Fibonacci zone"
+    if rule == "macro_gate":
+        return stages.get("macro_reason") or "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)"
     if rule == "signal_debounce":
         return stages.get("debounce_reason") or DEBOUNCE_REASON
     if rule == "risk_gate":
@@ -101,7 +103,9 @@ def format_pipeline_report(results: dict) -> str:
         f"misses: {_fmt_counts(diag.get('core_misses', {}))}",
         f"Stage 2 Fibonacci filter : {diag.get('fib_filter_passed', 0):,} passed, "
         f"{diag.get('fib_filter_blocked', 0):,} blocked",
-        f"Stage 2b entry debounce  : {diag.get('debounce_blocked', 0):,} suppressed "
+        f"Stage 2b Macro gate      : {diag.get('macro_filter_passed', 0):,} passed, "
+        f"{diag.get('macro_filter_blocked', 0):,} blocked",
+        f"Stage 2c entry debounce  : {diag.get('debounce_blocked', 0):,} suppressed "
         f"({diag.get('min_bars_between_trades', 0)} bar(s) required between trades; "
         f"tightest gap actually taken: "
         f"{results.get('min_entry_gap_bars') if results.get('min_entry_gap_bars') is not None else 'n/a'})",
@@ -264,6 +268,7 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
     # entries are decided by the core EMA/ADX/RSI signal alone.
     strategy_id = (getattr(cfg.strategy, "strategy_name", "ema_cross_fib") or "ema_cross_fib").strip().lower()
     fib_filter_enabled = strategy_id == "ema_cross_fib" and bool(cfg.strategy.use_fib_filter)
+    macro_filter_enabled = bool(getattr(cfg.strategy, "use_macro_filter", True))
     # Resolved once so the loop, the report and the echoed JSON all agree on how
     # many bars the entry debounce is actually enforcing for this grain.
     min_bars_between_trades = resolve_min_bars_between_trades(cfg.strategy, cfg.exchange.timeframe)
@@ -278,6 +283,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
         "core_signals_detected": 0,
         "fib_filter_passed": 0,
         "fib_filter_blocked": 0,
+        "macro_filter_passed": 0,
+        "macro_filter_blocked": 0,
         "debounce_blocked": 0,
         "sizing_passed": 0,
         "sizing_blocked": 0,
@@ -333,10 +340,12 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
                 diag["core_signals_detected"] += 1
                 if stages.get("fib_evaluated"):
                     diag["fib_filter_passed" if stages.get("fib_pass") else "fib_filter_blocked"] += 1
+                if stages.get("macro_evaluated"):
+                    diag["macro_filter_passed" if stages.get("macro_pass") else "macro_filter_blocked"] += 1
 
                 blocked_by = None
                 if sig != Signal.BUY:
-                    # Stage 2 blocked it (fib zone, or a strategy-level filter).
+                    # Stage 2 or 3 blocked it (fib zone, macro gate, or a strategy-level filter).
                     blocked_by = stages.get("rejected_by") or "fib_zone"
                     if blocked_by == "signal_debounce":
                         diag["debounce_blocked"] += 1
@@ -420,6 +429,8 @@ def run_backtest(df: pd.DataFrame, cfg: BotConfig, sweep_tag: str = None) -> dic
     results = summarize(trades, equity_curve, cfg.starting_equity, cfg.exchange.timeframe)
     results["fib_filter_enabled"] = fib_filter_enabled
     results["fib_blocked_signals"] = diag["fib_filter_blocked"]
+    results["macro_filter_enabled"] = macro_filter_enabled
+    results["macro_blocked_signals"] = diag["macro_filter_blocked"]
     # Echo the knobs the run was measured with, so a sweep of configs is
     # self-describing without having to keep the request alongside the result.
     results["fib_tolerance_atr_mult"] = float(

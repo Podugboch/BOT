@@ -555,7 +555,7 @@ class TestTradingBot:
         import strategy
 
         monkeypatch.setattr(strategy, "_evaluate_signal",
-                            lambda df, cfg, position_open, diagnostics=None: Signal.BUY)
+                            lambda df, cfg, position_open, diagnostics=None, **kwargs: Signal.BUY)
         cfg = BotConfig()
         cfg.exchange.timeframe = "15m"                    # 8-bar default for this grain
         bot = TradingBot(cfg)
@@ -1619,6 +1619,67 @@ class TestPipelineDiagnostics:
         assert stages["fib_pass"] is True
         assert "pulled back into the Fibonacci" in stages["fib_reason"]
         assert "0.618-0.382" in stages["fib_reason"]
+
+    def test_stage2b_macro_gate_suppresses_entry_with_exact_reason(self):
+        # 1h candle with close < 4h 200 EMA
+        df = self._cross({"close": 95.0, "ema_4h_200": 100.0, "fib_382": 96.0, "fib_500": 94.0, "fib_618": 92.0})
+        stages = {}
+        cfg = StrategyConfig(fib_level_mode="zone", use_macro_filter=True)
+        sig = generate_signal(df, cfg, position_open=False, diagnostics=stages, timeframe="1h")
+        assert sig == Signal.HOLD
+        assert stages["macro_evaluated"] is True
+        assert stages["macro_pass"] is False
+        assert stages["rejected_by"] == "macro_gate"
+        assert stages["macro_reason"] == "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)"
+
+    def test_stage2b_macro_gate_allows_entry_when_price_above_4h_200_ema(self):
+        # 1h candle with close > 4h 200 EMA
+        df = self._cross({"close": 102.0, "ema_4h_200": 100.0, "fib_382": 102.2, "fib_500": 95.0, "fib_618": 90.0})
+        stages = {}
+        cfg = StrategyConfig(fib_level_mode="zone", use_macro_filter=True, macro_filter_slope=False)
+        sig = generate_signal(df, cfg, position_open=False, diagnostics=stages, timeframe="1h")
+        assert sig == Signal.BUY
+        assert stages["macro_evaluated"] is True
+        assert stages["macro_pass"] is True
+        assert stages["rejected_by"] is None
+        assert "above 4h 200 EMA" in stages["macro_reason"]
+
+    def test_stage2b_macro_gate_suppresses_entry_when_slope_falling(self):
+        # 1h candle above EMA, but EMA slope is falling
+        n = 20
+        rows = []
+        for i in range(n):
+            fast = 100.0 if i < n - 1 else 102.0
+            slow = 100.0
+            rows.append({
+                "ema_fast": fast,
+                "ema_slow": slow,
+                "rsi": 55.0,
+                "adx": 26.0,
+                "close": 102.0,
+                "fib_382": 102.2,
+                "fib_500": 95.0,
+                "fib_618": 90.0,
+                "ema_4h_200": 105.0 - (i * 0.3),  # falling
+            })
+        df = pd.DataFrame(rows)
+        stages = {}
+        cfg = StrategyConfig(fib_level_mode="zone", use_macro_filter=True, macro_filter_slope=True, macro_slope_bars=12)
+        sig = generate_signal(df, cfg, position_open=False, diagnostics=stages, timeframe="1h")
+        assert sig == Signal.HOLD
+        assert stages["core_trigger"] is True
+        assert stages["macro_evaluated"] is True
+        assert stages["macro_pass"] is False
+        assert stages["rejected_by"] == "macro_gate"
+        assert stages["macro_reason"] == "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)"
+
+    def test_stage2b_macro_gate_bypasses_on_non_1h_timeframe(self):
+        df = self._cross({"close": 95.0, "ema_4h_200": 100.0, "fib_382": 96.0, "fib_500": 94.0, "fib_618": 92.0})
+        stages = {}
+        cfg = StrategyConfig(fib_level_mode="zone", use_macro_filter=True)
+        sig = generate_signal(df, cfg, position_open=False, diagnostics=stages, timeframe="15m")
+        assert sig == Signal.BUY
+        assert stages.get("macro_evaluated") is False or stages.get("macro_pass") is True
 
     def test_backtest_counts_every_stage(self):
         res = run_backtest(self._series(), self._diag_cfg())
@@ -2935,9 +2996,30 @@ class TestBacktestEnhancements:
             assert "realized_rr" in row
             assert "max_drawdown_pct" in row
             assert "fib_blocked" in row
+            assert "macro_blocked" in row
             assert "sizing_blocked" in row
             assert "total_fees_paid" in row
             assert "profitable" in row
+
+    def test_compare_windows_macro_filter(self, monkeypatch):
+        import web_server
+        hist = _wave_ohlcv(n=800)
+        monkeypatch.setattr(web_server, "fetch_historical", lambda *a, **k: hist.copy())
+
+        req = web_server.CompareWindowsRequest(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe="1h",
+            windows=[30],
+            starting_equity=1000.0,
+            use_macro_filter=True,
+            macro_filter_slope=True,
+        )
+        res = web_server.compare_windows_endpoint(req)
+        assert res["success"] is True
+        row = res["rows"][0]
+        assert "macro_blocked" in row
+        assert isinstance(row["macro_blocked"], int)
 
     def test_compare_timeframes_endpoint(self, monkeypatch):
         import web_server
