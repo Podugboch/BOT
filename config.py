@@ -95,6 +95,17 @@ class StrategyConfig:
     bb_std: float = 2.0
     macd_signal_period: int = 9
 
+    # Macro Regime Trend Filter (4h / Daily 200 EMA)
+    # When evaluating 1h signals, compute the 200 EMA on the 4-hour (or Daily) timeframe.
+    # Entry Condition: ONLY allow BUY signals if the 1h close price is ABOVE the 4h 200 EMA.
+    # If price < 4h 200 EMA, automatically suppress entry with rejection reason:
+    #   "Rejected by Macro Gate: Price below 4h 200 EMA (Downtrend)".
+    use_macro_filter: bool = True
+    macro_timeframe: str = "4h"
+    macro_ema_period: int = 200
+    macro_filter_slope: bool = True
+    macro_slope_bars: int = 12
+
 
 # --- entry debounce defaults ------------------------------------------------
 # Bars that must pass between the exit of one trade and the next entry. Three

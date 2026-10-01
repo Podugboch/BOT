@@ -366,6 +366,8 @@ class BacktestRequest(BaseModel):
     # entry. None derives it from the timeframe (8 bars on 5m/15m, 3 on 1h/4h).
     min_bars_between_trades: Optional[int] = None
     risk_per_trade_pct: float = 0.01
+    use_macro_filter: bool = True
+    macro_filter_slope: bool = True
     sweep_tag: Optional[str] = None
 
     @model_validator(mode="before")
@@ -387,6 +389,8 @@ class CompareWindowsRequest(BaseModel):
     starting_equity: float = 1000.0
     strategy: str = "ema_cross_fib"
     use_fib_filter: bool = True
+    use_macro_filter: bool = True
+    macro_filter_slope: bool = True
     fib_tolerance_atr_mult: float = 0.5
     fib_tolerance_pct: float = 0.003
     fib_level_mode: str = "deep"
@@ -1809,6 +1813,10 @@ def _build_backtest_config(req, exchange_id: str, symbol: str, timeframe: str, s
         cfg.strategy.min_bars_between_trades = max(0, int(req.min_bars_between_trades))
     if getattr(req, "risk_per_trade_pct", None) is not None:
         cfg.risk.risk_per_trade_pct = float(req.risk_per_trade_pct)
+    if getattr(req, "use_macro_filter", None) is not None:
+        cfg.strategy.use_macro_filter = bool(req.use_macro_filter)
+    if getattr(req, "macro_filter_slope", None) is not None:
+        cfg.strategy.macro_filter_slope = bool(req.macro_filter_slope)
     return cfg
 
 
@@ -1914,6 +1922,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                     "realized_rr": 0.0,
                     "max_drawdown_pct": 0.0,
                     "fib_blocked": 0,
+                    "macro_blocked": 0,
                     "sizing_blocked": 0,
                     "risk_blocked": 0,
                     "total_fees_paid": 0.0,
@@ -1934,6 +1943,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                     "realized_rr": 0.0,
                     "max_drawdown_pct": 0.0,
                     "fib_blocked": 0,
+                    "macro_blocked": 0,
                     "sizing_blocked": 0,
                     "risk_blocked": 0,
                     "total_fees_paid": 0.0,
@@ -1956,6 +1966,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                     "realized_rr": 0.0,
                     "max_drawdown_pct": 0.0,
                     "fib_blocked": 0,
+                    "macro_blocked": 0,
                     "sizing_blocked": 0,
                     "risk_blocked": 0,
                     "total_fees_paid": 0.0,
@@ -1988,6 +1999,7 @@ def compare_windows_endpoint(req: CompareWindowsRequest):
                 "realized_rr": float(res.get("realized_rr", 0.0)),
                 "max_drawdown_pct": float(res.get("max_drawdown_pct", 0.0)),
                 "fib_blocked": int(diag.get("fib_filter_blocked", 0)),
+                "macro_blocked": int(diag.get("macro_filter_blocked", 0)),
                 "sizing_blocked": int(diag.get("sizing_blocked", 0)),
                 "risk_blocked": int(diag.get("signals_risk_blocked", 0)),
                 "total_fees_paid": float(res.get("total_fees_paid", 0.0)),
