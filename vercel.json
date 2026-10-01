@@ -4,8 +4,7 @@
       "maxDuration": 60,
       "regions": [
         "fra1"
-      ],
-      "includeFiles": "**"
+      ]
     }
   },
   "regions": [
