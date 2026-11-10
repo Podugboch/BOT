@@ -511,18 +511,18 @@ DEFAULT_SEED_USERS = [
     {
         "id": 2,
         "username": "Jaytricks",
-        "email": "odu.pisc@gmail.com",
-        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
-        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "email": "jaytricks@example.com",
+        "password_hash": "08073d26829d55a2a76ea0bade8aafc50f7135eedb672d99dcc943c81203a2a8",
+        "salt": "023d1e83abc9b5e3b4c9311aadd2b7cb",
         "is_active": 1,
         "created_at": "2026-09-18T10:00:00.000000+00:00",
     },
     {
         "id": 3,
         "username": "Podugboch",
-        "email": "podugboch@traderqueen.name.ng",
-        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
-        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "email": "podugboch@example.com",
+        "password_hash": "fe00e3e4e3234e83de77f6858ac16ce38704a5905ce0435c3122fb99404838f1",
+        "salt": "f23646941bc21a3c9aa580a27534b3d9",
         "is_active": 1,
         "created_at": "2026-09-18T10:00:00.000000+00:00",
     },
@@ -530,17 +530,17 @@ DEFAULT_SEED_USERS = [
         "id": 5,
         "username": "test_login_user",
         "email": "test_login@example.com",
-        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
-        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "password_hash": "1ae3c42da0f49de59c2638a9c3b5ca2118083b08ff3d47991506d3a865aa6d2f",
+        "salt": "0933278061551cc8058713e4b4d7acb0",
         "is_active": 1,
         "created_at": "2026-09-18T10:00:00.000000+00:00",
     },
     {
         "id": 6,
         "username": "jaytricks_alias",
-        "email": "jaytricks@example.com",
-        "password_hash": "4e44247684ba686a64013b6155713bbbde6cab175579568ac33729a7b047179f",
-        "salt": "33e131a3d850264160c70eb222f1f8ca",
+        "email": "jaytricks_alias@example.com",
+        "password_hash": "35cfde52044ce890a30207f0d22d6760381baa81c4187cc4921176d272755b65",
+        "salt": "00b59267d33705f1a346ac0c32fff938",
         "is_active": 1,
         "created_at": "2026-09-18T10:00:00.000000+00:00",
     },
@@ -566,7 +566,7 @@ def get_all_seed_users() -> list:
 
 
 def find_and_rehydrate_seed_user(conn: sqlite3.Connection, identifier: str) -> Optional[sqlite3.Row]:
-    """Find a user in seed users matching identifier (username or email) and insert/update into SQLite."""
+    """Find a user in seed users matching identifier (username or email) and insert into SQLite if missing."""
     val = (identifier or "").strip().lower()
     if not val:
         return None
@@ -584,16 +584,6 @@ def find_and_rehydrate_seed_user(conn: sqlite3.Connection, identifier: str) -> O
     u_email = matched["email"].strip().lower()
     row = cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (u_name.lower(), u_email)).fetchone()
     if row:
-        cur.execute("""
-            UPDATE users SET
-                username = ?,
-                email = ?,
-                password_hash = ?,
-                salt = ?,
-                is_active = ?
-            WHERE id = ?
-        """, (u_name, u_email, matched["password_hash"], matched["salt"], matched.get("is_active", 1), row["id"]))
-        conn.commit()
         return cur.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
     else:
         uid = matched.get("id")
@@ -627,15 +617,7 @@ def seed_initial_users(conn: sqlite3.Connection):
                 u_email = u["email"].strip().lower()
                 row = cur.execute("SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?", (u_name.lower(), u_email)).fetchone()
                 if row:
-                    cur.execute("""
-                        UPDATE users SET
-                            username = ?,
-                            email = ?,
-                            password_hash = ?,
-                            salt = ?,
-                            is_active = ?
-                        WHERE id = ?
-                    """, (u_name, u_email, u["password_hash"], u["salt"], u.get("is_active", 1), row["id"]))
+                    continue
                 else:
                     uid = u.get("id")
                     if uid:

@@ -16,3 +16,4 @@ BOT.zip
 .secret_key
 *.key
 .env*
+seed_users.json

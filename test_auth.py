@@ -868,13 +868,14 @@ class TestSecretEncryptionAndVault:
         assert "EXCHANGE_API_KEY" not in os.environ
         assert "EXCHANGE_API_SECRET" not in os.environ
 
-        # But runner.cfg and new BotConfig have them directly in memory
+        # But runner.cfg has them directly in memory
         assert runner.cfg.exchange.api_key == "kraken_secret_key_123"
         assert runner.cfg.exchange.api_secret == "kraken_secret_sec_456"
 
+        # A fresh BotConfig created without env vars does NOT pick up saved keys
         new_cfg = BotConfig()
-        assert new_cfg.exchange.api_key == "kraken_secret_key_123"
-        assert new_cfg.exchange.api_secret == "kraken_secret_sec_456"
+        assert new_cfg.exchange.api_key == ""
+        assert new_cfg.exchange.api_secret == ""
 
     def test_safe_load_dotenv_blocks_sensitive_keys_from_os_environ(self, tmp_path, monkeypatch):
         from secret_manager import safe_load_dotenv, SENSITIVE_ENV_KEYS
@@ -1012,11 +1013,10 @@ class TestSecretEncryptionAndVault:
         conn.close()
         assert [row["exchange_id"] for row in rows] == ["kraken", "okx"]
 
-    def test_cold_container_bot_config_hydrates_vault_key_from_remote(self, tmp_path, monkeypatch):
+    def test_cold_container_bot_config_does_not_leak_stored_exchange_keys(self, tmp_path, monkeypatch):
         """
-        Order execution runs without a session on whatever container receives the
-        request, so an empty local vault must fall back to the remote store
-        instead of trading with blank credentials.
+        Verify config.py does NOT fall back to stored/vaulted exchange keys.
+        If packaged as a skill or module, saved keys must never be picked up automatically.
         """
         db_cold = tmp_path / "container_order_cold.db"
         monkeypatch.setattr("auth.DB_PATH", db_cold)
@@ -1037,10 +1037,14 @@ class TestSecretEncryptionAndVault:
         monkeypatch.setattr("auth.is_remote_storage_available", lambda: True)
         monkeypatch.setattr("auth.remote_get_latest_exchange_key", lambda: remote_record)
 
+        latest = AuthService.get_latest_raw_exchange_key()
+        assert latest is not None
+        assert latest["api_key"] == "mx0vcoldkey000000000001"
+
         from config import BotConfig
         cfg = BotConfig()
-        assert cfg.exchange.api_key == "mx0vcoldkey000000000001"
-        assert cfg.exchange.api_secret == "cold_secret_value"
+        assert cfg.exchange.api_key == ""
+        assert cfg.exchange.api_secret == ""
         assert cfg.exchange.exchange_id == "mexc"
 
     def test_cold_container_without_remote_key_returns_none(self, tmp_path, monkeypatch):
@@ -1148,7 +1152,7 @@ class TestServerlessSeedingAndAutoActivation:
         conn.row_factory = sqlite3.Row
         j = conn.execute("SELECT * FROM users WHERE username = 'Jaytricks'").fetchone()
         assert j is not None
-        assert j["email"] in ("odu.pisc@gmail.com", "jaytricks@example.com")
+        assert j["email"] == "jaytricks@example.com"
         assert j["is_active"] == 1
         conn.close()
 
@@ -1218,17 +1222,17 @@ class TestServerlessSeedingAndAutoActivation:
         assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
         conn.close()
 
-        # Attempting login with odu.pisc@gmail.com rehydrates Jaytricks and authenticates
-        res = AuthService.login("odu.pisc@gmail.com", "Password123456!")
+        # Attempting login with jaytricks@example.com rehydrates Jaytricks and authenticates
+        res = AuthService.login("jaytricks@example.com", "Jaytricks#Secure2026!")
         assert res["success"] is True
         assert res["user"]["username"] == "Jaytricks"
-        assert res["user"]["email"] == "odu.pisc@gmail.com"
+        assert res["user"]["email"] == "jaytricks@example.com"
         assert "token" in res
 
         # Verify record in DB
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
-        u = conn.execute("SELECT * FROM users WHERE email = 'odu.pisc@gmail.com'").fetchone()
+        u = conn.execute("SELECT * FROM users WHERE email = 'jaytricks@example.com'").fetchone()
         assert u is not None
         assert u["username"] == "Jaytricks"
         assert u["is_active"] == 1
@@ -1240,16 +1244,16 @@ class TestServerlessSeedingAndAutoActivation:
         init_auth_db()
 
         # Magic link on cold container finds seed user and generates token
-        magic_res = AuthService.send_magic_login_link("odu.pisc@gmail.com")
+        magic_res = AuthService.send_magic_login_link("jaytricks@example.com")
         assert magic_res["success"] is True
         assert "dev_magic_link" in magic_res or magic_res.get("email_sent") is True
 
         # Password reset on cold container finds seed user and generates reset link
-        reset_res = AuthService.request_password_reset("odu.pisc@gmail.com")
+        reset_res = AuthService.request_password_reset("jaytricks@example.com")
         assert reset_res["success"] is True
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
-        u = conn.execute("SELECT * FROM users WHERE email = 'odu.pisc@gmail.com'").fetchone()
+        u = conn.execute("SELECT * FROM users WHERE email = 'jaytricks@example.com'").fetchone()
         assert u is not None
         assert u["reset_token"] is not None
         conn.close()
@@ -1263,6 +1267,6 @@ class TestServerlessSeedingAndAutoActivation:
         init_auth_db()
 
         # Login with Jaytricks works using DEFAULT_SEED_USERS fallback
-        res = AuthService.login("Jaytricks", "Password123456!")
+        res = AuthService.login("Jaytricks", "Jaytricks#Secure2026!")
         assert res["success"] is True
         assert res["user"]["username"] == "Jaytricks"

@@ -178,46 +178,20 @@ class RiskConfig:
     max_spread_pct: float = 0.35               # max allowed market spread (0.35%) before suppressing entry
 
 
-def _get_exchange_credential(env_key: str, db_key: str) -> str:
-    val = os.getenv(env_key, "").strip()
-    if val:
-        return val
-    try:
-        from auth import AuthService
-        latest = AuthService.get_latest_raw_exchange_key()
-        if latest and latest.get(db_key):
-            return str(latest[db_key]).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _get_exchange_id() -> str:
-    val = os.getenv("EXCHANGE_ID", "").strip()
-    if val:
-        return val
-    try:
-        from auth import AuthService
-        latest = AuthService.get_latest_raw_exchange_key()
-        if latest and latest.get("exchange_id"):
-            return str(latest["exchange_id"]).strip()
-    except Exception:
-        pass
-    return "binance"
-
-
 @dataclass
 class ExchangeConfig:
     # Any ccxt-supported exchange id works here — see the "Supported exchanges"
-    # list in README.md for the popular ones. Override via env var or secure vault.
-    exchange_id: str = field(default_factory=_get_exchange_id)
+    # list in README.md for the popular ones. Override via env var so you can
+    # switch exchanges without editing code, e.g.:
+    #   EXCHANGE_ID=coinbase SYMBOL=ETH/USD python bot.py
+    exchange_id: str = field(default_factory=lambda: os.getenv("EXCHANGE_ID", "binance"))
     symbol: str = field(default_factory=lambda: os.getenv("SYMBOL", "BTC/USDT"))
     timeframe: str = field(default_factory=lambda: os.getenv("TIMEFRAME", "15m"))
     testnet: bool = field(default_factory=lambda: os.getenv("TESTNET", "true").lower() == "true")
-    api_key: str = field(default_factory=lambda: _get_exchange_credential("EXCHANGE_API_KEY", "api_key"))
-    api_secret: str = field(default_factory=lambda: _get_exchange_credential("EXCHANGE_API_SECRET", "api_secret"))
+    api_key: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_KEY", ""))
+    api_secret: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_SECRET", ""))
     # Some exchanges (Coinbase, KuCoin, OKX, Bitget...) also require a passphrase
-    api_passphrase: str = field(default_factory=lambda: _get_exchange_credential("EXCHANGE_API_PASSPHRASE", "api_passphrase"))
+    api_passphrase: str = field(default_factory=lambda: os.getenv("EXCHANGE_API_PASSPHRASE", ""))
 
 
 @dataclass
