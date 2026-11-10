@@ -3898,11 +3898,13 @@ class TestExchangeKeyRemovalAndExecutionMode:
         res = client.post("/api/exchange/delete", json={"exchange_id": "binance"})
         assert res.status_code == 401
 
-    def test_delete_exchange_key_endpoint_success(self, monkeypatch):
+    def test_delete_exchange_key_endpoint_success(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
         from web_server import app, runner
         from auth import AuthService, init_auth_db
 
+        db = tmp_path / "test_del_key.db"
+        monkeypatch.setattr("auth.DB_PATH", db)
         init_auth_db()
         reg = AuthService.register("test_key_user", "keyuser@example.com", "Password123!")
         if reg.get("token"):
