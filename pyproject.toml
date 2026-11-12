@@ -4,7 +4,7 @@ version = "2.0.0"
 description = "Trader Queen: Autonomous Trading Platform with Strategy, Risk Manager, Web Dashboard, and Exchange Authentication"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.100.0",
+    "fastapi>=0.162.2",
     "uvicorn>=0.54.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
