@@ -288,8 +288,12 @@ def remote_get_user(val: str) -> Optional[Dict[str, Any]]:
         return None
     if driver == "turso":
         if not _turso_init(): return None
-        column = "email" if "@" in value else ("id" if value.isdigit() else "username")
-        ok, rows = _turso_execute(f"SELECT id,username,email,password_hash,salt,is_active,created_at FROM remote_users WHERE {column}=? LIMIT 1", (int(value) if column == "id" else value,))
+        if "@" in value:
+            ok, rows = _turso_execute("SELECT id,username,email,password_hash,salt,is_active,created_at FROM remote_users WHERE email=? LIMIT 1", (value,))
+        elif value.isdigit():
+            ok, rows = _turso_execute("SELECT id,username,email,password_hash,salt,is_active,created_at FROM remote_users WHERE id=? LIMIT 1", (int(value),))
+        else:
+            ok, rows = _turso_execute("SELECT id,username,email,password_hash,salt,is_active,created_at FROM remote_users WHERE username=? LIMIT 1", (value,))
         return rows[0] if ok and rows else None
     paths = [f"users/by_email/{key}.json"] if "@" in value else ([f"users/by_id/{key}.json", f"users/by_username/{key}.json"] if value.isdigit() else [f"users/by_username/{key}.json", f"users/by_email/{key}.json"])
     for path in paths:

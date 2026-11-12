@@ -625,6 +625,7 @@ class TestAuthRegistrationFlow:
         monkeypatch.setattr("storage_adapter.KV_TOKEN", "")
         monkeypatch.setattr("storage_adapter.BLOB_TOKEN", "mock_blob_token_123")
         monkeypatch.setattr("storage_adapter.BLOB_STORE_ID", "store_mock123")
+        monkeypatch.setattr("storage_adapter._BLOB_SUSPENDED", False)
         monkeypatch.setattr("storage_adapter._blob_put", mock_blob_put)
         monkeypatch.setattr("storage_adapter._blob_get", mock_blob_get)
         monkeypatch.setattr("storage_adapter._blob_del", mock_blob_del)
@@ -928,7 +929,7 @@ class TestSecretEncryptionAndVault:
 
         # Verify transaction rolled back in DB: exchange_keys must NOT contain the credentials
         conn = get_db_connection()
-        row = conn.execute("SELECT * FROM exchange_keys WHERE api_key LIKE '%my_cb_key_555%'").fetchone()
+        row = conn.execute("SELECT * FROM exchange_keys WHERE api_key LIKE ?", ('%my_cb_key_555%',)).fetchone()
         conn.close()
         assert row is None
 
