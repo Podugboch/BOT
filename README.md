@@ -5,6 +5,15 @@ Fibonacci retracement zone, with a full risk layer (position sizing, stops,
 drawdown kill switch, circuit breakers), fee/slippage-aware paper trading,
 and a backtester — built on `ccxt` so it works with any supported exchange.
 
+## Live on Agensi
+
+[![Agensi Skill](https://img.shields.io/badge/Agensi-EMA%20Backtester%20Skill-0a0f1a?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PGNpcmNsZSBjeD0iMTYiIGN5PSIxNiIgcj0iMTYiIGZpbGw9IiMzQjgyRjYiLz48L3N2Zz4=&logoColor=white)](https://www.agensi.io/skills/bot-ema-crossover-backtester)
+
+The backtesting and risk layer from this repo is packaged as a free agent skill on [Agensi](https://www.agensi.io/skills/bot-ema-crossover-backtester).
+Use it in Claude Code, Cursor, Codex CLI or any agent that supports MCP — no API keys needed.
+
+**What the skill does:** runs a bar-by-bar EMA 9/21 crossover backtest on public exchange candles, with ATR stops, fees and slippage modelled, and a drawdown and loss-streak kill-switch. Backtest only: no live trading.
+
 ## How each design principle shows up in the code
 
 | Principle | Where |
