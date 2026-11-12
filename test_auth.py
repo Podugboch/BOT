@@ -1108,6 +1108,25 @@ class TestSecretEncryptionAndVault:
 class TestServerlessSeedingAndAutoActivation:
     """Test suite covering seed user hydration, client-token recovery, and auto-activation."""
 
+    @pytest.fixture(autouse=True)
+    def setup_test_seed_users(self, monkeypatch):
+        import auth
+        test_salt = "023d1e83abc9b5e3b4c9311aadd2b7cb"  # nosec
+        test_pw_hash, _ = auth.hash_password("Jaytricks#Secure2026!", salt=test_salt)
+        test_seed = [
+            {
+                "id": 2,
+                "username": "Jaytricks",
+                "email": "jaytricks@example.com",
+                "password_hash": test_pw_hash,
+                "salt": test_salt,
+                "is_active": 1,
+                "created_at": "2026-09-18T10:00:00.000000+00:00",
+            }
+        ]
+        monkeypatch.setattr("auth.DEFAULT_SEED_USERS", test_seed)
+        monkeypatch.setenv("SEED_USERS_JSON", json.dumps(test_seed))
+
     def test_seed_initial_users_loads_seed_json(self, tmp_path, monkeypatch):
         from auth import init_auth_db, seed_initial_users, get_db_connection
         db = tmp_path / "seed_test.db"

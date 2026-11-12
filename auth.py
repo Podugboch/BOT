@@ -507,61 +507,45 @@ def init_auth_db():
         print(f"[AUTH ERROR] Failed to run env migration in init_auth_db: {e}")
 
 
-DEFAULT_SEED_USERS = [
-    {
-        "id": 2,
-        "username": "Jaytricks",
-        "email": "jaytricks@example.com",
-        "password_hash": "08073d26829d55a2a76ea0bade8aafc50f7135eedb672d99dcc943c81203a2a8",
-        "salt": "023d1e83abc9b5e3b4c9311aadd2b7cb",
-        "is_active": 1,
-        "created_at": "2026-09-18T10:00:00.000000+00:00",
-    },
-    {
-        "id": 3,
-        "username": "Podugboch",
-        "email": "podugboch@example.com",
-        "password_hash": "fe00e3e4e3234e83de77f6858ac16ce38704a5905ce0435c3122fb99404838f1",
-        "salt": "f23646941bc21a3c9aa580a27534b3d9",
-        "is_active": 1,
-        "created_at": "2026-09-18T10:00:00.000000+00:00",
-    },
-    {
-        "id": 5,
-        "username": "test_login_user",
-        "email": "test_login@example.com",
-        "password_hash": "1ae3c42da0f49de59c2638a9c3b5ca2118083b08ff3d47991506d3a865aa6d2f",
-        "salt": "0933278061551cc8058713e4b4d7acb0",
-        "is_active": 1,
-        "created_at": "2026-09-18T10:00:00.000000+00:00",
-    },
-    {
-        "id": 6,
-        "username": "jaytricks_alias",
-        "email": "jaytricks_alias@example.com",
-        "password_hash": "35cfde52044ce890a30207f0d22d6760381baa81c4187cc4921176d272755b65",
-        "salt": "00b59267d33705f1a346ac0c32fff938",
-        "is_active": 1,
-        "created_at": "2026-09-18T10:00:00.000000+00:00",
-    },
-]
+# Default seed users list is empty in source code for production security.
+# Seed users must be provided via the SEED_USERS_JSON environment variable or local unversioned seed_users.json.
+DEFAULT_SEED_USERS: list = []
 
 
 def get_all_seed_users() -> list:
-    """Returns seed users by checking seed_users.json merged with DEFAULT_SEED_USERS."""
+    """Returns seed users by checking SEED_USERS_JSON env variable or local seed_users.json."""
     users_by_key = {}
-    for u in DEFAULT_SEED_USERS:
-        users_by_key[u["username"].lower()] = dict(u)
+
+    # 1. Environment variable SEED_USERS_JSON
+    env_seed = os.environ.get("SEED_USERS_JSON") or os.environ.get("SEED_USERS")
+    if env_seed:
+        try:
+            loaded_env = json.loads(env_seed)
+            if isinstance(loaded_env, list):
+                for u in loaded_env:
+                    if isinstance(u, dict) and u.get("username"):
+                        users_by_key[u["username"].lower()] = dict(u)
+        except Exception as e:
+            print(f"[AUTH WARNING] Failed to parse SEED_USERS_JSON env: {e}")
+
+    # 2. Local unversioned seed_users.json
     try:
         seed_path = Path(__file__).resolve().parent / "seed_users.json"
         if seed_path.exists():
             with open(seed_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            for u in loaded:
-                if isinstance(u, dict) and u.get("username"):
-                    users_by_key[u["username"].lower()] = u
+            if isinstance(loaded, list):
+                for u in loaded:
+                    if isinstance(u, dict) and u.get("username"):
+                        users_by_key[u["username"].lower()] = u
     except Exception as e:
         print(f"[AUTH WARNING] Could not load seed_users.json: {e}")
+
+    # 3. Dynamic in-memory DEFAULT_SEED_USERS (if set at runtime e.g. in test fixtures)
+    for u in DEFAULT_SEED_USERS:
+        if isinstance(u, dict) and u.get("username"):
+            users_by_key[u["username"].lower()] = dict(u)
+
     return list(users_by_key.values())
 
 

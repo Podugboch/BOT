@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # Git Pre-Push Security Hook
-# Scans all project files for sensitive tokens, secrets, and dangerous anti-patterns before push.
+# Scans all project files for sensitive tokens, password hashes, salts, and dangerous anti-patterns before push.
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || dirname "$(dirname "$(realpath "$0")")")"
-python3 "$REPO_ROOT/scripts/security_check.py" --all --repo "$REPO_ROOT"
-RESULT=$?
 
-if [ $RESULT -ne 0 ]; then
+# 1. Run Secrets, Passwords & File Blacklist Scanner
+python3 "$REPO_ROOT/scripts/security_check.py" --all --repo "$REPO_ROOT"
+SEC_RESULT=$?
+
+if [ $SEC_RESULT -ne 0 ]; then
     echo ""
-    echo "❌ Push aborted by pre-push security check."
-    echo "   Please fix the security findings above before pushing to GitHub."
+    echo "❌ Push aborted: Sensitive credentials, password hashes, or blacklisted files detected."
+    exit 1
+fi
+
+# 2. Run Sec-Code-Ref-Linter on Codebase
+python3 "$REPO_ROOT/scripts/linter.py" --target "$REPO_ROOT" --exclude-tests --strict
+LINT_RESULT=$?
+
+if [ $LINT_RESULT -ne 0 ]; then
+    echo ""
+    echo "❌ Push aborted: Code security anti-patterns detected by linter."
     exit 1
 fi
 

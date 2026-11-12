@@ -82,6 +82,21 @@ SECRET_PATTERNS = [
         ),
         "HIGH"
     ),
+    (
+        "Hardcoded Password Hash",
+        re.compile(r"""(?i)['"]?(?:password_hash|pwd_hash|pass_hash|hash_pw)['"]?\s*[:=]\s*['"]([a-f0-9]{32,64})['"]"""),
+        "HIGH"
+    ),
+    (
+        "Hardcoded Cryptographic Salt",
+        re.compile(r"""(?i)['"]?(?:salt|password_salt)['"]?\s*[:=]\s*['"]([a-f0-9]{16,64})['"]"""),
+        "HIGH"
+    ),
+    (
+        "Hardcoded Password Assignment",
+        re.compile(r"""(?i)['"]?(?:password|passwd|pwd|passphrase)['"]?\s*[:=]\s*['"]([^\s'"]{8,})['"]"""),
+        "HIGH"
+    ),
 ]
 
 # Dangerous code anti-patterns
@@ -193,8 +208,14 @@ def scan_file_for_issues(file_path: Path) -> List[Dict[str, Any]]:
 
         # Check secret patterns
         for name, pattern, severity in SECRET_PATTERNS:
-            # Skip generic high-entropy secret warnings for mock test files unless it's a real RSA key
-            if test_file and name in ["Generic High-Entropy API Secret / Token Assignment", "Resend API Key"]:
+            # Skip mock test secrets for unit test files unless it's a real RSA key
+            if test_file and name in [
+                "Generic High-Entropy API Secret / Token Assignment",
+                "Resend API Key",
+                "Hardcoded Password Assignment",
+                "Hardcoded Password Hash",
+                "Hardcoded Cryptographic Salt"
+            ]:
                 continue
 
             match = pattern.search(line)

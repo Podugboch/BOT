@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # Git Pre-Commit Security Hook
-# Scans staged files for sensitive tokens, secrets, and dangerous anti-patterns.
+# Scans staged files for sensitive tokens, password hashes, salts, and code anti-patterns.
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || dirname "$(dirname "$(realpath "$0")")")"
-python3 "$REPO_ROOT/scripts/security_check.py" --staged --repo "$REPO_ROOT"
-RESULT=$?
 
-if [ $RESULT -ne 0 ]; then
+# 1. Run Secrets, Passwords & File Blacklist Scanner
+python3 "$REPO_ROOT/scripts/security_check.py" --staged --repo "$REPO_ROOT"
+SEC_RESULT=$?
+
+if [ $SEC_RESULT -ne 0 ]; then
     echo ""
-    echo "❌ Commit aborted by pre-commit security check."
-    echo "   Please fix the security findings above or unstage sensitive files."
+    echo "❌ Commit aborted: Sensitive credentials, password hashes, or blacklisted files detected."
+    exit 1
+fi
+
+# 2. Run Sec-Code-Ref-Linter on Codebase
+python3 "$REPO_ROOT/scripts/linter.py" --target "$REPO_ROOT" --exclude-tests --strict
+LINT_RESULT=$?
+
+if [ $LINT_RESULT -ne 0 ]; then
+    echo ""
+    echo "❌ Commit aborted: Code security anti-patterns detected by linter."
     exit 1
 fi
 

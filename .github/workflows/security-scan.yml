@@ -24,6 +24,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install rich
 
-      - name: Run Pre-Commit & Code Security Check
+      - name: Run Secret, Password & Blacklist Scan
         run: |
           python scripts/security_check.py --all
+
+      - name: Run Sec-Code-Ref-Linter Engine
+        run: |
+          python scripts/linter.py --target . --exclude-tests --strict
