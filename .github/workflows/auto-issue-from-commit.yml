@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Parse Commit Message or Dispatch Inputs
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             let issueTitle = "";
