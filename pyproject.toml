@@ -5,7 +5,7 @@ description = "Trader Queen: Autonomous Trading Platform with Strategy, Risk Man
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
+    "uvicorn>=0.54.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "pandas>=2.0.0",
