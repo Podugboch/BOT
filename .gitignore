@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.log
+venv/
 .venv/
 .pytest_cache/
 .vercel/
@@ -10,10 +11,11 @@ execution.db
 *.db
 KILL
 .env
+.env*
+*.env
 .DS_Store
 BOT.zip
 .vercel
 .secret_key
 *.key
-.env*
 seed_users.json

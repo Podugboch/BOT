@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Git Pre-Push Security Hook
+# Scans all project files for sensitive tokens, secrets, and dangerous anti-patterns before push.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || dirname "$(dirname "$(realpath "$0")")")"
+python3 "$REPO_ROOT/scripts/security_check.py" --all --repo "$REPO_ROOT"
+RESULT=$?
+
+if [ $RESULT -ne 0 ]; then
+    echo ""
+    echo "❌ Push aborted by pre-push security check."
+    echo "   Please fix the security findings above before pushing to GitHub."
+    exit 1
+fi
+
+exit 0
