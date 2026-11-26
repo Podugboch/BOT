@@ -1,4 +1,4 @@
-ccxt>=4.5.92
+ccxt>=4.5.93
 pandas>=2.3.3
 numpy>=2.2.6
 python-dotenv>=1.2.4
